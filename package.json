@@ -1,0 +1,35 @@
+{
+  "name": "oc-tps",
+  "version": "0.1.0",
+  "description": "Token speed and response history plugin for OpenCode",
+  "type": "module",
+  "exports": {
+    "./server": "./dist/server.js",
+    "./tui": "./dist/tui.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "package.json"
+  ],
+  "engines": {
+    "opencode": ">=1.18.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --import tsx --test tests/core.test.ts"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.26.9",
+    "@babel/preset-typescript": "^7.26.0",
+    "@opencode-ai/plugin": "^1.18.18",
+    "@opentui/core": "^0.4.5",
+    "@opentui/keymap": "^0.4.5",
+    "@opentui/solid": "^0.4.5",
+    "@types/node": "^22.13.4",
+    "babel-preset-solid": "^1.9.5",
+    "solid-js": "^1.9.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
