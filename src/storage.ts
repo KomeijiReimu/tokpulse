@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, basename, join } from "node:path";
 import {
   HISTORY_VERSION,
@@ -75,6 +75,48 @@ export function createHistoryStorage(
 }
 
 export async function readHistoryFile(path: string): Promise<HistoryRecord[]> {
+  const records = await readPrimaryHistoryFile(path);
+  const orphanTemps = await findRecoverableTemps(path);
+  if (orphanTemps.length === 0) return records;
+
+  const recoveredPaths: string[] = [];
+  const recoveredRecords: HistoryRecord[] = [];
+  for (const orphan of orphanTemps) {
+    try {
+      const content = await readFile(orphan.path, "utf8");
+      recoveredPaths.push(orphan.path);
+      recoveredRecords.push(...parseHistoryJsonl(content));
+    } catch (error) {
+      // Leave unreadable files for a later attempt. A temp-file problem must
+      // not make an otherwise readable history unavailable.
+      if (!isNodeError(error) || error.code !== "ENOENT") continue;
+    }
+  }
+
+  if (recoveredPaths.length === 0) return records;
+  const merged = mergeHistoryRecords(records, recoveredRecords);
+  if (recoveredRecords.length > 0) await writeHistoryFile(path, merged);
+  await Promise.all(recoveredPaths.map((tempPath) => rm(tempPath, { force: true })));
+  return merged;
+}
+
+export function mergeHistoryRecords(
+  mainRecords: readonly HistoryRecord[],
+  recoveredRecords: readonly HistoryRecord[],
+): HistoryRecord[] {
+  const byMessage = new Map<string, HistoryRecord>();
+  for (const record of [...mainRecords, ...recoveredRecords]) {
+    const normalized = normalizeHistoryRecord(record);
+    if (!normalized) continue;
+    const existing = byMessage.get(normalized.messageID);
+    if (!existing || isPreferredRecord(normalized, existing)) {
+      byMessage.set(normalized.messageID, normalized);
+    }
+  }
+  return [...byMessage.values()];
+}
+
+async function readPrimaryHistoryFile(path: string): Promise<HistoryRecord[]> {
   let content: string;
   try {
     content = await readFile(path, "utf8");
@@ -83,6 +125,35 @@ export async function readHistoryFile(path: string): Promise<HistoryRecord[]> {
     throw error;
   }
   return parseHistoryJsonl(content);
+}
+
+async function findRecoverableTemps(path: string): Promise<OrphanTemp[]> {
+  const directory = dirname(path);
+  const pattern = new RegExp(`^\\.${escapeRegExp(basename(path))}\\.(\\d+)\\.(\\d+)\\.([^./]+)\\.tmp$`);
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return [];
+    throw error;
+  }
+
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => {
+      const match = pattern.exec(entry.name);
+      if (!match) return undefined;
+      const pid = Number(match[1]);
+      const timestamp = Number(match[2]);
+      if (!isExitedProcess(pid) || !Number.isFinite(timestamp)) return undefined;
+      return {
+        path: join(directory, entry.name),
+        pid,
+        timestamp,
+      };
+    })
+    .filter((temp): temp is OrphanTemp => temp !== undefined)
+    .sort((left, right) => left.timestamp - right.timestamp || left.path.localeCompare(right.path));
 }
 
 export async function writeHistoryFile(
@@ -162,6 +233,54 @@ function upsertRecord(records: readonly HistoryRecord[], record: HistoryRecord):
   return result;
 }
 
+function isPreferredRecord(candidate: HistoryRecord, existing: HistoryRecord): boolean {
+  const candidateCompleteness = recordCompleteness(candidate);
+  const existingCompleteness = recordCompleteness(existing);
+  if (candidateCompleteness !== existingCompleteness) {
+    return candidateCompleteness > existingCompleteness;
+  }
+
+  const candidateFreshness = recordFreshness(candidate);
+  const existingFreshness = recordFreshness(existing);
+  if (candidateFreshness !== existingFreshness) return candidateFreshness > existingFreshness;
+
+  // The later source wins an otherwise identical tie. Recovered files are
+  // processed after the primary file and in filename timestamp order.
+  return true;
+}
+
+function recordCompleteness(record: HistoryRecord): number {
+  let score = 0;
+  if (record.parentSessionID) score += 2;
+  if (record.model) score += 2;
+  if (record.time.firstToken !== undefined) score += 1;
+  if (record.time.completed !== undefined) score += 3;
+  if (record.time.ttft !== undefined) score += 1;
+  if (record.time.duration !== undefined) score += 1;
+  if (record.samples.length > 0) score += 2 + Math.min(record.samples.length, 8);
+  if (record.tokens.input > 0) score += 1;
+  if (record.tokens.output > 0) score += 1;
+  if (record.tokens.reasoning > 0) score += 1;
+  if (record.tokens.cacheRead > 0) score += 1;
+  if (record.tokens.cacheWrite > 0) score += 1;
+  if (record.cost > 0) score += 1;
+  return score;
+}
+
+function recordFreshness(record: HistoryRecord): number {
+  return Math.max(
+    record.time.start,
+    record.time.firstToken ?? Number.NEGATIVE_INFINITY,
+    record.time.completed ?? Number.NEGATIVE_INFINITY,
+  );
+}
+
+interface OrphanTemp {
+  path: string;
+  pid: number;
+  timestamp: number;
+}
+
 function normalizeTokens(value: unknown): TokenCounts {
   const source = isRecord(value) ? value : {};
   const cache = isRecord(source.cache) ? source.cache : {};
@@ -235,4 +354,18 @@ function isRecord(value: unknown): value is Record<string, any> {
 
 function isNodeError(value: unknown): value is NodeJS.ErrnoException {
   return value instanceof Error || isRecord(value);
+}
+
+function isExitedProcess(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return isNodeError(error) && error.code === "ESRCH";
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

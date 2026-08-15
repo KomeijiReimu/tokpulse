@@ -2,6 +2,7 @@
 
 import { isAbsolute, join } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup } from "solid-js";
+import type { MouseEvent } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
 import type {
   TuiPlugin,
@@ -20,7 +21,6 @@ import {
   addTokenCounts,
   aggregateSession,
   aggregateSessionTree,
-  calculateRateStats,
   calculateSpeedStats,
   calibrateResponseSamples,
   bytesToTokens,
@@ -28,7 +28,6 @@ import {
   emptyTokenCounts,
   formatDuration,
   formatNumber,
-  formatTokens,
   normalizeTokenCounts,
   rollingTokenRate,
   timeToFirstToken,
@@ -46,7 +45,7 @@ const COMMAND_NAME = "oc-tps.history";
 const SPARK_CHARS = ".:-=+#";
 
 type ObjectRecord = Record<string, unknown>;
-type StreamName = "legacy" | "v2";
+export type StreamName = "legacy" | "v2";
 type SampleKind = "output" | "reasoning";
 type CompatibleEventType =
   | "message.part.delta"
@@ -56,7 +55,9 @@ type CompatibleEventType =
   | "session.next.step.started"
   | "session.next.step.ended"
   | "session.idle"
-  | "session.status";
+  | "session.status"
+  | "session.created"
+  | "session.updated";
 
 interface CompatibleEvent {
   type?: unknown;
@@ -77,7 +78,7 @@ interface CandidateStream {
   samples: SpeedSample[];
 }
 
-interface ActiveState {
+export interface ActiveState {
   messageID: string;
   sessionID: string;
   startedAt: number;
@@ -87,21 +88,100 @@ interface ActiveState {
   fallbackTokens: Partial<TokenCounts>;
   legacy: CandidateStream;
   v2: CandidateStream;
+  selectedSource?: StreamName;
 }
 
-interface TuiOptions {
+export type SessionRunStatus = "idle" | "busy" | "retry";
+
+interface RuntimeContribution {
+  tokens: TokenCounts;
+  cost: number;
+}
+
+export interface SessionRunSummary {
+  runEpoch: number;
+  tokens: TokenCounts;
+  cost: number;
+  responseCount: number;
+  startedAt?: number;
+  firstTokenAt?: number;
+  completedAt?: number;
+}
+
+export interface SessionRuntime {
+  status: SessionRunStatus;
+  runEpoch: number;
+  activeMessageID?: string;
+  runStartedAt?: number;
+  runFirstTokenAt?: number;
+  runTotals: TokenCounts;
+  runCost: number;
+  runResponseCount: number;
+  seenMessageIDs: Set<string>;
+  lastRunSummary?: SessionRunSummary;
+  contributions: Map<string, RuntimeContribution>;
+}
+
+export type TaskSessionState = "busy" | "retry" | "idle" | "completed";
+
+interface PendingTaskSession {
+  state: TaskSessionState;
+  timestamp: number;
+}
+
+export interface TaskWallTimeSummary {
+  runEpoch: number;
+  startedAt: number;
+  completedAt: number;
+  wallTime: number;
+}
+
+export interface TaskWallRun {
+  rootSessionID: string;
+  phase: "idle" | "active";
+  runEpoch: number;
+  rootBusy: boolean;
+  rootObserved: boolean;
+  hasExplicitRootStart: boolean;
+  runStartedAt?: number;
+  participantSessions: Set<string>;
+  activeSessions: Set<string>;
+  sessionStates: Map<string, TaskSessionState>;
+  lastActivityAt: Map<string, number>;
+  pendingSessions: Map<string, PendingTaskSession>;
+  lastRunWallTime?: TaskWallTimeSummary;
+}
+
+export interface LastCompletedSnapshot {
+  record: HistoryRecord;
+  rate: number;
+  generated: number;
+  ttft?: number;
+  elapsed: number;
+  runEpoch: number;
+  estimated: boolean;
+}
+
+export interface TuiOptions {
   historyPath?: string;
   maxRecords: number;
   bytesPerToken: number;
   enabled: boolean;
 }
 
-interface RuntimeStore {
+export interface RuntimeStore {
   maxRecords: number;
   records: HistoryRecord[];
   optimistic: Map<string, HistoryRecord>;
   active: Map<string, ActiveState>;
   completedMessageIDs: Set<string>;
+  sessionRuntime: Map<string, SessionRuntime>;
+  taskRuns: Map<string, TaskWallRun>;
+  sessionParents: Map<string, string>;
+  lastCompletedBySession: Map<string, LastCompletedSnapshot>;
+  focusSessionID?: string;
+  pulseExpanded: boolean;
+  historyGeneration: number;
   revision: () => number;
   bump: () => void;
   disposed: boolean;
@@ -122,7 +202,7 @@ interface ChildRow {
   model: string;
 }
 
-interface RecordSpeedSummary extends RateStats {
+export interface RecordSpeedSummary extends RateStats {
   generated: number;
 }
 
@@ -179,7 +259,7 @@ function readNumberFrom(
 function normalizeEvent(input: unknown): CompatibleEvent | undefined {
   const outer = asRecord(input);
   if (!outer) return undefined;
-  const nested = asRecord(outer.event);
+  const nested = asRecord(outer.event) ?? asRecord(outer.payload);
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
@@ -222,11 +302,18 @@ function readSessionID(
   properties: ObjectRecord,
   event: CompatibleEvent,
 ): string | undefined {
-  return readStringFrom([properties, event], [
+  const direct = readStringFrom([properties, event], [
     "sessionID",
     "sessionId",
     "session.id",
   ]);
+  if (direct) return direct;
+  return readStringFrom([
+    asRecord(properties.info),
+    asRecord(properties.session),
+    asRecord(event.info),
+    asRecord(event.session),
+  ], ["id", "sessionID", "sessionId", "session.id"]);
 }
 
 function readDelta(
@@ -301,7 +388,243 @@ function pendingKey(sessionID: string): string {
   return `__pending__:${sessionID}`;
 }
 
-function createActiveState(
+export function createSessionRuntime(): SessionRuntime {
+  return {
+    status: "idle",
+    runEpoch: 0,
+    runTotals: emptyTokenCounts(),
+    runCost: 0,
+    runResponseCount: 0,
+    seenMessageIDs: new Set<string>(),
+    contributions: new Map<string, RuntimeContribution>(),
+  };
+}
+
+export function createTaskWallRun(rootSessionID: string): TaskWallRun {
+  return {
+    rootSessionID,
+    phase: "idle",
+    runEpoch: 0,
+    rootBusy: false,
+    rootObserved: false,
+    hasExplicitRootStart: false,
+    participantSessions: new Set<string>(),
+    activeSessions: new Set<string>(),
+    sessionStates: new Map<string, TaskSessionState>(),
+    lastActivityAt: new Map<string, number>(),
+    pendingSessions: new Map<string, PendingTaskSession>(),
+  };
+}
+
+function clearTaskRunParticipants(run: TaskWallRun): void {
+  run.participantSessions.clear();
+  run.activeSessions.clear();
+  run.sessionStates.clear();
+  run.lastActivityAt.clear();
+}
+
+function activeTaskSessionState(state: TaskSessionState | undefined): boolean {
+  return state === "busy" || state === "retry";
+}
+
+function startTaskWallRun(
+  run: TaskWallRun,
+  timestamp: number,
+  explicitRootStart: boolean,
+): void {
+  run.phase = "active";
+  run.runEpoch += 1;
+  run.runStartedAt = timestamp;
+  run.rootBusy = explicitRootStart;
+  run.rootObserved = explicitRootStart;
+  run.hasExplicitRootStart = explicitRootStart;
+  clearTaskRunParticipants(run);
+  run.pendingSessions.forEach((pending, sessionID) => {
+    const continuesIntoRun = pending.state === "busy"
+      || pending.state === "retry"
+      || pending.timestamp >= timestamp;
+    if (!continuesIntoRun) return;
+    run.participantSessions.add(sessionID);
+    run.sessionStates.set(sessionID, pending.state);
+    run.lastActivityAt.set(sessionID, pending.timestamp);
+    if (pending.state === "busy" || pending.state === "retry") {
+      run.activeSessions.add(sessionID);
+    }
+  });
+  run.pendingSessions.clear();
+  if (explicitRootStart) {
+    run.participantSessions.add(run.rootSessionID);
+    run.activeSessions.add(run.rootSessionID);
+    run.sessionStates.set(run.rootSessionID, "busy");
+    run.lastActivityAt.set(run.rootSessionID, timestamp);
+  }
+}
+
+function recordTaskSessionActivity(
+  run: TaskWallRun,
+  sessionID: string,
+  state: TaskSessionState,
+  timestamp: number,
+): void {
+  run.participantSessions.add(sessionID);
+  run.sessionStates.set(sessionID, state);
+  const previous = run.lastActivityAt.get(sessionID);
+  run.lastActivityAt.set(
+    sessionID,
+    previous === undefined ? timestamp : Math.max(previous, timestamp),
+  );
+  if (state === "busy" || state === "retry") run.activeSessions.add(sessionID);
+  else run.activeSessions.delete(sessionID);
+  if (sessionID === run.rootSessionID) {
+    run.rootObserved = true;
+    run.rootBusy = state === "busy" || state === "retry";
+  }
+}
+
+function finishTaskWallRun(
+  run: TaskWallRun,
+  timestamp: number,
+): TaskWallTimeSummary | undefined {
+  if (run.phase !== "active" || !run.rootObserved || run.activeSessions.size > 0) return undefined;
+  const startedAt = run.runStartedAt ?? timestamp;
+  const activityEnd = Math.max(
+    timestamp,
+    ...run.lastActivityAt.values(),
+  );
+  const summary: TaskWallTimeSummary = {
+    runEpoch: run.runEpoch,
+    startedAt,
+    completedAt: activityEnd,
+    wallTime: Math.max(0, activityEnd - startedAt),
+  };
+  run.lastRunWallTime = summary;
+  run.phase = "idle";
+  run.rootBusy = false;
+  run.rootObserved = false;
+  run.activeSessions.clear();
+  return summary;
+}
+
+export function transitionTaskWallRun(
+  run: TaskWallRun,
+  sessionID: string,
+  state: TaskSessionState,
+  timestamp: number,
+): TaskWallTimeSummary | undefined {
+  const isRoot = sessionID === run.rootSessionID;
+  const startsRootRun = isRoot && activeTaskSessionState(state);
+  if (run.phase === "idle") {
+    if (startsRootRun) {
+      startTaskWallRun(run, timestamp, true);
+    } else {
+      run.pendingSessions.set(sessionID, { state, timestamp });
+      return undefined;
+    }
+  } else if (startsRootRun && !run.hasExplicitRootStart) {
+    run.runStartedAt = timestamp;
+    run.hasExplicitRootStart = true;
+    run.rootObserved = true;
+    run.rootBusy = true;
+  }
+  recordTaskSessionActivity(run, sessionID, state, timestamp);
+  return finishTaskWallRun(run, timestamp);
+}
+
+export function noteTaskRunRecord(
+  run: TaskWallRun,
+  sessionID: string,
+  startedAt: number | undefined,
+  completedAt: number | undefined,
+): TaskWallTimeSummary | undefined {
+  if (run.phase !== "active") return undefined;
+  const activityAt = completedAt ?? startedAt;
+  if (activityAt === undefined) return undefined;
+  recordTaskSessionActivity(run, sessionID, "completed", activityAt);
+  return finishTaskWallRun(run, activityAt);
+}
+
+function startSessionRun(
+  runtime: SessionRuntime,
+  timestamp: number,
+  status: Exclude<SessionRunStatus, "idle"> = "busy",
+): void {
+  runtime.runEpoch += 1;
+  runtime.status = status;
+  runtime.activeMessageID = undefined;
+  runtime.runStartedAt = timestamp;
+  runtime.runFirstTokenAt = undefined;
+  runtime.runTotals = emptyTokenCounts();
+  runtime.runCost = 0;
+  runtime.runResponseCount = 0;
+  runtime.seenMessageIDs.clear();
+  runtime.contributions.clear();
+}
+
+export function transitionSessionRuntime(
+  runtime: SessionRuntime,
+  status: SessionRunStatus,
+  timestamp: number,
+): boolean {
+  if (status === "idle") {
+    if (runtime.status === "idle" && runtime.activeMessageID === undefined) return false;
+    runtime.status = "idle";
+    return true;
+  }
+  if (runtime.status === "idle") {
+    if (status === "busy" || runtime.runEpoch === 0) startSessionRun(runtime, timestamp, status);
+    else runtime.status = status;
+  } else {
+    runtime.status = status;
+  }
+  runtime.runStartedAt = runtime.runStartedAt === undefined
+    ? timestamp
+    : Math.min(runtime.runStartedAt, timestamp);
+  return true;
+}
+
+export function freezeSessionRun(
+  runtime: SessionRuntime,
+  timestamp: number,
+): SessionRunSummary | undefined {
+  if (runtime.status === "idle") return undefined;
+  const summary: SessionRunSummary = {
+    runEpoch: runtime.runEpoch,
+    tokens: { ...runtime.runTotals },
+    cost: runtime.runCost,
+    responseCount: runtime.runResponseCount,
+    ...(runtime.runStartedAt !== undefined ? { startedAt: runtime.runStartedAt } : {}),
+    ...(runtime.runFirstTokenAt !== undefined ? { firstTokenAt: runtime.runFirstTokenAt } : {}),
+    completedAt: timestamp,
+  };
+  runtime.lastRunSummary = summary;
+  runtime.status = "idle";
+  runtime.activeMessageID = undefined;
+  return summary;
+}
+
+function ensureSessionRun(
+  store: RuntimeStore,
+  sessionID: string,
+  timestamp: number,
+): SessionRuntime {
+  const runtime = getSessionRuntime(store, sessionID);
+  if (runtime.status === "idle") startSessionRun(runtime, timestamp);
+  runtime.status = "busy";
+  runtime.runStartedAt = runtime.runStartedAt === undefined
+    ? timestamp
+    : Math.min(runtime.runStartedAt, timestamp);
+  return runtime;
+}
+
+function getSessionRuntime(store: RuntimeStore, sessionID: string): SessionRuntime {
+  const existing = store.sessionRuntime.get(sessionID);
+  if (existing) return existing;
+  const runtime = createSessionRuntime();
+  store.sessionRuntime.set(sessionID, runtime);
+  return runtime;
+}
+
+export function createActiveState(
   messageID: string,
   sessionID: string,
   timestamp: number,
@@ -316,23 +639,11 @@ function createActiveState(
   };
 }
 
-function mergeActiveStates(target: ActiveState, source: ActiveState): void {
-  target.startedAt = Math.min(target.startedAt, source.startedAt);
-  if (
-    target.firstTokenAt === undefined
-    || (source.firstTokenAt !== undefined && source.firstTokenAt < target.firstTokenAt)
-  ) {
-    target.firstTokenAt = source.firstTokenAt;
-  }
-  target.model = target.model ?? source.model;
-  target.cost = target.cost ?? source.cost;
-  target.fallbackTokens = mergeTokenFields(source.fallbackTokens, target.fallbackTokens);
-  target.legacy.hasData ||= source.legacy.hasData;
-  target.legacy.samples.push(...source.legacy.samples);
-  target.v2.hasData ||= source.v2.hasData;
-  target.v2.samples.push(...source.v2.samples);
-  target.legacy.samples.sort((left, right) => left.timestamp - right.timestamp);
-  target.v2.samples.sort((left, right) => left.timestamp - right.timestamp);
+export function lockStreamSource(
+  selected: StreamName | undefined,
+  incoming: StreamName,
+): StreamName {
+  return selected ?? incoming;
 }
 
 function getOrCreateActiveState(
@@ -344,39 +655,38 @@ function getOrCreateActiveState(
   const direct = messageID ? active.get(messageID) : undefined;
   const pendingID = pendingKey(sessionID);
   const pending = active.get(pendingID);
-  if (direct && pending && direct !== pending) {
-    mergeActiveStates(direct, pending);
-    active.delete(pendingID);
-  }
   const state = direct ?? pending ?? createActiveState(messageID ?? pendingID, sessionID, timestamp);
   if (messageID) state.messageID = messageID;
   if (messageID && pending && state === pending) active.delete(pendingID);
   return state;
 }
 
-function takeActiveState(
+export function takeActiveState(
   active: Map<string, ActiveState>,
   messageID: string,
   sessionID: string,
 ): ActiveState | undefined {
   const direct = active.get(messageID);
   const pendingID = pendingKey(sessionID);
-  const pending = active.get(pendingID);
-  if (direct && pending && direct !== pending) {
-    mergeActiveStates(direct, pending);
-    active.delete(pendingID);
-  }
-  const state = direct ?? pending;
+  const state = direct ?? active.get(pendingID);
   if (!state || state.sessionID !== sessionID) return undefined;
   active.delete(messageID);
-  active.delete(pendingID);
+  if (!direct) active.delete(pendingID);
   state.messageID = messageID;
   return state;
 }
 
-function selectedSamples(state: ActiveState | undefined): SpeedSample[] {
+export function selectedSamples(state: ActiveState | undefined): SpeedSample[] {
   if (!state) return [];
+  if (state.selectedSource === "v2") return [...state.v2.samples];
+  if (state.selectedSource === "legacy") return [...state.legacy.samples];
   return state.v2.hasData ? [...state.v2.samples] : [...state.legacy.samples];
+}
+
+// Keep live estimates source-locked; only final calibration gives v2 its priority.
+export function finalSamples(state: ActiveState | undefined): SpeedSample[] {
+  if (!state) return [];
+  return state.v2.hasData ? [...state.v2.samples] : selectedSamples(state);
 }
 
 function estimateActiveTokens(
@@ -391,7 +701,8 @@ function estimateActiveTokens(
     else result.output += tokens;
   }
   if (state && samples.length === 0) {
-    for (const sample of [...state.legacy.samples, ...state.v2.samples]) {
+    const source = state.selectedSource === "v2" ? state.v2 : state.legacy;
+    for (const sample of source.samples) {
       result.output += bytesToTokens(sample.bytes ?? 0, bytesPerToken);
     }
   }
@@ -426,10 +737,10 @@ function terminalStatus(value: unknown): boolean {
   return terminalStatus(value.type) || terminalStatus(value.status);
 }
 
-function isIdleEvent(type: string, properties: ObjectRecord, event: CompatibleEvent): boolean {
-  if (type === "session.idle") return true;
-  if (type !== "session.status" && !type.endsWith(".status")) return false;
-  return terminalStatus(properties.status ?? properties.state ?? event.status);
+function statusName(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!isRecord(value)) return undefined;
+  return readString(value.type) ?? readString(value.status);
 }
 
 function infoTimeValue(
@@ -496,6 +807,94 @@ function makeTokens(
   };
 }
 
+function replaceTokenContribution(
+  total: TokenCounts,
+  previous: TokenCounts,
+  next: TokenCounts,
+): TokenCounts {
+  return {
+    input: Math.max(0, total.input - previous.input + next.input),
+    output: Math.max(0, total.output - previous.output + next.output),
+    reasoning: Math.max(0, total.reasoning - previous.reasoning + next.reasoning),
+    cacheRead: Math.max(0, total.cacheRead - previous.cacheRead + next.cacheRead),
+    cacheWrite: Math.max(0, total.cacheWrite - previous.cacheWrite + next.cacheWrite),
+  };
+}
+
+export function applyRecordToSessionRuntime(
+  runtime: SessionRuntime,
+  record: HistoryRecord,
+): boolean {
+  const previous = runtime.contributions.get(record.messageID);
+  if (previous) {
+    runtime.runTotals = replaceTokenContribution(runtime.runTotals, previous.tokens, record.tokens);
+    runtime.runCost = Math.max(0, runtime.runCost - previous.cost + record.cost);
+  } else {
+    runtime.runTotals = addTokenCounts(runtime.runTotals, record.tokens);
+    runtime.runCost += record.cost;
+    runtime.runResponseCount += 1;
+    runtime.seenMessageIDs.add(record.messageID);
+  }
+  runtime.contributions.set(record.messageID, { tokens: record.tokens, cost: record.cost });
+  runtime.runStartedAt = runtime.runStartedAt === undefined
+    ? record.time.start
+    : Math.min(runtime.runStartedAt, record.time.start);
+  if (record.time.firstToken !== undefined) {
+    runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined
+      ? record.time.firstToken
+      : Math.min(runtime.runFirstTokenAt, record.time.firstToken);
+  }
+  return previous === undefined;
+}
+
+function completedElapsed(record: HistoryRecord): number {
+  const completed = record.time.completed ?? record.time.start;
+  const firstToken = record.time.firstToken;
+  if (firstToken !== undefined) return Math.max(0, completed - firstToken);
+  return Math.max(0, durationOf(record) ?? 0);
+}
+
+export function makeLastCompletedSnapshot(
+  record: HistoryRecord,
+  runEpoch = 0,
+  estimated = false,
+): LastCompletedSnapshot {
+  const elapsed = completedElapsed(record);
+  const generated = record.tokens.output + record.tokens.reasoning;
+  return {
+    record,
+    rate: elapsed > 0 ? (generated * 1000) / elapsed : 0,
+    generated,
+    ...(timeToFirstToken(record) !== undefined
+      ? { ttft: timeToFirstToken(record) }
+      : {}),
+    elapsed,
+    runEpoch,
+    estimated,
+  };
+}
+
+function commitRecord(
+  store: RuntimeStore,
+  record: HistoryRecord,
+  markCompleted: boolean,
+): void {
+  const existingRuntime = getSessionRuntime(store, record.sessionID);
+  const runtime = existingRuntime.status === "idle"
+    && existingRuntime.contributions.has(record.messageID)
+    ? existingRuntime
+    : ensureSessionRun(store, record.sessionID, record.time.start);
+  runtime.status = "busy";
+  applyRecordToSessionRuntime(runtime, record);
+  if (runtime.activeMessageID === record.messageID) runtime.activeMessageID = undefined;
+  if (markCompleted) store.completedMessageIDs.add(record.messageID);
+  store.lastCompletedBySession.set(
+    record.sessionID,
+    makeLastCompletedSnapshot(record, runtime.runEpoch, !markCompleted),
+  );
+  addOptimisticRecord(store, record);
+}
+
 function parentSessionID(api: TuiPluginApi, sessionID: string, info?: ObjectRecord): string | undefined {
   try {
     const session = api.state.session.get(sessionID);
@@ -503,7 +902,257 @@ function parentSessionID(api: TuiPluginApi, sessionID: string, info?: ObjectReco
   } catch {
     // State can still be syncing while a response completes.
   }
-  return readStringFrom([info], ["parentSessionID", "parentID"]);
+  return readStringFrom([info], ["parentSessionID", "parentSessionId", "parentID"]);
+}
+
+function knownRootSessionID(store: RuntimeStore, sessionID: string): string {
+  let root = sessionID;
+  const visited = new Set<string>();
+  while (!visited.has(root)) {
+    visited.add(root);
+    const parent = store.sessionParents.get(root);
+    if (!parent) break;
+    root = parent;
+  }
+  return root;
+}
+
+function mergeTaskWallRun(
+  target: TaskWallRun,
+  source: TaskWallRun,
+  rootSessionID: string,
+): void {
+  const activeCandidates = new Set([
+    ...target.activeSessions,
+    ...source.activeSessions,
+  ]);
+  target.rootSessionID = rootSessionID;
+  target.phase = target.phase === "active" || source.phase === "active"
+    ? "active"
+    : "idle";
+  target.runEpoch = Math.max(target.runEpoch, source.runEpoch);
+  target.rootBusy = target.rootBusy || source.rootBusy;
+  target.rootObserved = target.rootObserved || source.rootObserved;
+  target.hasExplicitRootStart = target.hasExplicitRootStart || source.hasExplicitRootStart;
+  if (source.runStartedAt !== undefined) {
+    target.runStartedAt = target.runStartedAt === undefined
+      ? source.runStartedAt
+      : Math.min(target.runStartedAt, source.runStartedAt);
+  }
+
+  for (const sessionID of source.participantSessions) {
+    target.participantSessions.add(sessionID);
+  }
+  for (const [sessionID, state] of source.sessionStates) {
+    const current = target.sessionStates.get(sessionID);
+    const currentAt = target.lastActivityAt.get(sessionID) ?? Number.NEGATIVE_INFINITY;
+    const sourceAt = source.lastActivityAt.get(sessionID) ?? Number.NEGATIVE_INFINITY;
+    if (
+      current === undefined
+      || sourceAt > currentAt
+      || (sourceAt === currentAt && activeTaskSessionState(state) && !activeTaskSessionState(current))
+    ) {
+      target.sessionStates.set(sessionID, state);
+    }
+  }
+  for (const [sessionID, timestamp] of source.lastActivityAt) {
+    const current = target.lastActivityAt.get(sessionID);
+    if (current === undefined || timestamp > current) {
+      target.lastActivityAt.set(sessionID, timestamp);
+    }
+  }
+  for (const [sessionID, pending] of source.pendingSessions) {
+    const current = target.pendingSessions.get(sessionID);
+    if (
+      current === undefined
+      || pending.timestamp > current.timestamp
+      || (
+        pending.timestamp === current.timestamp
+        && activeTaskSessionState(pending.state)
+        && !activeTaskSessionState(current.state)
+      )
+    ) {
+      target.pendingSessions.set(sessionID, pending);
+    }
+  }
+
+  for (const sessionID of activeCandidates) {
+    target.participantSessions.add(sessionID);
+    if (!target.sessionStates.has(sessionID)) {
+      target.sessionStates.set(sessionID, "busy");
+    }
+  }
+  target.activeSessions.clear();
+  for (const [sessionID, state] of target.sessionStates) {
+    if (activeTaskSessionState(state)) target.activeSessions.add(sessionID);
+  }
+  const rootState = target.sessionStates.get(rootSessionID);
+  if (rootState !== undefined) target.rootBusy = activeTaskSessionState(rootState);
+
+  const sourceSummary = source.lastRunWallTime;
+  const targetSummary = target.lastRunWallTime;
+  if (
+    targetSummary === undefined
+    || (
+      sourceSummary !== undefined
+      && (
+        sourceSummary.runEpoch > targetSummary.runEpoch
+        || (
+          sourceSummary.runEpoch === targetSummary.runEpoch
+          && sourceSummary.completedAt > targetSummary.completedAt
+        )
+      )
+    )
+  ) {
+    target.lastRunWallTime = sourceSummary;
+  }
+}
+
+function migrateTaskWallRuns(store: RuntimeStore, rootSessionID: string): boolean {
+  let target = store.taskRuns.get(rootSessionID);
+  let changed = false;
+  const entries = [...store.taskRuns.entries()];
+  for (const [key, source] of entries) {
+    if (key === rootSessionID) continue;
+    if (
+      knownRootSessionID(store, key) !== rootSessionID
+      && knownRootSessionID(store, source.rootSessionID) !== rootSessionID
+    ) {
+      continue;
+    }
+    if (!target) {
+      source.rootSessionID = rootSessionID;
+      store.taskRuns.delete(key);
+      store.taskRuns.set(rootSessionID, source);
+      target = source;
+    } else {
+      mergeTaskWallRun(target, source, rootSessionID);
+      store.taskRuns.delete(key);
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+function rememberSessionParent(
+  store: RuntimeStore,
+  sessionID: string,
+  parentID: string,
+): boolean {
+  if (!sessionID || !parentID || sessionID === parentID) return false;
+  const previous = store.sessionParents.get(sessionID);
+  if (previous !== parentID) store.sessionParents.set(sessionID, parentID);
+  const rootSessionID = knownRootSessionID(store, sessionID);
+  const migrated = migrateTaskWallRuns(store, rootSessionID);
+  return previous !== parentID || migrated;
+}
+
+function sessionEventSources(
+  properties: ObjectRecord,
+  event: CompatibleEvent,
+): ObjectRecord[] {
+  return [
+    asRecord(properties.info),
+    asRecord(properties.session),
+    asRecord(event.info),
+    asRecord(event.session),
+    properties,
+    event,
+  ].filter((value): value is ObjectRecord => value !== undefined);
+}
+
+export function cacheSessionParentFromEvent(store: RuntimeStore, input: unknown): boolean {
+  const event = normalizeEvent(input);
+  if (!event) return false;
+  const type = eventType(event);
+  if (type !== "session.created" && type !== "session.updated") return false;
+  const properties = eventProperties(event);
+  const sessionID = readSessionID(properties, event);
+  const parentID = readStringFrom(
+    sessionEventSources(properties, event),
+    ["parentID", "parentSessionID", "parentSessionId", "parent.id"],
+  );
+  if (!sessionID || !parentID) return false;
+  return rememberSessionParent(store, sessionID, parentID);
+}
+
+function rootSessionIDFor(
+  store: RuntimeStore,
+  api: TuiPluginApi,
+  sessionID: string,
+  info?: ObjectRecord,
+): string {
+  const parent = parentSessionID(api, sessionID, info);
+  if (parent) rememberSessionParent(store, sessionID, parent);
+  const rootSessionID = knownRootSessionID(store, sessionID);
+  migrateTaskWallRuns(store, rootSessionID);
+  return rootSessionID;
+}
+
+function getTaskWallRun(store: RuntimeStore, rootSessionID: string): TaskWallRun {
+  migrateTaskWallRuns(store, rootSessionID);
+  const existing = store.taskRuns.get(rootSessionID);
+  if (existing) return existing;
+  const run = createTaskWallRun(rootSessionID);
+  store.taskRuns.set(rootSessionID, run);
+  return run;
+}
+
+function findTaskWallRun(
+  store: RuntimeStore,
+  rootSessionID: string,
+  sessionID: string,
+): TaskWallRun | undefined {
+  const direct = store.taskRuns.get(rootSessionID);
+  if (direct) return direct;
+  for (const [key, run] of store.taskRuns) {
+    if (
+      key === sessionID
+      || run.rootSessionID === sessionID
+      || run.participantSessions.has(sessionID)
+      || run.activeSessions.has(sessionID)
+      || run.sessionStates.has(sessionID)
+      || run.pendingSessions.has(sessionID)
+    ) {
+      return run;
+    }
+  }
+  return undefined;
+}
+
+export function taskWallTimeForSession(
+  store: RuntimeStore,
+  sessionID: string | undefined,
+  now = Date.now(),
+): number | undefined {
+  if (!sessionID) return undefined;
+  const rootSessionID = knownRootSessionID(store, sessionID);
+  migrateTaskWallRuns(store, rootSessionID);
+  const run = findTaskWallRun(store, rootSessionID, sessionID);
+  if (!run) return undefined;
+  if (run.phase === "active" && run.runStartedAt !== undefined) {
+    return Math.max(0, now - run.runStartedAt);
+  }
+  if (run.lastRunWallTime) return run.lastRunWallTime.wallTime;
+  return undefined;
+}
+
+export function noteTaskRecord(
+  store: RuntimeStore,
+  api: TuiPluginApi,
+  record: HistoryRecord,
+): void {
+  const info = record.parentSessionID ? { parentSessionID: record.parentSessionID } : undefined;
+  const rootSessionID = rootSessionIDFor(store, api, record.sessionID, info);
+  const run = findTaskWallRun(store, rootSessionID, record.sessionID);
+  if (!run || run.phase !== "active") return;
+  const summary = noteTaskRunRecord(
+    run,
+    record.sessionID,
+    record.time.start,
+    record.time.completed,
+  );
+  if (summary) store.bump();
 }
 
 function recordDelta(
@@ -520,10 +1169,9 @@ function recordDelta(
   const delta = readDelta(properties, event);
   if (!delta) return;
   const timestamp = eventTimestamp(event, properties);
-  const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
-  if (state.sessionID !== sessionID) return;
-  state.startedAt = Math.min(state.startedAt, timestamp);
-  state.firstTokenAt = state.firstTokenAt ?? timestamp;
+  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const existingState = (messageID ? store.active.get(messageID) : undefined)
+    ?? store.active.get(pendingKey(sessionID));
   const bytes = utf8ByteLength(delta);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample: SpeedSample = {
@@ -533,6 +1181,23 @@ function recordDelta(
     bytes,
     kind: explicitKind ?? inferKind(properties, event),
   };
+  if (existingState?.selectedSource !== undefined && existingState.selectedSource !== stream) {
+    existingState[stream].hasData = true;
+    existingState[stream].samples.push(sample);
+    existingState[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
+    if (messageID) runtime.activeMessageID = messageID;
+    store.bump();
+    return;
+  }
+  const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
+  if (state.sessionID !== sessionID) return;
+  state.selectedSource = lockStreamSource(state.selectedSource, stream);
+  state.startedAt = Math.min(state.startedAt, timestamp);
+  state.firstTokenAt = state.firstTokenAt ?? timestamp;
+  runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined
+    ? timestamp
+    : Math.min(runtime.runFirstTokenAt, timestamp);
+  if (messageID) runtime.activeMessageID = messageID;
   state[stream].hasData = true;
   state[stream].samples.push(sample);
   state[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
@@ -549,9 +1214,11 @@ function recordStepStarted(
   if (!sessionID) return;
   const messageID = readMessageID(properties);
   const timestamp = eventTimestamp(event, properties);
+  const runtime = ensureSessionRun(store, sessionID, timestamp);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.startedAt = Math.min(state.startedAt, timestamp);
   state.model = state.model ?? modelName(properties);
+  if (messageID) runtime.activeMessageID = messageID;
   store.active.set(messageID ?? pendingKey(sessionID), state);
   store.bump();
 }
@@ -565,6 +1232,7 @@ function recordStepFallback(
   if (!sessionID) return;
   const messageID = readMessageID(properties);
   const timestamp = eventTimestamp(event, properties);
+  const runtime = ensureSessionRun(store, sessionID, timestamp);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.fallbackTokens = mergeTokenFields(
     state.fallbackTokens,
@@ -572,13 +1240,14 @@ function recordStepFallback(
   );
   state.model = state.model ?? modelName(properties);
   state.cost = state.cost ?? readNumber(properties.cost);
+  if (messageID) runtime.activeMessageID = messageID;
   store.active.set(messageID ?? pendingKey(sessionID), state);
   store.bump();
 }
 
 function addOptimisticRecord(store: RuntimeStore, record: HistoryRecord): void {
   store.optimistic.set(record.messageID, record);
-  store.records = mergeRecords(store.records, store.optimistic, store.maxRecords);
+  store.records = mergeHistoryLayers(store.records, store.optimistic, store.maxRecords);
   store.bump();
 }
 
@@ -601,6 +1270,7 @@ function handleMessageUpdated(
   const timestamp = eventTimestamp(event, properties);
 
   if (!isCompleted(info, properties, event)) {
+    const runtime = ensureSessionRun(store, sessionID, timestamp);
     const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
     state.startedAt = Math.min(
       state.startedAt,
@@ -609,6 +1279,7 @@ function handleMessageUpdated(
     state.model = state.model ?? modelName(info);
     state.cost = state.cost ?? readNumber(info.cost);
     state.fallbackTokens = mergeTokenFields(state.fallbackTokens, tokenFields(info.tokens));
+    runtime.activeMessageID = messageID;
     store.active.set(messageID, state);
     store.bump();
     return false;
@@ -616,8 +1287,9 @@ function handleMessageUpdated(
 
   if (store.completedMessageIDs.has(messageID)) {
     store.active.delete(messageID);
-    store.active.delete(pendingKey(sessionID));
-    return true;
+    const runtime = getSessionRuntime(store, sessionID);
+    if (runtime.activeMessageID === messageID) runtime.activeMessageID = undefined;
+    return false;
   }
   const state = takeActiveState(store.active, messageID, sessionID);
   const tokens = makeTokens(info, state, bytesPerToken);
@@ -628,7 +1300,7 @@ function handleMessageUpdated(
     model: modelName(info) ?? state?.model,
     cost: readNumber(info.cost) ?? state?.cost ?? 0,
     tokens,
-    samples: calibrateResponseSamples(selectedSamples(state), {
+    samples: calibrateResponseSamples(finalSamples(state), {
       output: tokens.output,
       reasoning: tokens.reasoning,
     }),
@@ -636,8 +1308,8 @@ function handleMessageUpdated(
     info,
     completedAt: timestamp,
   });
-  store.completedMessageIDs.add(messageID);
-  addOptimisticRecord(store, record);
+  commitRecord(store, record, true);
+  noteTaskRecord(store, api, record);
   return true;
 }
 
@@ -646,9 +1318,9 @@ function flushIdleStates(
   api: TuiPluginApi,
   sessionID: string,
   bytesPerToken: number,
+  completedAt = Date.now(),
 ): boolean {
   let flushed = false;
-  const timestamp = Date.now();
   const entries = [...store.active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
     store.active.delete(key);
@@ -661,21 +1333,89 @@ function flushIdleStates(
       model: state.model,
       cost: state.cost ?? 0,
       tokens,
-      samples: calibrateResponseSamples(selectedSamples(state), {
+      samples: calibrateResponseSamples(finalSamples(state), {
         output: tokens.output,
         reasoning: tokens.reasoning,
       }),
       state,
-      completedAt: timestamp,
+      completedAt,
     });
-    addOptimisticRecord(store, record);
+    commitRecord(store, record, false);
     flushed = true;
   }
   if (entries.length > 0) store.bump();
   return flushed;
 }
 
-function mergeRecords(
+function sessionRunStatus(
+  type: string,
+  properties: ObjectRecord,
+  event: CompatibleEvent,
+): SessionRunStatus | undefined {
+  if (type === "session.idle") return "idle";
+  if (type !== "session.status" && !type.endsWith(".status")) return undefined;
+  const value = properties.status ?? properties.state ?? event.status;
+  const name = statusName(value);
+  if (name === "busy" || name === "retry") return name;
+  if (terminalStatus(value)) return "idle";
+  return undefined;
+}
+
+function finishSessionRun(
+  store: RuntimeStore,
+  api: TuiPluginApi,
+  sessionID: string,
+  bytesPerToken: number,
+  completedAt: number,
+): boolean {
+  const runtime = getSessionRuntime(store, sessionID);
+  const hadActive = [...store.active.values()].some((state) => state.sessionID === sessionID);
+  const wasRunning = runtime.status !== "idle" || hadActive;
+  const flushed = flushIdleStates(store, api, sessionID, bytesPerToken, completedAt);
+  const frozen = wasRunning ? freezeSessionRun(runtime, completedAt) : undefined;
+  runtime.status = "idle";
+  runtime.activeMessageID = undefined;
+  if (hadActive || flushed || frozen !== undefined || wasRunning) {
+    store.bump();
+    return true;
+  }
+  return false;
+}
+
+export function handleSessionLifecycle(
+  store: RuntimeStore,
+  api: TuiPluginApi,
+  type: string,
+  properties: ObjectRecord,
+  event: CompatibleEvent,
+  bytesPerToken: number,
+): boolean {
+  const sessionID = readSessionID(properties, event);
+  const status = sessionRunStatus(type, properties, event);
+  if (!sessionID || status === undefined) return false;
+  const timestamp = eventTimestamp(event, properties);
+  const rootSessionID = rootSessionIDFor(store, api, sessionID);
+  const taskRun = status === "idle"
+    ? findTaskWallRun(store, rootSessionID, sessionID)
+    : getTaskWallRun(store, rootSessionID);
+  if (status === "idle") {
+    const finishedSession = finishSessionRun(store, api, sessionID, bytesPerToken, timestamp);
+    const finishedTask = taskRun
+      ? transitionTaskWallRun(taskRun, sessionID, "idle", timestamp)
+      : undefined;
+    if (finishedTask) store.bump();
+    return finishedSession || finishedTask !== undefined;
+  }
+  if (!taskRun) return false;
+  const runtime = getSessionRuntime(store, sessionID);
+  const changed = transitionSessionRuntime(runtime, status, timestamp);
+  const finishedTask = transitionTaskWallRun(taskRun, sessionID, status, timestamp);
+  if (changed) store.bump();
+  if (finishedTask) store.bump();
+  return false;
+}
+
+export function mergeHistoryLayers(
   diskRecords: readonly HistoryRecord[],
   optimistic: ReadonlyMap<string, HistoryRecord>,
   maxRecords: number,
@@ -690,17 +1430,76 @@ function mergeRecords(
   return [...byMessage.values()].slice(-maxRecords);
 }
 
+function tokenCountsEqual(left: TokenCounts, right: TokenCounts): boolean {
+  return left.input === right.input
+    && left.output === right.output
+    && left.reasoning === right.reasoning
+    && left.cacheRead === right.cacheRead
+    && left.cacheWrite === right.cacheWrite;
+}
+
+export function historyRecordsEquivalent(
+  left: HistoryRecord,
+  right: HistoryRecord,
+): boolean {
+  return left.messageID === right.messageID
+    && left.sessionID === right.sessionID
+    && left.parentSessionID === right.parentSessionID
+    && left.model === right.model
+    && left.cost === right.cost
+    && tokenCountsEqual(left.tokens, right.tokens)
+    && left.time.start === right.time.start
+    && left.time.firstToken === right.time.firstToken
+    && left.time.completed === right.time.completed
+    && left.time.ttft === right.time.ttft
+    && left.time.duration === right.time.duration;
+}
+
+function recordCompletedAt(record: HistoryRecord): number {
+  return record.time.completed ?? record.time.start;
+}
+
+function hydrateHistoryState(
+  store: RuntimeStore,
+  diskRecords: readonly HistoryRecord[],
+): void {
+  for (const record of diskRecords) {
+    const overlay = store.optimistic.get(record.messageID);
+    if (overlay && !historyRecordsEquivalent(overlay, record)) continue;
+    store.completedMessageIDs.add(record.messageID);
+    const existing = store.lastCompletedBySession.get(record.sessionID);
+    if (
+      existing === undefined
+      || recordCompletedAt(record) >= recordCompletedAt(existing.record)
+    ) {
+      const runtime = store.sessionRuntime.get(record.sessionID);
+      store.lastCompletedBySession.set(
+        record.sessionID,
+        makeLastCompletedSnapshot(record, runtime?.runEpoch ?? 0),
+      );
+    }
+  }
+}
+
 async function reloadHistory(
   store: RuntimeStore,
   api: TuiPluginApi,
   path: string,
   maxRecords: number,
+  generation = store.historyGeneration,
 ): Promise<void> {
   if (store.disposed) return;
   try {
     const diskRecords = (await readHistoryFile(path)).slice(-maxRecords);
-    for (const record of diskRecords) store.optimistic.delete(record.messageID);
-    store.records = mergeRecords(diskRecords, store.optimistic, maxRecords);
+    if (store.disposed || generation !== store.historyGeneration) return;
+    for (const record of diskRecords) {
+      const overlay = store.optimistic.get(record.messageID);
+      if (overlay && historyRecordsEquivalent(overlay, record)) {
+        store.optimistic.delete(record.messageID);
+      }
+    }
+    hydrateHistoryState(store, diskRecords);
+    store.records = mergeHistoryLayers(diskRecords, store.optimistic, maxRecords);
     store.bump();
   } catch (error) {
     warnWithToast(api, "history read failed", error);
@@ -736,7 +1535,7 @@ function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefine
     : join(base, relativeOrAbsolute);
 }
 
-function createRuntimeStore(maxRecords: number): RuntimeStore {
+export function createRuntimeStore(maxRecords: number): RuntimeStore {
   return createRoot((disposeSignals): RuntimeStore => {
     const [revision, setRevision] = createSignal(0);
     return {
@@ -745,6 +1544,12 @@ function createRuntimeStore(maxRecords: number): RuntimeStore {
       optimistic: new Map<string, HistoryRecord>(),
       active: new Map<string, ActiveState>(),
       completedMessageIDs: new Set<string>(),
+      sessionRuntime: new Map<string, SessionRuntime>(),
+      taskRuns: new Map<string, TaskWallRun>(),
+      sessionParents: new Map<string, string>(),
+      lastCompletedBySession: new Map<string, LastCompletedSnapshot>(),
+      pulseExpanded: false,
+      historyGeneration: 0,
       revision,
       bump: () => setRevision((value) => value + 1),
       disposed: false,
@@ -781,8 +1586,44 @@ function generatedTokens(tokens: TokenCounts): number {
   return tokens.output + tokens.reasoning;
 }
 
-function formatRate(value: number): string {
-  return `${formatNumber(value, 1)} tok/s`;
+export function totalTokens(tokens: TokenCounts): number {
+  return tokens.input + tokens.cacheRead + tokens.output + tokens.reasoning;
+}
+
+export function formatCompactNumber(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const sign = value < 0 ? "-" : "";
+  const absolute = Math.abs(value);
+  if (absolute < 1000) return `${sign}${Math.round(absolute)}`;
+  const units = ["k", "M", "B"];
+  let scaled = absolute;
+  let unitIndex = -1;
+  while (scaled >= 1000 && unitIndex < units.length - 1) {
+    scaled /= 1000;
+    unitIndex += 1;
+  }
+  const decimals = unitIndex === units.length - 1 ? 1 : scaled >= 100 ? 0 : 1;
+  let rendered = scaled.toFixed(decimals);
+  if (unitIndex < units.length - 1) rendered = rendered.replace(/\.0$/, "");
+  return `${sign}${rendered}${units[unitIndex]}`;
+}
+
+export function formatCompactRate(value: number): string {
+  return `${formatCompactNumber(value)} tok/s`;
+}
+
+export function formatPulseMetrics(tokens: TokenCounts, speed: number): string {
+  const speedLabel = Number.isFinite(speed) && speed > 0
+    ? ` · ${formatCompactRate(speed)}`
+    : "";
+  return `${formatCompactNumber(totalTokens(tokens))} total${speedLabel}`;
+}
+
+export function formatPulseSummary(tokens: TokenCounts, speed: number): string {
+  const speedLabel = Number.isFinite(speed) && speed > 0
+    ? `  ${formatCompactRate(speed)}`
+    : "";
+  return `+ Token Pulse  ${formatCompactNumber(totalTokens(tokens))} total${speedLabel}`;
 }
 
 function formatCost(value: number): string {
@@ -800,29 +1641,51 @@ function formatOptionalDuration(value: number | undefined): string {
   return value === undefined ? "--" : formatDuration(value);
 }
 
-function recordSpeedSummary(record: HistoryRecord): RecordSpeedSummary {
+export function generationElapsed(record: HistoryRecord): number | undefined {
+  const completed = record.time.completed;
+  const firstToken = record.time.firstToken;
+  if (
+    typeof completed === "number"
+    && Number.isFinite(completed)
+    && typeof firstToken === "number"
+    && Number.isFinite(firstToken)
+  ) {
+    return Math.max(0, completed - firstToken);
+  }
+  return durationOf(record);
+}
+
+function stableGeneratedRate(record: HistoryRecord): number {
+  const elapsed = generationElapsed(record);
+  const generated = generatedTokens(record.tokens);
+  return elapsed !== undefined && elapsed > 0 ? (generated * 1000) / elapsed : 0;
+}
+
+export function recordSpeedSummary(record: HistoryRecord): RecordSpeedSummary {
   const generated = generatedTokens(record.tokens);
   const sampleStats = calculateSpeedStats(record.samples);
+  const stableRate = stableGeneratedRate(record);
   if (record.samples.length >= 2 && sampleStats.avg > 0) {
-    return { ...sampleStats, generated };
+    return { ...sampleStats, avg: stableRate > 0 ? stableRate : sampleStats.avg, generated };
   }
-  const duration = durationOf(record);
-  const fallbackRate = duration !== undefined && duration > 0
-    ? (generated * 1000) / duration
-    : 0;
   return {
-    avg: fallbackRate,
-    max: fallbackRate,
-    min: fallbackRate,
+    avg: stableRate,
+    max: stableRate,
+    min: stableRate,
     generated,
   };
 }
 
-function aggregateSpeed(records: readonly HistoryRecord[]): number {
-  const values = records
-    .map((record) => recordSpeedSummary(record).avg)
-    .filter((value) => Number.isFinite(value) && value > 0);
-  return calculateRateStats(values).avg;
+export function aggregateSpeed(records: readonly HistoryRecord[]): number {
+  let generated = 0;
+  let elapsed = 0;
+  for (const record of records) {
+    const generationTime = generationElapsed(record);
+    if (generationTime === undefined || generationTime <= 0) continue;
+    generated += generatedTokens(record.tokens);
+    elapsed += generationTime;
+  }
+  return elapsed > 0 ? (generated * 1000) / elapsed : 0;
 }
 
 function sparkline(samples: readonly SpeedSample[], width = 8): string {
@@ -860,10 +1723,10 @@ function formatHistoryRow(record: HistoryRecord): string {
     padRight(formatTime(record.time.completed ?? record.time.start), 8),
     padRight(shortTail(record.sessionID, 11), 11),
     padRight(truncateMiddle(record.model, 14), 14),
-    padLeft(`${formatTokens(record.tokens.output)}/${formatTokens(record.tokens.reasoning)}`, 9),
-    padLeft(formatNumber(speed.avg, 1), 6),
-    padLeft(formatNumber(speed.max, 1), 6),
-    padLeft(formatNumber(speed.min, 1), 6),
+    padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9),
+    padLeft(formatCompactNumber(speed.avg), 6),
+    padLeft(formatCompactNumber(speed.max), 6),
+    padLeft(formatCompactNumber(speed.min), 6),
     padLeft(formatOptionalDuration(ttft), 7),
     padLeft(formatOptionalDuration(duration), 7),
     padLeft(formatCost(record.cost), 9),
@@ -878,9 +1741,128 @@ function summaryLines(
   responseCount: number,
 ): string[] {
   return [
-    `${label} in ${formatTokens(tokens.input)} out ${formatTokens(tokens.output)} reasoning ${formatTokens(tokens.reasoning)} generated ${formatTokens(generatedTokens(tokens))}`,
-    `${label} cache ${formatTokens(tokens.cacheRead)}/${formatTokens(tokens.cacheWrite)} cost ${formatCost(cost)} responses ${formatTokens(responseCount)}`,
+    label,
+    `  Total tokens (input + generated) ${formatCompactNumber(totalTokens(tokens))}`,
+    `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`,
+    `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`,
+    `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`,
+    `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`,
   ];
+}
+
+function emptySummaryLines(): string[] {
+  const empty = emptyTokenCounts();
+  return [
+    ...summaryLines("Session only", empty, 0, 0),
+    ...summaryLines("Including subagents", empty, 0, 0),
+    "No completed responses yet",
+  ];
+}
+
+interface PulseMetric {
+  label: string;
+  value: string;
+}
+
+interface PulseSectionData {
+  label: string;
+  tokens: TokenCounts;
+  cost: number;
+  responseCount: number;
+}
+
+function pulseMetricRows(
+  tokens: TokenCounts,
+  cost: number,
+  responseCount: number,
+): PulseMetric[] {
+  return [
+    { label: "Total tokens (input + generated)", value: formatCompactNumber(totalTokens(tokens)) },
+    { label: "Uncached input", value: formatCompactNumber(tokens.input) },
+    { label: "Cache read (reused)", value: formatCompactNumber(tokens.cacheRead) },
+    { label: "Cache write", value: formatCompactNumber(tokens.cacheWrite) },
+    { label: "Visible output", value: formatCompactNumber(tokens.output) },
+    { label: "Reasoning", value: formatCompactNumber(tokens.reasoning) },
+    { label: "Generated", value: formatCompactNumber(generatedTokens(tokens)) },
+    { label: "Model calls", value: formatCompactNumber(responseCount) },
+    { label: "Estimated cost", value: formatCost(cost) },
+  ];
+}
+
+function PulseMetricGrid(props: {
+  theme: TuiPluginApi["theme"];
+  rows: readonly (readonly PulseMetric[])[];
+}): JSX.Element {
+  return (
+    <box flexDirection="column" width="100%">
+      {props.rows.map((row) => (
+        <box flexDirection="row" width="100%" columnGap={1}>
+          {row.map((metric) => (
+            <box flexDirection="column" flexBasis={0} flexGrow={1} minWidth={0}>
+              <text fg={props.theme.current.textMuted} wrapMode="word">
+                {metric.label}
+              </text>
+              <text fg={props.theme.current.text} truncate wrapMode="none">
+                {metric.value}
+              </text>
+            </box>
+          ))}
+        </box>
+      ))}
+    </box>
+  );
+}
+
+function PulseSection(props: {
+  theme: TuiPluginApi["theme"];
+  section: PulseSectionData;
+}): JSX.Element {
+  const metrics = pulseMetricRows(props.section.tokens, props.section.cost, props.section.responseCount);
+  return (
+    <box flexDirection="column" width="100%" paddingTop={1}>
+      <text fg={props.theme.current.accent} truncate wrapMode="none">
+        {props.section.label}
+      </text>
+      <PulseMetricGrid
+        theme={props.theme}
+        rows={[
+          [metrics[0]],
+          [metrics[1], metrics[2]],
+          [metrics[3], metrics[4]],
+          [metrics[5], metrics[6]],
+          [metrics[7], metrics[8]],
+        ]}
+      />
+    </box>
+  );
+}
+
+function ChildAgentRows(props: {
+  theme: TuiPluginApi["theme"];
+  rows: readonly ChildRow[];
+}): JSX.Element {
+  return (
+    <box flexDirection="column" width="100%" paddingTop={1}>
+      <text fg={props.theme.current.accent} truncate wrapMode="none">CHILD AGENTS</text>
+      {props.rows.map((row) => (
+        <box
+          flexDirection="column"
+          width="100%"
+          paddingTop={1}
+          paddingLeft={1}
+          border={["left"]}
+          borderColor={props.theme.current.borderSubtle}
+        >
+          <text fg={props.theme.current.info} truncate wrapMode="none">
+            {`${"  ".repeat(row.depth)}${shortTail(row.sessionID, 10)}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`}
+          </text>
+          <text fg={props.theme.current.textMuted} truncate wrapMode="none">
+            {`model ${truncateMiddle(row.model, 24)}  ${formatCompactRate(row.speed)}`}
+          </text>
+        </box>
+      ))}
+    </box>
+  );
 }
 
 function aggregateForSession(
@@ -955,10 +1937,18 @@ function childRows(
   const rows: ChildRow[] = [];
   const visit = (node: SessionAggregate, depth: number) => {
     const directRecords = records.filter((record) => record.sessionID === node.sessionID);
+    const subtreeIDs = new Set<string>();
+    const collectIDs = (current: SessionAggregate) => {
+      subtreeIDs.add(current.sessionID);
+      current.children.forEach(collectIDs);
+    };
+    collectIDs(node);
+    const subtreeRecords = records.filter((record) => subtreeIDs.has(record.sessionID));
+    const displayRecords = directRecords.length > 0 ? directRecords : subtreeRecords;
     const directGenerated = generatedTokens(node.directTokens);
     const responseCount = node.directResponseCount || node.responseCount;
     const generated = node.directResponseCount > 0 ? directGenerated : generatedTokens(node.tokens);
-    const modelRecord = directRecords
+    const modelRecord = displayRecords
       .slice()
       .sort((left, right) => (
         (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start)
@@ -968,7 +1958,7 @@ function childRows(
       sessionID: node.sessionID,
       responseCount,
       generated,
-      speed: aggregateSpeed(directRecords),
+      speed: aggregateSpeed(displayRecords),
       model: modelRecord?.model ?? "-",
     });
     node.children.forEach((child) => visit(child, depth + 1));
@@ -1002,7 +1992,10 @@ function activeStats(
 function latestActive(
   active: ReadonlyMap<string, ActiveState>,
   sessionID: string,
+  preferredMessageID?: string,
 ): ActiveState | undefined {
+  const preferred = preferredMessageID ? active.get(preferredMessageID) : undefined;
+  if (preferred?.sessionID === sessionID) return preferred;
   return [...active.values()]
     .filter((state) => state.sessionID === sessionID && !state.messageID.startsWith("__pending__:"))
     .sort((left, right) => right.startedAt - left.startedAt)[0]
@@ -1017,13 +2010,30 @@ function liveLabel(
   bytesPerToken: number,
   width: number,
 ): string {
-  const state = latestActive(store.active, sessionID);
+  const runtime = store.sessionRuntime.get(sessionID);
+  const state = latestActive(store.active, sessionID, runtime?.activeMessageID);
   const stats = activeStats(state, Date.now(), bytesPerToken);
-  const rate = formatRate(stats.rate);
-  if (width < 30) return rate;
-  if (!state) return `${rate} idle`;
-  if (width < 48) return `${rate} ${formatTokens(stats.generated)}t ${formatDuration(stats.elapsed)}`;
-  return `${rate} ${formatTokens(stats.generated)}t ttft ${formatOptionalDuration(stats.ttft)} elapsed ${formatDuration(stats.elapsed)}`;
+  const runGenerated = runtime ? generatedTokens(runtime.runTotals) : 0;
+  if (state) {
+    const rate = `LIVE ~${formatCompactRate(stats.rate)}`;
+    if (width < 34) return rate;
+    if (width < 58) {
+      return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)}`;
+    }
+    return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)} elapsed ${formatDuration(stats.elapsed)} total ${formatCompactNumber(runGenerated)}`;
+  }
+  const last = store.lastCompletedBySession.get(sessionID);
+  if (last) {
+    const prefix = last.estimated ? "LAST ~" : "LAST ";
+    const rate = `${prefix}${formatCompactRate(last.rate)}`;
+    const totalGenerated = runtime && runtime.runEpoch > 0 ? runGenerated : last.generated;
+    if (width < 34) return rate;
+    if (width < 58) {
+      return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)}`;
+    }
+    return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)} elapsed ${formatDuration(last.elapsed)} total ${formatCompactNumber(totalGenerated)}`;
+  }
+  return "IDLE";
 }
 
 function currentSessionID(api: TuiPluginApi): string | undefined {
@@ -1081,22 +2091,22 @@ function SummaryBlock(props: {
   const lines = createMemo(() => {
     props.store.revision();
     const aggregate = aggregateForSession(props.store.records, props.sessionID);
-    if (!aggregate) return ["No completed responses yet"];
+    if (!aggregate) return emptySummaryLines();
     return [
       ...summaryLines(
-        "direct",
+        "Session only",
         aggregate.directTokens,
         aggregate.directCost,
         aggregate.directResponseCount,
       ),
-      ...summaryLines("all", aggregate.tokens, aggregate.cost, aggregate.responseCount),
+      ...summaryLines("Including subagents", aggregate.tokens, aggregate.cost, aggregate.responseCount),
     ];
   });
   return (
     <box paddingX={1} flexDirection="column" backgroundColor={props.theme.current.background}>
       <text fg={props.theme.current.secondary}>totals</text>
       {lines().map((line) => (
-        <text fg={props.theme.current.text} truncate wrapMode="none">{line}</text>
+        <text fg={props.theme.current.text} wrapMode="word">{line}</text>
       ))}
     </box>
   );
@@ -1147,6 +2157,7 @@ function PromptRight(props: {
   sessionID: string;
   options: TuiOptions;
 }): JSX.Element {
+  setFocusSession(props.store, props.sessionID);
   const label = createMemo(() => {
     props.store.revision();
     return liveLabel(
@@ -1159,45 +2170,164 @@ function PromptRight(props: {
   return <text fg={props.api.theme.current.accent} truncate wrapMode="none">{label()}</text>;
 }
 
-function SidebarContent(props: {
+function setFocusSession(store: RuntimeStore, sessionID: string | undefined): void {
+  if (!sessionID || store.focusSessionID === sessionID) return;
+  store.focusSessionID = sessionID;
+  store.bump();
+}
+
+export function togglePulse(store: RuntimeStore): boolean {
+  store.pulseExpanded = !store.pulseExpanded;
+  store.bump();
+  return store.pulseExpanded;
+}
+
+function BottomContent(props: {
   api: TuiPluginApi;
   store: RuntimeStore;
   sessionID: string;
 }): JSX.Element {
+  const sessionID = createMemo(() => {
+    props.store.revision();
+    return props.store.focusSessionID ?? props.sessionID;
+  });
   const view = createMemo((): AggregateView => {
     props.store.revision();
     return {
-      aggregate: aggregateForSession(props.store.records, props.sessionID),
+      aggregate: aggregateForSession(props.store.records, sessionID()),
       records: props.store.records,
     };
   });
+  const taskWallTime = createMemo(() => {
+    props.store.revision();
+    return taskWallTimeForSession(props.store, sessionID());
+  });
   const rows = createMemo(() => childRows(view().records, view().aggregate));
-  const lines = createMemo(() => {
+  const sections = createMemo((): PulseSectionData[] => {
     const aggregate = view().aggregate;
-    if (!aggregate) return ["No completed responses yet"];
+    if (!aggregate) {
+      return [
+        { label: "SESSION ONLY", tokens: emptyTokenCounts(), cost: 0, responseCount: 0 },
+        { label: "INCLUDING SUBAGENTS", tokens: emptyTokenCounts(), cost: 0, responseCount: 0 },
+      ];
+    }
     return [
-      ...summaryLines("direct", aggregate.directTokens, aggregate.directCost, aggregate.directResponseCount),
-      ...summaryLines("all", aggregate.tokens, aggregate.cost, aggregate.responseCount),
+      {
+        label: "SESSION ONLY",
+        tokens: aggregate.directTokens,
+        cost: aggregate.directCost,
+        responseCount: aggregate.directResponseCount,
+      },
+      {
+        label: "INCLUDING SUBAGENTS",
+        tokens: aggregate.tokens,
+        cost: aggregate.cost,
+        responseCount: aggregate.responseCount,
+      },
     ];
   });
+  const pulseSummary = createMemo(() => {
+    const currentView = view();
+    const currentSessionID = sessionID();
+    const aggregate = currentView.aggregate;
+    return {
+      tokens: aggregate?.tokens ?? emptyTokenCounts(),
+      speed: aggregate && currentSessionID
+        ? aggregateSpeed(recordsForSession(currentView.records, currentSessionID))
+        : 0,
+    };
+  });
+  const metricLabel = createMemo(() => {
+    const summary = pulseSummary();
+    return formatPulseMetrics(summary.tokens, summary.speed);
+  });
+  const taskWallTimeLabel = createMemo(() => {
+    const wallTime = taskWallTime();
+    return wallTime === undefined ? "--" : formatDuration(wallTime);
+  });
+  const expanded = createMemo(() => {
+    props.store.revision();
+    return props.store.pulseExpanded;
+  });
+  const onPulseMouseDown = (event: MouseEvent): void => {
+    if (event.button !== 0) return;
+    togglePulse(props.store);
+  };
   return (
-    <box flexDirection="column" paddingTop={1} paddingX={1}>
-      <text fg={props.api.theme.current.secondary}>token pulse</text>
-      {lines().map((line) => (
-        <text fg={props.api.theme.current.textMuted} truncate wrapMode="none">{line}</text>
-      ))}
-      {rows().map((row) => (
-        <box flexDirection="column" paddingTop={1}>
-          <text fg={props.api.theme.current.info} truncate wrapMode="none">
-            {`${"  ".repeat(row.depth)}> ${shortTail(row.sessionID, 10)} ${formatTokens(row.responseCount)}r ${formatTokens(row.generated)}t`}
+    <box
+      flexDirection="column"
+      width="100%"
+      paddingTop={1}
+      paddingX={1}
+      overflow="hidden"
+    >
+      <box
+        focusable
+        width="100%"
+        height={1}
+        paddingX={1}
+        backgroundColor={props.api.theme.current.backgroundElement}
+        onMouseDown={onPulseMouseDown}
+      >
+        <text fg={props.api.theme.current.primary} truncate wrapMode="none">
+          {expanded() ? "- Token Pulse" : "+ Token Pulse"}
+        </text>
+      </box>
+      <text fg={props.api.theme.current.textMuted} width="100%" paddingX={1} truncate wrapMode="none">
+        {metricLabel()}
+      </text>
+      {expanded() && (!sessionID() ? (
+        <text fg={props.api.theme.current.textMuted} paddingTop={1} truncate wrapMode="none">
+          No active session
+        </text>
+      ) : (
+        <>
+          <text fg={props.api.theme.current.secondary} paddingTop={1} truncate wrapMode="none">
+            session {shortTail(sessionID(), 18)}
           </text>
-          <text fg={props.api.theme.current.textMuted} truncate wrapMode="none">
-            {`  ${formatRate(row.speed)} ${truncateMiddle(row.model, 14)}`}
-          </text>
-        </box>
+          {sections().map((section) => (
+            <PulseSection theme={props.api.theme} section={section} />
+          ))}
+          {!view().aggregate && (
+            <text fg={props.api.theme.current.textMuted} paddingTop={1} truncate wrapMode="none">
+              No completed responses yet
+            </text>
+          )}
+          <box flexDirection="column" width="100%" paddingTop={1}>
+            <text fg={props.api.theme.current.accent} truncate wrapMode="none">SESSION RUN</text>
+            <PulseMetricGrid
+              theme={props.api.theme}
+              rows={[[{ label: "Task wall time", value: taskWallTimeLabel() }]]}
+            />
+          </box>
+          {rows().length > 0 && <ChildAgentRows theme={props.api.theme} rows={rows()} />}
+        </>
       ))}
     </box>
   );
+}
+
+export function createTuiSlotPlugin(
+  api: TuiPluginApi,
+  store: RuntimeStore,
+  options: TuiOptions,
+): TuiSlotPlugin {
+  return {
+    order: 1_000_000,
+    slots: {
+      sidebar_content: (_context, props) => (
+        <BottomContent api={api} store={store} sessionID={props.session_id} />
+      ),
+      session_prompt_right: (_context, props) => (
+        <PromptRight
+          api={api}
+          store={store}
+          sessionID={props.session_id}
+          options={options}
+        />
+      ),
+    },
+  };
 }
 
 function registerLegacyCommand(api: TuiPluginApi, openHistory: () => void): void {
@@ -1233,11 +2363,12 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const scheduleReload = (): void => {
     reloadGeneration += 1;
     const generation = reloadGeneration;
+    store.historyGeneration = generation;
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     const run = async (attempt: number): Promise<void> => {
       if (disposed || generation !== reloadGeneration) return;
       reloadTimer = undefined;
-      await reloadHistory(store, api, historyPath, options.maxRecords);
+      await reloadHistory(store, api, historyPath, options.maxRecords, generation);
       if (
         !disposed
         && generation === reloadGeneration
@@ -1324,22 +2455,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     registerLegacyCommand(api, openHistory);
   }
 
-  const slotPlugin: TuiSlotPlugin = {
-    slots: {
-      session_prompt_right: (_context, props) => (
-        <PromptRight
-          api={api}
-          store={store}
-          sessionID={props.session_id}
-          options={options}
-        />
-      ),
-      sidebar_content: (_context, props) => (
-        <SidebarContent api={api} store={store} sessionID={props.session_id} />
-      ),
-    },
-  };
-  api.slots.register(slotPlugin);
+  api.slots.register(createTuiSlotPlugin(api, store, options));
 
   // The generated SDK union can lag runtime legacy/v2 event names; keep this cast local.
   const eventOn = api.event.on as unknown as CompatibleEventOn;
@@ -1362,6 +2478,17 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       if (!event) return;
       const type = eventType(event);
       const properties = eventProperties(event);
+      const eventSessionID = readSessionID(properties, event);
+      if (type === "session.created" || type === "session.updated") {
+        const mapped = cacheSessionParentFromEvent(store, event);
+        const sessionID = readSessionID(properties, event);
+        if (sessionID) rootSessionIDFor(store, api, sessionID);
+        setFocusSession(store, sessionID);
+        if (mapped) store.bump();
+        return;
+      }
+      if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
+      setFocusSession(store, eventSessionID);
       if (type === "message.part.delta") {
         recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken);
         return;
@@ -1383,7 +2510,6 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       }
       if (type === "session.next.step.ended") {
         recordStepFallback(store, properties, event);
-        scheduleReload();
         return;
       }
       if (type === "message.updated") {
@@ -1392,9 +2518,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         }
         return;
       }
-      if (isIdleEvent(type, properties, event)) {
-        const sessionID = readSessionID(properties, event);
-        if (sessionID && flushIdleStates(store, api, sessionID, options.bytesPerToken)) {
+      if (type === "session.idle" || type === "session.status") {
+        if (handleSessionLifecycle(store, api, type, properties, event, options.bytesPerToken)) {
           scheduleReload();
         }
       }
@@ -1411,6 +2536,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   subscribe("session.next.step.ended", handleEvent);
   subscribe("session.idle", handleEvent);
   subscribe("session.status", handleEvent);
+  subscribe("session.created", handleEvent);
+  subscribe("session.updated", handleEvent);
 
   const interval = setInterval(() => {
     if (!disposed && store.active.size > 0) store.bump();
@@ -1425,10 +2552,16 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     store.optimistic.clear();
     store.records = [];
     store.completedMessageIDs.clear();
+    store.sessionRuntime.clear();
+    store.taskRuns.clear();
+    store.sessionParents.clear();
+    store.lastCompletedBySession.clear();
+    store.focusSessionID = undefined;
     store.disposeSignals();
   });
 
-  await reloadHistory(store, api, historyPath, options.maxRecords);
+  store.historyGeneration += 1;
+  await reloadHistory(store, api, historyPath, options.maxRecords, store.historyGeneration);
 };
 
 const plugin = {

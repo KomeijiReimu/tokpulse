@@ -17,7 +17,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --import tsx --test tests/core.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "devDependencies": {
     "@babel/core": "^7.26.9",
