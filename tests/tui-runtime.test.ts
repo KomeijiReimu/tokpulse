@@ -6,6 +6,7 @@ import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import {
   aggregateSpeed,
   applyRecordToSessionRuntime,
+  cacheHitRate,
   cacheSessionParentFromEvent,
   createActiveState,
   createRuntimeStore,
@@ -13,6 +14,7 @@ import {
   createTaskWallRun,
   createTuiSlotPlugin,
   finalSamples,
+  formatCacheHitRate,
   formatCompactNumber,
   formatCompactRate,
   formatPulseMetrics,
@@ -174,10 +176,20 @@ test("total token count excludes cache writes and collapsed pulse shows speed", 
     cacheWrite: 900,
   };
   assert.equal(totalTokens(counts), 37);
-  assert.equal(formatPulseMetrics(counts, 293), "37 total · 293 tok/s");
-  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "0 total");
-  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  37 total  293 tok/s");
-  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  0 total");
+  assert.equal(cacheHitRate({ ...counts, input: 0, cacheRead: 0 }), undefined);
+  assert.equal(formatCacheHitRate(undefined), "--");
+  assert.equal(cacheHitRate({ ...counts, input: 10, cacheRead: 0 }), 0);
+  assert.equal(formatCacheHitRate(cacheHitRate({ ...counts, input: 10, cacheRead: 0 })), "0%");
+  assert.equal(cacheHitRate({ ...counts, input: 0, cacheRead: 10 }), 1);
+  assert.equal(formatCacheHitRate(cacheHitRate({ ...counts, input: 0, cacheRead: 10 })), "100%");
+  const mixed = { ...counts, input: 10, cacheRead: 2, cacheWrite: 0 };
+  assert.equal(cacheHitRate(mixed), 2 / 12);
+  assert.equal(cacheHitRate({ ...mixed, cacheWrite: 900 }), 2 / 12);
+  assert.equal(formatCacheHitRate(cacheHitRate(mixed)), "17%");
+  assert.equal(formatPulseMetrics(counts, 293), "37 total · 293 tok/s · cache 17%");
+  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "0 total · cache --");
+  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  37 total · 293 tok/s · cache 17%");
+  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  0 total · cache --");
 });
 
 test("aggregate speed is generated-weighted instead of response-average", () => {
@@ -227,6 +239,8 @@ test("slot registration appends sidebar content without taking the footer or app
   assert.match(source, /\+ Token Pulse/);
   assert.match(source, /- Token Pulse/);
   assert.match(source, /formatPulseMetrics\(summary\.tokens, summary\.speed\)/);
+  assert.match(source, /Cache hit rate/);
+  assert.match(source, /formatCacheHitRate\(cacheHitRate\(tokens\)\)/);
   assert.match(source, /backgroundColor=\{props\.api\.theme\.current\.backgroundElement\}/);
   assert.match(source, /CHILD AGENTS/);
   assert.match(source, /Total tokens \(input \+ generated\)/);

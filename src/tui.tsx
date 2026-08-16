@@ -1590,6 +1590,13 @@ export function totalTokens(tokens: TokenCounts): number {
   return tokens.input + tokens.cacheRead + tokens.output + tokens.reasoning;
 }
 
+export function cacheHitRate(tokens: TokenCounts): number | undefined {
+  const denominator = tokens.input + tokens.cacheRead;
+  if (!Number.isFinite(denominator) || denominator <= 0) return undefined;
+  const rate = tokens.cacheRead / denominator;
+  return Number.isFinite(rate) ? rate : undefined;
+}
+
 export function formatCompactNumber(value: number): string {
   if (!Number.isFinite(value)) return "0";
   const sign = value < 0 ? "-" : "";
@@ -1612,18 +1619,20 @@ export function formatCompactRate(value: number): string {
   return `${formatCompactNumber(value)} tok/s`;
 }
 
+export function formatCacheHitRate(rate: number | undefined): string {
+  if (rate === undefined || !Number.isFinite(rate)) return "--";
+  return `${Math.round(Math.max(0, Math.min(1, rate)) * 100)}%`;
+}
+
 export function formatPulseMetrics(tokens: TokenCounts, speed: number): string {
   const speedLabel = Number.isFinite(speed) && speed > 0
     ? ` · ${formatCompactRate(speed)}`
     : "";
-  return `${formatCompactNumber(totalTokens(tokens))} total${speedLabel}`;
+  return `${formatCompactNumber(totalTokens(tokens))} total${speedLabel} · cache ${formatCacheHitRate(cacheHitRate(tokens))}`;
 }
 
 export function formatPulseSummary(tokens: TokenCounts, speed: number): string {
-  const speedLabel = Number.isFinite(speed) && speed > 0
-    ? `  ${formatCompactRate(speed)}`
-    : "";
-  return `+ Token Pulse  ${formatCompactNumber(totalTokens(tokens))} total${speedLabel}`;
+  return `+ Token Pulse  ${formatPulseMetrics(tokens, speed)}`;
 }
 
 function formatCost(value: number): string {
@@ -1744,6 +1753,7 @@ function summaryLines(
     label,
     `  Total tokens (input + generated) ${formatCompactNumber(totalTokens(tokens))}`,
     `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`,
+    `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`,
     `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`,
     `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`,
     `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`,
@@ -1780,6 +1790,7 @@ function pulseMetricRows(
     { label: "Total tokens (input + generated)", value: formatCompactNumber(totalTokens(tokens)) },
     { label: "Uncached input", value: formatCompactNumber(tokens.input) },
     { label: "Cache read (reused)", value: formatCompactNumber(tokens.cacheRead) },
+    { label: "Cache hit rate", value: formatCacheHitRate(cacheHitRate(tokens)) },
     { label: "Cache write", value: formatCompactNumber(tokens.cacheWrite) },
     { label: "Visible output", value: formatCompactNumber(tokens.output) },
     { label: "Reasoning", value: formatCompactNumber(tokens.reasoning) },
@@ -1831,6 +1842,7 @@ function PulseSection(props: {
           [metrics[3], metrics[4]],
           [metrics[5], metrics[6]],
           [metrics[7], metrics[8]],
+          [metrics[9]],
         ]}
       />
     </box>

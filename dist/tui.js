@@ -962,6 +962,12 @@ function generatedTokens(tokens) {
 export function totalTokens(tokens) {
   return tokens.input + tokens.cacheRead + tokens.output + tokens.reasoning;
 }
+export function cacheHitRate(tokens) {
+  const denominator = tokens.input + tokens.cacheRead;
+  if (!Number.isFinite(denominator) || denominator <= 0) return undefined;
+  const rate = tokens.cacheRead / denominator;
+  return Number.isFinite(rate) ? rate : undefined;
+}
 export function formatCompactNumber(value) {
   if (!Number.isFinite(value)) return "0";
   const sign = value < 0 ? "-" : "";
@@ -982,13 +988,16 @@ export function formatCompactNumber(value) {
 export function formatCompactRate(value) {
   return `${formatCompactNumber(value)} tok/s`;
 }
+export function formatCacheHitRate(rate) {
+  if (rate === undefined || !Number.isFinite(rate)) return "--";
+  return `${Math.round(Math.max(0, Math.min(1, rate)) * 100)}%`;
+}
 export function formatPulseMetrics(tokens, speed) {
   const speedLabel = Number.isFinite(speed) && speed > 0 ? ` · ${formatCompactRate(speed)}` : "";
-  return `${formatCompactNumber(totalTokens(tokens))} total${speedLabel}`;
+  return `${formatCompactNumber(totalTokens(tokens))} total${speedLabel} · cache ${formatCacheHitRate(cacheHitRate(tokens))}`;
 }
 export function formatPulseSummary(tokens, speed) {
-  const speedLabel = Number.isFinite(speed) && speed > 0 ? `  ${formatCompactRate(speed)}` : "";
-  return `+ Token Pulse  ${formatCompactNumber(totalTokens(tokens))} total${speedLabel}`;
+  return `+ Token Pulse  ${formatPulseMetrics(tokens, speed)}`;
 }
 function formatCost(value) {
   return `$${formatNumber(value, 4)}`;
@@ -1077,7 +1086,7 @@ function formatHistoryRow(record) {
   return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(formatCompactNumber(speed.avg), 6), padLeft(formatCompactNumber(speed.max), 6), padLeft(formatCompactNumber(speed.min), 6), padLeft(formatOptionalDuration(ttft), 7), padLeft(formatOptionalDuration(duration), 7), padLeft(formatCost(record.cost), 9), sparkline(record.samples)].join(" ");
 }
 function summaryLines(label, tokens, cost, responseCount) {
-  return [label, `  Total tokens (input + generated) ${formatCompactNumber(totalTokens(tokens))}`, `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`, `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`, `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`, `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
+  return [label, `  Total tokens (input + generated) ${formatCompactNumber(totalTokens(tokens))}`, `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`, `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`, `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`, `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`, `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
 }
 function emptySummaryLines() {
   const empty = emptyTokenCounts();
@@ -1093,6 +1102,9 @@ function pulseMetricRows(tokens, cost, responseCount) {
   }, {
     label: "Cache read (reused)",
     value: formatCompactNumber(tokens.cacheRead)
+  }, {
+    label: "Cache hit rate",
+    value: formatCacheHitRate(cacheHitRate(tokens))
   }, {
     label: "Cache write",
     value: formatCompactNumber(tokens.cacheWrite)
@@ -1172,7 +1184,7 @@ function PulseSection(props) {
         return props.theme;
       },
       get rows() {
-        return [[metrics[0]], [metrics[1], metrics[2]], [metrics[3], metrics[4]], [metrics[5], metrics[6]], [metrics[7], metrics[8]]];
+        return [[metrics[0]], [metrics[1], metrics[2]], [metrics[3], metrics[4]], [metrics[5], metrics[6]], [metrics[7], metrics[8]], [metrics[9]]];
       }
     }), null);
     _$effect(_$p => _$setProp(_el$7, "fg", props.theme.current.accent, _$p));
