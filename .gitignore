@@ -1,5 +1,6 @@
 node_modules/
 .opencode/
 .cortexkit/
+.slim/deepwork/
 *.tgz
 .DS_Store
