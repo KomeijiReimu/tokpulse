@@ -2,6 +2,7 @@ import type { Plugin, PluginInput, PluginModule, PluginOptions } from "@opencode
 import {
   HISTORY_VERSION,
   HistoryRecord,
+  HistoryRecordQuality,
   SpeedSample,
   TokenCounts,
   bytesToTokens,
@@ -127,11 +128,20 @@ async function handleEvent(
       return;
     }
     if (type === "session.next.step.ended") {
-      recordStepFallback(active, properties, event, timestamp);
+      recordStepFallback(active, completedMessageIDs, properties, event, timestamp);
       return;
     }
     if (isIdleEvent(type, properties)) {
-      await flushIdleStates(input, storage, active, properties, event, timestamp, bytesPerToken);
+      await flushIdleStates(
+        input,
+        storage,
+        active,
+        completedMessageIDs,
+        properties,
+        event,
+        timestamp,
+        bytesPerToken,
+      );
     }
   } catch (error) {
     warn("event parsing failed", error);
@@ -178,6 +188,7 @@ function recordDelta(
 
 function recordStepFallback(
   active: Map<string, ActiveState>,
+  completedMessageIDs: Set<string>,
   properties: AnyRecord,
   event: AnyRecord,
   timestamp: number,
@@ -185,10 +196,11 @@ function recordStepFallback(
   const sessionID = readString(properties, event, ["sessionID", "sessionId"]);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
+  if (messageID && completedMessageIDs.has(messageID)) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
   const tokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
-  state.fallbackTokens = { ...state.fallbackTokens, ...tokens };
+  state.fallbackTokens = mergeFallbackTokens(state.fallbackTokens, tokens);
   state.model = state.model ?? modelName(info);
   if (state.cost === undefined) state.cost = numberOrUndefined(info?.cost ?? properties.cost);
   active.set(messageID ?? pendingKey(sessionID), state);
@@ -222,8 +234,8 @@ async function handleMessageUpdated(
     input: exactOrFallback(exactTokens.input, fallback.input, estimate.input),
     output: exactOrFallback(exactTokens.output, fallback.output, estimate.output),
     reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, estimate.reasoning),
-    cacheRead: exactOrFallback(exactTokens.cacheRead, fallback.cacheRead, 0),
-    cacheWrite: exactOrFallback(exactTokens.cacheWrite, fallback.cacheWrite, 0),
+    cacheRead: cacheOrFallback(exactTokens.cacheRead, fallback.cacheRead),
+    cacheWrite: cacheOrFallback(exactTokens.cacheWrite, fallback.cacheWrite),
   };
   const candidateSamples = chooseSamples(state);
   const samples = calibrateResponseSamples(candidateSamples, {
@@ -242,6 +254,7 @@ async function handleMessageUpdated(
     state,
     info,
     completedAt: timestamp,
+    quality: "exact",
   });
   if (await safeUpsert(storage, record)) completedMessageIDs.add(messageID);
   else if (state) active.set(messageID, state);
@@ -251,6 +264,7 @@ async function flushIdleStates(
   input: PluginInput,
   storage: HistoryStorage,
   active: Map<string, ActiveState>,
+  completedMessageIDs: Set<string>,
   properties: AnyRecord,
   event: AnyRecord,
   timestamp: number,
@@ -262,6 +276,7 @@ async function flushIdleStates(
   for (const [key, state] of entries) {
     active.delete(key);
     if (state.messageID.startsWith("__pending__:")) continue;
+    if (completedMessageIDs.has(state.messageID)) continue;
     const estimate = estimateStateTokens(state, bytesPerToken);
     const tokens: TokenCounts = {
       input: state.fallbackTokens.input ?? estimate.input,
@@ -285,6 +300,7 @@ async function flushIdleStates(
       state,
       info: undefined,
       completedAt: timestamp,
+      quality: "provisional",
     });
     await safeUpsert(storage, record);
   }
@@ -301,6 +317,7 @@ function makeHistoryRecord(input: {
   state?: ActiveState;
   info?: AnyRecord;
   completedAt: number;
+  quality: HistoryRecordQuality;
 }): HistoryRecord {
   const infoTime = asRecord(input.info?.time) ?? {};
   const start = numberOrUndefined(infoTime.start)
@@ -331,6 +348,7 @@ function makeHistoryRecord(input: {
       duration,
     },
     samples: input.samples,
+    quality: input.quality,
   };
 }
 
@@ -408,7 +426,7 @@ function mergeStates(target: ActiveState, source: ActiveState): void {
   }
   target.model = target.model ?? source.model;
   target.cost = target.cost ?? source.cost;
-  target.fallbackTokens = { ...source.fallbackTokens, ...target.fallbackTokens };
+  target.fallbackTokens = mergeFallbackTokens(source.fallbackTokens, target.fallbackTokens);
   target.legacy.hasData ||= source.legacy.hasData;
   target.legacy.samples.push(...source.legacy.samples);
   target.v2.hasData ||= source.v2.hasData;
@@ -438,21 +456,65 @@ function eventInfo(properties: AnyRecord, event: AnyRecord): AnyRecord | undefin
 function tokenFields(value: unknown): Partial<TokenCounts> {
   if (!isRecord(value)) return {};
   const normalized = normalizeTokenCounts(value);
+  const inputDetails = isRecord(value.inputTokenDetails) ? value.inputTokenDetails : undefined;
+  const outputDetails = isRecord(value.outputTokenDetails) ? value.outputTokenDetails : undefined;
   const fields: Partial<TokenCounts> = {};
-  if (hasNumber(value.input)) fields.input = normalized.input;
-  if (hasNumber(value.output)) fields.output = normalized.output;
-  if (hasNumber(value.reasoning)) fields.reasoning = normalized.reasoning;
-  if (hasNumber(value.cacheRead) || (isRecord(value.cache) && hasNumber(value.cache.read))) {
+  if (hasNumber(value.input) || hasNumber(value.inputTokens)) fields.input = normalized.input;
+  if (hasNumber(value.output) || hasNumber(value.outputTokens)) fields.output = normalized.output;
+  if (
+    hasNumber(value.reasoning)
+    || hasNumber(value.reasoningTokens)
+    || hasNumber(outputDetails?.reasoningTokens)
+    || hasNumber(outputDetails?.reasoning)
+  ) {
+    fields.reasoning = normalized.reasoning;
+  }
+  if (
+    hasNumber(value.cacheRead)
+    || hasNumber(value.cache_read)
+    || (isRecord(value.cache) && hasNumber(value.cache.read))
+    || hasNumber(value.cachedInputTokens)
+    || hasNumber(value.cacheReadTokens)
+    || hasNumber(inputDetails?.cacheReadTokens)
+    || hasNumber(inputDetails?.cacheRead)
+  ) {
     fields.cacheRead = normalized.cacheRead;
   }
-  if (hasNumber(value.cacheWrite) || (isRecord(value.cache) && hasNumber(value.cache.write))) {
+  if (
+    hasNumber(value.cacheWrite)
+    || hasNumber(value.cache_write)
+    || (isRecord(value.cache) && hasNumber(value.cache.write))
+    || hasNumber(value.cacheWriteTokens)
+    || hasNumber(inputDetails?.cacheWriteTokens)
+    || hasNumber(inputDetails?.cacheWrite)
+  ) {
     fields.cacheWrite = normalized.cacheWrite;
   }
   return fields;
 }
 
+function mergeFallbackTokens(
+  previous: Partial<TokenCounts>,
+  incoming: Partial<TokenCounts>,
+): Partial<TokenCounts> {
+  const result = { ...previous, ...incoming };
+  if (previous.cacheRead !== undefined && incoming.cacheRead !== undefined) {
+    result.cacheRead = Math.max(previous.cacheRead, incoming.cacheRead);
+  }
+  if (previous.cacheWrite !== undefined && incoming.cacheWrite !== undefined) {
+    result.cacheWrite = Math.max(previous.cacheWrite, incoming.cacheWrite);
+  }
+  return result;
+}
+
 function exactOrFallback(exact: number | undefined, fallback: number | undefined, estimate: number): number {
   return exact ?? fallback ?? Math.max(0, Math.round(estimate));
+}
+
+function cacheOrFallback(exact: number | undefined, fallback: number | undefined): number {
+  if (exact === undefined) return fallback ?? 0;
+  if (exact === 0 && fallback !== undefined && fallback > 0) return fallback;
+  return exact;
 }
 
 function isCompleted(info: AnyRecord, properties: AnyRecord, event: AnyRecord): boolean {

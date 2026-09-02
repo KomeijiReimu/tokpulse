@@ -14,6 +14,7 @@ import {
   DEFAULT_ROLLING_WINDOW_MS,
   HISTORY_VERSION,
   HistoryRecord,
+  HistoryRecordQuality,
   RateStats,
   SessionAggregate,
   SpeedSample,
@@ -47,6 +48,8 @@ const SPARK_CHARS = ".:-=+#";
 type ObjectRecord = Record<string, unknown>;
 export type StreamName = "legacy" | "v2";
 type SampleKind = "output" | "reasoning";
+export type RecordQuality = HistoryRecordQuality;
+const recordQualityByObject = new WeakMap<object, RecordQuality>();
 type CompatibleEventType =
   | "message.part.delta"
   | "session.next.text.delta"
@@ -94,8 +97,11 @@ export interface ActiveState {
 export type SessionRunStatus = "idle" | "busy" | "retry";
 
 interface RuntimeContribution {
+  record: HistoryRecord;
   tokens: TokenCounts;
   cost: number;
+  quality: RecordQuality;
+  runEpoch: number;
 }
 
 export interface SessionRunSummary {
@@ -120,6 +126,8 @@ export interface SessionRuntime {
   seenMessageIDs: Set<string>;
   lastRunSummary?: SessionRunSummary;
   contributions: Map<string, RuntimeContribution>;
+  completedContributions: Map<string, RuntimeContribution>;
+  runSummaries: Map<number, SessionRunSummary>;
 }
 
 export type TaskSessionState = "busy" | "retry" | "idle" | "completed";
@@ -127,6 +135,41 @@ export type TaskSessionState = "busy" | "retry" | "idle" | "completed";
 interface PendingTaskSession {
   state: TaskSessionState;
   timestamp: number;
+}
+
+interface TaskLifecycleEvent {
+  state: TaskSessionState;
+  timestamp: number;
+}
+
+function lifecycleStateAt(
+  events: readonly TaskLifecycleEvent[],
+  timestamp: number,
+): TaskSessionState | undefined {
+  return events.filter((event) => event.timestamp <= timestamp).at(-1)?.state;
+}
+
+function mergeLifecycleEvents(
+  left: readonly TaskLifecycleEvent[],
+  right: readonly TaskLifecycleEvent[],
+): TaskLifecycleEvent[] {
+  const byTimestamp = new Map<number, TaskLifecycleEvent>();
+  for (const event of [...left, ...right]) {
+    const existing = byTimestamp.get(event.timestamp);
+    if (!existing || (activeTaskSessionState(event.state) && !activeTaskSessionState(existing.state))) {
+      byTimestamp.set(event.timestamp, { ...event });
+    }
+  }
+  return [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+interface TaskActivityInterval {
+  start: number;
+  end: number;
+}
+
+function cloneIntervals(intervals: readonly TaskActivityInterval[]): TaskActivityInterval[] {
+  return intervals.map((interval) => ({ ...interval }));
 }
 
 export interface TaskWallTimeSummary {
@@ -149,7 +192,15 @@ export interface TaskWallRun {
   sessionStates: Map<string, TaskSessionState>;
   lastActivityAt: Map<string, number>;
   pendingSessions: Map<string, PendingTaskSession>;
+  pendingLifecycleEvents: Map<string, TaskLifecycleEvent[]>;
+  lifecycleEvents: Map<string, TaskLifecycleEvent[]>;
+  carriedIntervals: TaskActivityInterval[];
+  activeIntervals: TaskActivityInterval[];
+  activeElapsed: number;
   lastRunWallTime?: TaskWallTimeSummary;
+  lastRunIntervals: TaskActivityInterval[];
+  lastRunLifecycleEvents: Map<string, TaskLifecycleEvent[]>;
+  lastRunCarriedIntervals: TaskActivityInterval[];
 }
 
 export interface LastCompletedSnapshot {
@@ -171,8 +222,12 @@ export interface TuiOptions {
 
 export interface RuntimeStore {
   maxRecords: number;
+  diskRecords: HistoryRecord[];
   records: HistoryRecord[];
   optimistic: Map<string, HistoryRecord>;
+  optimisticQuality: Map<string, RecordQuality>;
+  optimisticOrder: Map<string, number>;
+  nextOptimisticOrder: number;
   active: Map<string, ActiveState>;
   completedMessageIDs: Set<string>;
   sessionRuntime: Map<string, SessionRuntime>;
@@ -360,18 +415,80 @@ function modelName(value: ObjectRecord | undefined): string | undefined {
 }
 
 function tokenFields(value: unknown): Partial<TokenCounts> {
-  const source = asRecord(value);
+  const input = asRecord(value);
+  const source = asRecord(input?.tokens)
+    ?? asRecord(input?.usage)
+    ?? asRecord(input?.tokenUsage)
+    ?? input;
   if (!source) return {};
   const normalized = normalizeTokenCounts(source);
   const fields: Partial<TokenCounts> = {};
-  if (readNumber(source.input) !== undefined) fields.input = normalized.input;
-  if (readNumber(source.output) !== undefined) fields.output = normalized.output;
-  if (readNumber(source.reasoning) !== undefined) fields.reasoning = normalized.reasoning;
+  const inputDetails = asRecord(source.inputTokenDetails);
+  const outputDetails = asRecord(source.outputTokenDetails);
+  const rawInput = readNumber(source.inputTokens)
+    ?? readNumber(source.promptTokens);
+  const uncachedInput = readNumber(source.noCacheTokens)
+    ?? readNumber(inputDetails?.noCacheTokens)
+    ?? readNumber(inputDetails?.noCacheInputTokens);
+  const rawOutput = readNumber(source.outputTokens)
+    ?? readNumber(source.completionTokens);
+  const textOutput = readNumber(outputDetails?.textTokens)
+    ?? readNumber(outputDetails?.text)
+    ?? readNumber(outputDetails?.outputTokens);
+  const hasInput = readNumber(source.input) !== undefined
+    || rawInput !== undefined
+    || uncachedInput !== undefined
+    || readNumber(source.cacheReadTokens) !== undefined
+    || readNumber(source.cacheWriteTokens) !== undefined
+    || readNumber(source.cache_read) !== undefined
+    || readNumber(source.cache_write) !== undefined
+    || readNumber(inputDetails?.cacheReadTokens) !== undefined
+    || readNumber(inputDetails?.cacheWriteTokens) !== undefined
+    || readNumber(inputDetails?.cacheRead) !== undefined
+    || readNumber(inputDetails?.cacheWrite) !== undefined;
+  const hasOutput = readNumber(source.output) !== undefined
+    || rawOutput !== undefined
+    || textOutput !== undefined
+    || readNumber(source.reasoning) !== undefined
+    || readNumber(outputDetails?.reasoningTokens) !== undefined
+    || readNumber(outputDetails?.reasoning) !== undefined;
+  const hasReasoning = readNumber(source.reasoning) !== undefined
+    || readNumber(source.reasoningTokens) !== undefined
+    || readNumber(outputDetails?.reasoningTokens) !== undefined
+    || readNumber(outputDetails?.reasoning) !== undefined;
+  if (hasInput) {
+    fields.input = uncachedInput !== undefined
+      ? Math.max(0, uncachedInput)
+      : normalized.input;
+  }
+  if (hasOutput) {
+    fields.output = textOutput !== undefined
+      ? Math.max(0, textOutput)
+      : rawOutput !== undefined && normalized.reasoning > 0
+        ? Math.max(0, rawOutput - normalized.reasoning)
+        : normalized.output;
+  }
+  if (hasReasoning) fields.reasoning = normalized.reasoning;
   const cache = asRecord(source.cache);
-  if (readNumber(source.cacheRead) !== undefined || readNumber(cache?.read) !== undefined) {
+  if (
+    readNumber(source.cacheRead) !== undefined
+    || readNumber(source.cacheReadTokens) !== undefined
+    || readNumber(source.cachedInputTokens) !== undefined
+    || readNumber(source.cache_read) !== undefined
+    || readNumber(inputDetails?.cacheReadTokens) !== undefined
+    || readNumber(inputDetails?.cacheRead) !== undefined
+    || readNumber(cache?.read) !== undefined
+  ) {
     fields.cacheRead = normalized.cacheRead;
   }
-  if (readNumber(source.cacheWrite) !== undefined || readNumber(cache?.write) !== undefined) {
+  if (
+    readNumber(source.cacheWrite) !== undefined
+    || readNumber(source.cacheWriteTokens) !== undefined
+    || readNumber(source.cache_write) !== undefined
+    || readNumber(inputDetails?.cacheWriteTokens) !== undefined
+    || readNumber(inputDetails?.cacheWrite) !== undefined
+    || readNumber(cache?.write) !== undefined
+  ) {
     fields.cacheWrite = normalized.cacheWrite;
   }
   return fields;
@@ -381,7 +498,16 @@ function mergeTokenFields(
   left: Partial<TokenCounts>,
   right: Partial<TokenCounts>,
 ): Partial<TokenCounts> {
-  return { ...left, ...right };
+  const merged = { ...left };
+  for (const key of ["input", "output", "reasoning"] as const) {
+    if (right[key] !== undefined) merged[key] = right[key];
+  }
+  for (const key of ["cacheRead", "cacheWrite"] as const) {
+    if (right[key] !== undefined) {
+      merged[key] = Math.max(merged[key] ?? 0, right[key]);
+    }
+  }
+  return merged;
 }
 
 function pendingKey(sessionID: string): string {
@@ -397,6 +523,8 @@ export function createSessionRuntime(): SessionRuntime {
     runResponseCount: 0,
     seenMessageIDs: new Set<string>(),
     contributions: new Map<string, RuntimeContribution>(),
+    completedContributions: new Map<string, RuntimeContribution>(),
+    runSummaries: new Map<number, SessionRunSummary>(),
   };
 }
 
@@ -413,6 +541,14 @@ export function createTaskWallRun(rootSessionID: string): TaskWallRun {
     sessionStates: new Map<string, TaskSessionState>(),
     lastActivityAt: new Map<string, number>(),
     pendingSessions: new Map<string, PendingTaskSession>(),
+    pendingLifecycleEvents: new Map<string, TaskLifecycleEvent[]>(),
+    lifecycleEvents: new Map<string, TaskLifecycleEvent[]>(),
+    carriedIntervals: [],
+    activeIntervals: [],
+    activeElapsed: 0,
+    lastRunIntervals: [],
+    lastRunLifecycleEvents: new Map<string, TaskLifecycleEvent[]>(),
+    lastRunCarriedIntervals: [],
   };
 }
 
@@ -421,6 +557,97 @@ function clearTaskRunParticipants(run: TaskWallRun): void {
   run.activeSessions.clear();
   run.sessionStates.clear();
   run.lastActivityAt.clear();
+}
+
+function clearTaskRunCycle(run: TaskWallRun): void {
+  run.lifecycleEvents.clear();
+  run.pendingLifecycleEvents.clear();
+  run.activeIntervals = [];
+  run.activeElapsed = 0;
+}
+
+function mergeIntervals(
+  left: readonly TaskActivityInterval[],
+  right: readonly TaskActivityInterval[],
+): TaskActivityInterval[] {
+  return [...left, ...right]
+    .filter((interval) => interval.end > interval.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+    .reduce<TaskActivityInterval[]>((merged, interval) => {
+      const previous = merged.at(-1);
+      if (previous && interval.start <= previous.end) {
+        previous.end = Math.max(previous.end, interval.end);
+      } else {
+        merged.push({ ...interval });
+      }
+      return merged;
+    }, []);
+}
+
+function intervalElapsed(intervals: readonly TaskActivityInterval[]): number {
+  return intervals.reduce((total, interval) => total + interval.end - interval.start, 0);
+}
+
+function recordLifecycleEvent(
+  run: TaskWallRun,
+  sessionID: string,
+  state: TaskSessionState,
+  timestamp: number,
+): boolean {
+  const target = run.phase === "active" ? run.lifecycleEvents : run.pendingLifecycleEvents;
+  const events = target.get(sessionID) ?? [];
+  const existing = events.find((event) => event.timestamp === timestamp);
+  if (existing) {
+    if (existing.state === state) return false;
+    if (activeTaskSessionState(existing.state) && !activeTaskSessionState(state)) return false;
+    existing.state = state;
+  } else {
+    events.push({ state, timestamp });
+    events.sort((left, right) => left.timestamp - right.timestamp);
+  }
+  target.set(sessionID, events);
+  return true;
+}
+
+function rebuildActiveIntervals(run: TaskWallRun, through?: number): void {
+  const computedIntervals = lifecycleIntervals(run.lifecycleEvents, through);
+  const intervals = mergeIntervals(run.carriedIntervals, computedIntervals);
+  run.activeIntervals = intervals;
+  run.activeElapsed = intervalElapsed(intervals);
+}
+
+function lifecycleIntervals(
+  lifecycleEvents: ReadonlyMap<string, readonly TaskLifecycleEvent[]>,
+  through?: number,
+): TaskActivityInterval[] {
+  const points = [...lifecycleEvents.values()]
+    .flatMap((events) => events.map((event) => event.timestamp))
+    .sort((left, right) => left - right);
+  if (through !== undefined && Number.isFinite(through)) points.push(through);
+  points.sort((left, right) => left - right);
+  const uniquePoints = [...new Set(points)];
+  const computedIntervals: TaskActivityInterval[] = [];
+  for (let index = 0; index < uniquePoints.length; index += 1) {
+    const start = uniquePoints[index];
+    const end = uniquePoints[index + 1];
+    if (end === undefined || end <= start) continue;
+    const active = [...lifecycleEvents.values()].some((events) => (
+      activeTaskSessionState(lifecycleStateAt(events, start))
+    ));
+    if (!active) continue;
+    const previous = computedIntervals.at(-1);
+    if (previous?.end === start) previous.end = end;
+    else computedIntervals.push({ start, end });
+  }
+  return computedIntervals;
+}
+
+function earliestActiveTimestamp(run: TaskWallRun): number | undefined {
+  const timestamps = [...run.lifecycleEvents.values()]
+    .flatMap((events) => events)
+    .filter((event) => activeTaskSessionState(event.state))
+    .map((event) => event.timestamp);
+  return timestamps.length > 0 ? Math.min(...timestamps) : undefined;
 }
 
 function activeTaskSessionState(state: TaskSessionState | undefined): boolean {
@@ -432,6 +659,10 @@ function startTaskWallRun(
   timestamp: number,
   explicitRootStart: boolean,
 ): void {
+  const pendingLifecycle = new Map<string, TaskLifecycleEvent[]>();
+  for (const [sessionID, events] of run.pendingLifecycleEvents) {
+    pendingLifecycle.set(sessionID, events.map((event) => ({ ...event })));
+  }
   run.phase = "active";
   run.runEpoch += 1;
   run.runStartedAt = timestamp;
@@ -439,25 +670,36 @@ function startTaskWallRun(
   run.rootObserved = explicitRootStart;
   run.hasExplicitRootStart = explicitRootStart;
   clearTaskRunParticipants(run);
+  clearTaskRunCycle(run);
+  run.carriedIntervals = [];
+  run.runStartedAt = timestamp;
+  run.activeIntervals = [];
+  run.activeElapsed = 0;
+  run.lifecycleEvents = pendingLifecycle;
+  run.pendingLifecycleEvents.clear();
   run.pendingSessions.forEach((pending, sessionID) => {
-    const continuesIntoRun = pending.state === "busy"
-      || pending.state === "retry"
-      || pending.timestamp >= timestamp;
-    if (!continuesIntoRun) return;
-    run.participantSessions.add(sessionID);
-    run.sessionStates.set(sessionID, pending.state);
-    run.lastActivityAt.set(sessionID, pending.timestamp);
-    if (pending.state === "busy" || pending.state === "retry") {
-      run.activeSessions.add(sessionID);
+    if (!run.lifecycleEvents.has(sessionID)) {
+      run.lifecycleEvents.set(sessionID, [{ ...pending }]);
     }
   });
+  for (const [sessionID, events] of pendingLifecycle) {
+    const latest = events.at(-1);
+    if (!latest) continue;
+    run.participantSessions.add(sessionID);
+    run.sessionStates.set(sessionID, latest.state);
+    run.lastActivityAt.set(sessionID, Math.max(...events.map((event) => event.timestamp)));
+    if (activeTaskSessionState(latest.state)) run.activeSessions.add(sessionID);
+  }
   run.pendingSessions.clear();
   if (explicitRootStart) {
     run.participantSessions.add(run.rootSessionID);
     run.activeSessions.add(run.rootSessionID);
     run.sessionStates.set(run.rootSessionID, "busy");
     run.lastActivityAt.set(run.rootSessionID, timestamp);
+    recordLifecycleEvent(run, run.rootSessionID, "busy", timestamp);
   }
+  run.runStartedAt = earliestActiveTimestamp(run) ?? timestamp;
+  rebuildActiveIntervals(run);
 }
 
 function recordTaskSessionActivity(
@@ -465,44 +707,92 @@ function recordTaskSessionActivity(
   sessionID: string,
   state: TaskSessionState,
   timestamp: number,
-): void {
+): boolean {
   run.participantSessions.add(sessionID);
-  run.sessionStates.set(sessionID, state);
+  if (!recordLifecycleEvent(run, sessionID, state, timestamp)) return false;
+  const events = run.lifecycleEvents.get(sessionID) ?? [];
+  const latest = events.at(-1);
+  if (!latest) return false;
+  run.sessionStates.set(sessionID, latest.state);
   const previous = run.lastActivityAt.get(sessionID);
   run.lastActivityAt.set(
     sessionID,
-    previous === undefined ? timestamp : Math.max(previous, timestamp),
+    previous === undefined ? latest.timestamp : Math.max(previous, latest.timestamp),
   );
-  if (state === "busy" || state === "retry") run.activeSessions.add(sessionID);
+  const currentState = run.sessionStates.get(sessionID);
+  if (activeTaskSessionState(currentState)) run.activeSessions.add(sessionID);
   else run.activeSessions.delete(sessionID);
   if (sessionID === run.rootSessionID) {
     run.rootObserved = true;
-    run.rootBusy = state === "busy" || state === "retry";
+    run.rootBusy = activeTaskSessionState(currentState);
   }
+  rebuildActiveIntervals(run);
+  return true;
 }
 
 function finishTaskWallRun(
   run: TaskWallRun,
   timestamp: number,
 ): TaskWallTimeSummary | undefined {
-  if (run.phase !== "active" || !run.rootObserved || run.activeSessions.size > 0) return undefined;
+  if (run.phase !== "active" || run.activeSessions.size > 0) return undefined;
   const startedAt = run.runStartedAt ?? timestamp;
-  const activityEnd = Math.max(
-    timestamp,
-    ...run.lastActivityAt.values(),
-  );
+  const activityEnd = Math.max(timestamp, ...run.lastActivityAt.values());
+  rebuildActiveIntervals(run, activityEnd);
+  const completedIntervals = [...run.activeIntervals];
+  const completedActiveElapsed = intervalElapsed(completedIntervals);
   const summary: TaskWallTimeSummary = {
     runEpoch: run.runEpoch,
     startedAt,
     completedAt: activityEnd,
-    wallTime: Math.max(0, activityEnd - startedAt),
+    wallTime: Math.max(0, completedActiveElapsed),
   };
+  run.lastRunIntervals = completedIntervals;
+  run.lastRunLifecycleEvents = new Map(
+    [...run.lifecycleEvents.entries()].map(([sessionID, events]) => [
+      sessionID,
+      events.map((event) => ({ ...event })),
+    ]),
+  );
+  run.lastRunCarriedIntervals = cloneIntervals(run.carriedIntervals);
   run.lastRunWallTime = summary;
   run.phase = "idle";
   run.rootBusy = false;
   run.rootObserved = false;
-  run.activeSessions.clear();
+  run.hasExplicitRootStart = false;
+  run.runStartedAt = undefined;
+  clearTaskRunParticipants(run);
+  run.lifecycleEvents.clear();
+  run.pendingLifecycleEvents.clear();
+  run.carriedIntervals = cloneIntervals(completedIntervals);
+  run.activeIntervals = [];
+  run.activeElapsed = 0;
   return summary;
+}
+
+function patchCompletedTaskWallRun(
+  run: TaskWallRun,
+  sessionID: string,
+  state: TaskSessionState,
+  timestamp: number,
+): boolean {
+  if (!run.lastRunWallTime || timestamp >= run.lastRunWallTime.completedAt) return false;
+  const previous = run.lastRunLifecycleEvents.get(sessionID) ?? [];
+  const next = mergeLifecycleEvents(previous, [{ state, timestamp }]);
+  run.lastRunLifecycleEvents.set(sessionID, next);
+  const computed = lifecycleIntervals(
+    run.lastRunLifecycleEvents,
+    run.lastRunWallTime.completedAt,
+  );
+  run.lastRunIntervals = mergeIntervals(run.lastRunCarriedIntervals, computed);
+  run.lastRunWallTime = {
+    ...run.lastRunWallTime,
+    startedAt: Math.min(
+      run.lastRunWallTime.startedAt,
+      ...run.lastRunIntervals.map((interval) => interval.start),
+    ),
+    wallTime: intervalElapsed(run.lastRunIntervals),
+  };
+  return true;
 }
 
 export function transitionTaskWallRun(
@@ -514,19 +804,23 @@ export function transitionTaskWallRun(
   const isRoot = sessionID === run.rootSessionID;
   const startsRootRun = isRoot && activeTaskSessionState(state);
   if (run.phase === "idle") {
-    if (startsRootRun) {
-      startTaskWallRun(run, timestamp, true);
+    if (run.lastRunWallTime && timestamp < run.lastRunWallTime.completedAt) {
+      patchCompletedTaskWallRun(run, sessionID, state, timestamp);
+      return undefined;
+    }
+    if (activeTaskSessionState(state)) {
+      startTaskWallRun(run, timestamp, startsRootRun);
     } else {
+      recordLifecycleEvent(run, sessionID, state, timestamp);
       run.pendingSessions.set(sessionID, { state, timestamp });
       return undefined;
     }
   } else if (startsRootRun && !run.hasExplicitRootStart) {
-    run.runStartedAt = timestamp;
+    run.runStartedAt = Math.min(run.runStartedAt ?? timestamp, timestamp);
     run.hasExplicitRootStart = true;
-    run.rootObserved = true;
-    run.rootBusy = true;
   }
-  recordTaskSessionActivity(run, sessionID, state, timestamp);
+  const accepted = recordTaskSessionActivity(run, sessionID, state, timestamp);
+  if (accepted && activeTaskSessionState(state)) run.runStartedAt = Math.min(run.runStartedAt ?? timestamp, timestamp);
   return finishTaskWallRun(run, timestamp);
 }
 
@@ -536,11 +830,14 @@ export function noteTaskRunRecord(
   startedAt: number | undefined,
   completedAt: number | undefined,
 ): TaskWallTimeSummary | undefined {
-  if (run.phase !== "active") return undefined;
-  const activityAt = completedAt ?? startedAt;
-  if (activityAt === undefined) return undefined;
-  recordTaskSessionActivity(run, sessionID, "completed", activityAt);
-  return finishTaskWallRun(run, activityAt);
+  // A message completion only finalizes message/token accounting. The task
+  // run remains active until the participant emits its lifecycle idle or
+  // terminal state.
+  void run;
+  void sessionID;
+  void startedAt;
+  void completedAt;
+  return undefined;
 }
 
 function startSessionRun(
@@ -548,6 +845,9 @@ function startSessionRun(
   timestamp: number,
   status: Exclude<SessionRunStatus, "idle"> = "busy",
 ): void {
+  for (const [messageID, contribution] of runtime.contributions) {
+    runtime.completedContributions.set(messageID, contribution);
+  }
   runtime.runEpoch += 1;
   runtime.status = status;
   runtime.activeMessageID = undefined;
@@ -571,8 +871,7 @@ export function transitionSessionRuntime(
     return true;
   }
   if (runtime.status === "idle") {
-    if (status === "busy" || runtime.runEpoch === 0) startSessionRun(runtime, timestamp, status);
-    else runtime.status = status;
+    startSessionRun(runtime, timestamp, status);
   } else {
     runtime.status = status;
   }
@@ -597,6 +896,12 @@ export function freezeSessionRun(
     completedAt: timestamp,
   };
   runtime.lastRunSummary = summary;
+  runtime.runSummaries.set(runtime.runEpoch, summary);
+  for (const [messageID, contribution] of runtime.contributions) {
+    if (contribution.runEpoch === runtime.runEpoch) {
+      runtime.completedContributions.set(messageID, contribution);
+    }
+  }
   runtime.status = "idle";
   runtime.activeMessageID = undefined;
   return summary;
@@ -761,6 +1066,7 @@ function makeHistoryRecord(input: {
   state?: ActiveState;
   info?: ObjectRecord;
   completedAt: number;
+  quality?: RecordQuality;
 }): HistoryRecord {
   const start = infoTimeValue(input.info, ["start", "created"])
     ?? input.state?.startedAt
@@ -771,7 +1077,7 @@ function makeHistoryRecord(input: {
     ?? input.completedAt;
   const ttft = firstToken === undefined ? undefined : Math.max(0, firstToken - start);
   const duration = Math.max(0, completed - start);
-  return {
+  const record: HistoryRecord = {
     version: HISTORY_VERSION,
     messageID: input.messageID,
     sessionID: input.sessionID,
@@ -787,23 +1093,36 @@ function makeHistoryRecord(input: {
       duration,
     },
     samples: input.samples,
+    quality: input.quality ?? "exact",
   };
+  recordQualityByObject.set(record, input.quality ?? "exact");
+  return record;
 }
 
-function makeTokens(
+export function makeTokens(
   info: ObjectRecord | undefined,
   state: ActiveState | undefined,
   bytesPerToken: number,
 ): TokenCounts {
-  const exact = tokenFields(info?.tokens);
+  const exact = tokenFields(info);
   const fallback = state?.fallbackTokens ?? {};
   const estimate = estimateActiveTokens(state, bytesPerToken);
+  const cacheRead = exact.cacheRead === undefined
+    ? fallback.cacheRead ?? 0
+    : exact.cacheRead === 0 && (fallback.cacheRead ?? 0) > 0
+      ? fallback.cacheRead!
+      : exact.cacheRead;
+  const cacheWrite = exact.cacheWrite === undefined
+    ? fallback.cacheWrite ?? 0
+    : exact.cacheWrite === 0 && (fallback.cacheWrite ?? 0) > 0
+      ? fallback.cacheWrite!
+      : exact.cacheWrite;
   return {
     input: exactOrFallback(exact.input, fallback.input, estimate.input),
     output: exactOrFallback(exact.output, fallback.output, estimate.output),
     reasoning: exactOrFallback(exact.reasoning, fallback.reasoning, estimate.reasoning),
-    cacheRead: exactOrFallback(exact.cacheRead, fallback.cacheRead, 0),
-    cacheWrite: exactOrFallback(exact.cacheWrite, fallback.cacheWrite, 0),
+    cacheRead,
+    cacheWrite,
   };
 }
 
@@ -821,21 +1140,118 @@ function replaceTokenContribution(
   };
 }
 
+function recordCompleteness(record: HistoryRecord): number {
+  let score = 0;
+  if (record.parentSessionID) score += 2;
+  if (record.model) score += 2;
+  if (record.time.firstToken !== undefined) score += 1;
+  if (record.time.completed !== undefined) score += 3;
+  if (record.time.ttft !== undefined) score += 1;
+  if (record.time.duration !== undefined) score += 1;
+  if (record.samples.length > 0) score += 2 + Math.min(record.samples.length, 8);
+  if (record.tokens.input > 0) score += 1;
+  if (record.tokens.output > 0) score += 1;
+  if (record.tokens.reasoning > 0) score += 1;
+  if (record.tokens.cacheRead > 0) score += 1;
+  if (record.tokens.cacheWrite > 0) score += 1;
+  if (record.cost > 0) score += 1;
+  return score;
+}
+
+function recordFreshness(record: HistoryRecord): number {
+  return Math.max(
+    record.time.start,
+    record.time.firstToken ?? Number.NEGATIVE_INFINITY,
+    record.time.completed ?? Number.NEGATIVE_INFINITY,
+  );
+}
+
+function preferredHistoryRecord(
+  candidate: HistoryRecord,
+  existing: HistoryRecord,
+  candidateQuality: RecordQuality,
+  existingQuality: RecordQuality,
+): HistoryRecord {
+  if (candidateQuality !== existingQuality) {
+    return candidateQuality === "exact" ? candidate : existing;
+  }
+  const candidateFreshness = recordFreshness(candidate);
+  const existingFreshness = recordFreshness(existing);
+  if (candidateFreshness !== existingFreshness) {
+    return candidateFreshness > existingFreshness ? candidate : existing;
+  }
+  const candidateCompleteness = recordCompleteness(candidate);
+  const existingCompleteness = recordCompleteness(existing);
+  if (candidateCompleteness !== existingCompleteness) {
+    return candidateCompleteness > existingCompleteness ? candidate : existing;
+  }
+  return candidate;
+}
+
 export function applyRecordToSessionRuntime(
   runtime: SessionRuntime,
   record: HistoryRecord,
+  quality: RecordQuality = "exact",
 ): boolean {
+  const historical = runtime.completedContributions.get(record.messageID);
+  if (!runtime.contributions.has(record.messageID) && historical) {
+    const previous = historical.record;
+    if (quality === "provisional") return false;
+    const preferred = preferredHistoryRecord(record, previous, quality, historical.quality);
+    if (preferred !== record) return false;
+    runtime.completedContributions.set(record.messageID, {
+      ...historical,
+      record,
+      tokens: record.tokens,
+      cost: record.cost,
+      quality,
+    });
+    const summary = runtime.runSummaries.get(historical.runEpoch);
+    if (summary) {
+      const tokens = replaceTokenContribution(summary.tokens, previous.tokens, record.tokens);
+      runtime.runSummaries.set(historical.runEpoch, {
+        ...summary,
+        tokens,
+        cost: Math.max(0, summary.cost - previous.cost + record.cost),
+      });
+      if (runtime.lastRunSummary?.runEpoch === historical.runEpoch) runtime.lastRunSummary = runtime.runSummaries.get(historical.runEpoch);
+    }
+    return false;
+  }
   const previous = runtime.contributions.get(record.messageID);
+  if (previous && previous.quality === "exact" && quality === "provisional") return false;
+  if (previous) {
+    const preferred = preferredHistoryRecord(record, previous.record, quality, previous.quality);
+    if (preferred !== record) return false;
+  }
   if (previous) {
     runtime.runTotals = replaceTokenContribution(runtime.runTotals, previous.tokens, record.tokens);
     runtime.runCost = Math.max(0, runtime.runCost - previous.cost + record.cost);
+    const previousSummary = runtime.runSummaries.get(previous.runEpoch);
+    if (previousSummary) {
+      const correctedSummary: SessionRunSummary = {
+        ...previousSummary,
+        tokens: replaceTokenContribution(previousSummary.tokens, previous.tokens, record.tokens),
+        cost: Math.max(0, previousSummary.cost - previous.cost + record.cost),
+      };
+      runtime.runSummaries.set(previous.runEpoch, correctedSummary);
+      if (runtime.lastRunSummary?.runEpoch === previous.runEpoch) {
+        runtime.lastRunSummary = correctedSummary;
+      }
+    }
   } else {
     runtime.runTotals = addTokenCounts(runtime.runTotals, record.tokens);
     runtime.runCost += record.cost;
     runtime.runResponseCount += 1;
     runtime.seenMessageIDs.add(record.messageID);
   }
-  runtime.contributions.set(record.messageID, { tokens: record.tokens, cost: record.cost });
+  runtime.contributions.set(record.messageID, {
+    record,
+    tokens: record.tokens,
+    cost: record.cost,
+    quality,
+    runEpoch: runtime.runEpoch,
+  });
   runtime.runStartedAt = runtime.runStartedAt === undefined
     ? record.time.start
     : Math.min(runtime.runStartedAt, record.time.start);
@@ -843,6 +1259,16 @@ export function applyRecordToSessionRuntime(
     runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined
       ? record.time.firstToken
       : Math.min(runtime.runFirstTokenAt, record.time.firstToken);
+  }
+  if (runtime.status === "idle" && runtime.lastRunSummary?.runEpoch === runtime.runEpoch) {
+    runtime.lastRunSummary = {
+      ...runtime.lastRunSummary,
+      tokens: { ...runtime.runTotals },
+      cost: runtime.runCost,
+      responseCount: runtime.runResponseCount,
+      ...(runtime.runStartedAt !== undefined ? { startedAt: runtime.runStartedAt } : {}),
+      ...(runtime.runFirstTokenAt !== undefined ? { firstTokenAt: runtime.runFirstTokenAt } : {}),
+    };
   }
   return previous === undefined;
 }
@@ -879,30 +1305,73 @@ function commitRecord(
   record: HistoryRecord,
   markCompleted: boolean,
 ): void {
+  const quality: RecordQuality = markCompleted ? "exact" : "provisional";
+  if (!markCompleted && store.completedMessageIDs.has(record.messageID)) return;
+  if (
+    markCompleted
+    && store.completedMessageIDs.has(record.messageID)
+    && store.records.some((entry) => entry.messageID === record.messageID && historyRecordsEquivalent(entry, record))
+  ) return;
+  const selected = selectCommitRecord(store, record, quality);
+  const effectiveRecord = selected.record;
+  const effectiveQuality = selected.quality ?? "exact";
   const existingRuntime = getSessionRuntime(store, record.sessionID);
-  const runtime = existingRuntime.status === "idle"
-    && existingRuntime.contributions.has(record.messageID)
+  const existingContribution = existingRuntime.contributions.get(record.messageID)
+    ?? existingRuntime.completedContributions.get(record.messageID);
+  const runtime = existingContribution
     ? existingRuntime
     : ensureSessionRun(store, record.sessionID, record.time.start);
-  runtime.status = "busy";
-  applyRecordToSessionRuntime(runtime, record);
+  const historicalEpoch = existingRuntime.completedContributions.get(record.messageID)?.runEpoch;
+  if (runtime.contributions.get(record.messageID)?.quality === "exact" && effectiveQuality === "provisional") return;
+  const applied = applyRecordToSessionRuntime(runtime, effectiveRecord, effectiveQuality);
+  if (
+    !applied
+    && runtime.contributions.get(record.messageID)?.record !== effectiveRecord
+    && runtime.completedContributions.get(record.messageID)?.record !== effectiveRecord
+  ) return;
+  runtime.status = effectiveQuality === "exact" ? runtime.status : "busy";
   if (runtime.activeMessageID === record.messageID) runtime.activeMessageID = undefined;
-  if (markCompleted) store.completedMessageIDs.add(record.messageID);
-  store.lastCompletedBySession.set(
-    record.sessionID,
-    makeLastCompletedSnapshot(record, runtime.runEpoch, !markCompleted),
+  if (markCompleted || effectiveQuality === "exact") store.completedMessageIDs.add(record.messageID);
+  if (selected.source === "incoming") addOptimisticRecord(store, effectiveRecord, effectiveQuality);
+  const contributionEpoch = runtime.completedContributions.get(record.messageID)?.runEpoch
+    ?? runtime.contributions.get(record.messageID)?.runEpoch
+    ?? historicalEpoch
+    ?? runtime.runEpoch;
+  const snapshot = makeLastCompletedSnapshot(
+    effectiveRecord,
+    contributionEpoch,
+    effectiveQuality === "provisional",
   );
-  addOptimisticRecord(store, record);
+  const previousSnapshot = store.lastCompletedBySession.get(effectiveRecord.sessionID);
+  if (
+    previousSnapshot === undefined
+    || previousSnapshot.record.messageID === effectiveRecord.messageID
+    || contributionEpoch > previousSnapshot.runEpoch
+    || (
+      contributionEpoch === previousSnapshot.runEpoch
+      && recordCompletedAt(effectiveRecord) >= recordCompletedAt(previousSnapshot.record)
+    )
+  ) {
+    store.lastCompletedBySession.set(effectiveRecord.sessionID, snapshot);
+  }
 }
 
-function parentSessionID(api: TuiPluginApi, sessionID: string, info?: ObjectRecord): string | undefined {
+function parentSessionID(
+  api: TuiPluginApi,
+  sessionID: string,
+  info?: ObjectRecord,
+  store?: RuntimeStore,
+): string | undefined {
+  let stateParent: string | undefined;
   try {
     const session = api.state.session.get(sessionID);
-    if (session?.parentID) return session.parentID;
+    if (session?.parentID) stateParent = session.parentID;
   } catch {
     // State can still be syncing while a response completes.
   }
-  return readStringFrom([info], ["parentSessionID", "parentSessionId", "parentID"]);
+  return stateParent
+    ?? readStringFrom([info], ["parentSessionID", "parentSessionId", "parentID"])
+    ?? store?.sessionParents.get(sessionID);
 }
 
 function knownRootSessionID(store: RuntimeStore, sessionID: string): string {
@@ -917,11 +1386,77 @@ function knownRootSessionID(store: RuntimeStore, sessionID: string): string {
   return root;
 }
 
+function rewriteRecordParent(
+  record: HistoryRecord,
+  parentSessionID: string | undefined,
+): HistoryRecord {
+  if (parentSessionID === undefined || record.parentSessionID === parentSessionID) return record;
+  const next: HistoryRecord = { ...record, parentSessionID };
+  const quality = recordQualityByObject.get(record);
+  if (quality !== undefined) recordQualityByObject.set(next, quality);
+  return next;
+}
+
+function repairKnownParents(store: RuntimeStore): boolean {
+  let changed = false;
+  const repair = (record: HistoryRecord): HistoryRecord => {
+    const next = rewriteRecordParent(record, store.sessionParents.get(record.sessionID));
+    if (next !== record) changed = true;
+    return next;
+  };
+  const repairedRecords = store.records.map(repair);
+  store.diskRecords = store.diskRecords.map(repair);
+  for (const [messageID, record] of store.optimistic) {
+    const next = repair(record);
+    if (next === record) continue;
+    store.optimistic.set(messageID, next);
+    recordQualityByObject.set(next, store.optimisticQuality.get(messageID) ?? recordQuality(record));
+  }
+  if (changed) {
+    if (store.diskRecords.length > 0 || store.optimistic.size > 0) {
+      store.records = mergeHistoryLayers(
+        baseHistoryRecords(store),
+        store.optimistic,
+        store.maxRecords,
+        store.optimisticQuality,
+        store.optimisticOrder,
+      );
+    } else {
+      store.records = repairedRecords;
+    }
+    for (const [sessionID, snapshot] of store.lastCompletedBySession) {
+      const repaired = repair(snapshot.record);
+      if (repaired !== snapshot.record) {
+        store.lastCompletedBySession.set(
+          sessionID,
+          { ...snapshot, record: repaired },
+        );
+      }
+    }
+    for (const runtime of store.sessionRuntime.values()) {
+      for (const contribution of runtime.contributions.values()) {
+        contribution.record = repair(contribution.record);
+      }
+    }
+    store.bump();
+  }
+  return changed;
+}
+
 function mergeTaskWallRun(
   target: TaskWallRun,
   source: TaskWallRun,
   rootSessionID: string,
 ): void {
+  const targetWasActive = target.phase === "active";
+  const sourceWasActive = source.phase === "active";
+  const sourceIntervals = sourceWasActive
+    ? source.activeIntervals
+    : mergeIntervals(source.lastRunIntervals, source.carriedIntervals);
+  const carriedSourceIntervals = mergeIntervals(source.lastRunIntervals, source.carriedIntervals);
+  const sourceLifecycleEvents = sourceWasActive
+    ? source.lifecycleEvents
+    : source.lastRunLifecycleEvents;
   const activeCandidates = new Set([
     ...target.activeSessions,
     ...source.activeSessions,
@@ -934,15 +1469,67 @@ function mergeTaskWallRun(
   target.rootBusy = target.rootBusy || source.rootBusy;
   target.rootObserved = target.rootObserved || source.rootObserved;
   target.hasExplicitRootStart = target.hasExplicitRootStart || source.hasExplicitRootStart;
+  target.lastRunIntervals = mergeIntervals(target.lastRunIntervals, carriedSourceIntervals);
+  if (targetWasActive) {
+    target.carriedIntervals = mergeIntervals(
+      target.carriedIntervals,
+      sourceWasActive ? source.carriedIntervals : carriedSourceIntervals,
+    );
+  } else if (sourceWasActive) {
+    target.carriedIntervals = cloneIntervals(source.carriedIntervals);
+  } else {
+    target.carriedIntervals = [];
+  }
+  const lifecycleCandidates = new Map<string, TaskLifecycleEvent[]>();
+  for (const [sessionID, events] of target.lifecycleEvents) {
+    lifecycleCandidates.set(sessionID, mergeLifecycleEvents(events, []));
+  }
+  for (const [sessionID, events] of sourceLifecycleEvents) {
+    lifecycleCandidates.set(
+      sessionID,
+      mergeLifecycleEvents(lifecycleCandidates.get(sessionID) ?? [], events),
+    );
+  }
+  target.lifecycleEvents = lifecycleCandidates;
+  const pendingLifecycle = new Map<string, TaskLifecycleEvent[]>();
+  for (const [sessionID, events] of target.pendingLifecycleEvents) {
+    pendingLifecycle.set(sessionID, events.map((event) => ({ ...event })));
+  }
+  for (const [sessionID, events] of source.pendingLifecycleEvents) {
+    pendingLifecycle.set(
+      sessionID,
+      mergeLifecycleEvents(pendingLifecycle.get(sessionID) ?? [], events),
+    );
+  }
+  target.pendingLifecycleEvents = pendingLifecycle;
+  if (targetWasActive) {
+    target.activeIntervals = mergeIntervals(target.activeIntervals, sourceIntervals);
+    target.activeElapsed = intervalElapsed(target.activeIntervals);
+  }
+  const mergedParticipants = new Set([
+    ...target.participantSessions,
+    ...source.participantSessions,
+  ]);
+  target.participantSessions = mergedParticipants;
   if (source.runStartedAt !== undefined) {
     target.runStartedAt = target.runStartedAt === undefined
       ? source.runStartedAt
       : Math.min(target.runStartedAt, source.runStartedAt);
   }
-
-  for (const sessionID of source.participantSessions) {
-    target.participantSessions.add(sessionID);
+  if (carriedSourceIntervals.length > 0) {
+    const sourceStart = Math.min(...carriedSourceIntervals.map((interval) => interval.start));
+    target.runStartedAt = target.runStartedAt === undefined
+      ? sourceStart
+      : Math.min(target.runStartedAt, sourceStart);
   }
+  const sourceEarliestActive = earliestActiveTimestamp(source);
+  if (sourceEarliestActive !== undefined) {
+    target.runStartedAt = target.runStartedAt === undefined
+      ? sourceEarliestActive
+      : Math.min(target.runStartedAt, sourceEarliestActive);
+  }
+
+  for (const sessionID of source.participantSessions) target.participantSessions.add(sessionID);
   for (const [sessionID, state] of source.sessionStates) {
     const current = target.sessionStates.get(sessionID);
     const currentAt = target.lastActivityAt.get(sessionID) ?? Number.NEGATIVE_INFINITY;
@@ -982,12 +1569,26 @@ function mergeTaskWallRun(
       target.sessionStates.set(sessionID, "busy");
     }
   }
+  for (const [sessionID, events] of target.lifecycleEvents) {
+    const latest = events.at(-1);
+    if (!latest) continue;
+    target.participantSessions.add(sessionID);
+    target.sessionStates.set(sessionID, latest.state);
+    target.lastActivityAt.set(
+      sessionID,
+      Math.max(target.lastActivityAt.get(sessionID) ?? Number.NEGATIVE_INFINITY, latest.timestamp),
+    );
+  }
   target.activeSessions.clear();
   for (const [sessionID, state] of target.sessionStates) {
     if (activeTaskSessionState(state)) target.activeSessions.add(sessionID);
   }
   const rootState = target.sessionStates.get(rootSessionID);
-  if (rootState !== undefined) target.rootBusy = activeTaskSessionState(rootState);
+  target.rootObserved = rootState !== undefined;
+  target.rootBusy = activeTaskSessionState(rootState);
+  target.hasExplicitRootStart = activeTaskSessionState(rootState);
+  target.runStartedAt = earliestActiveTimestamp(target) ?? target.runStartedAt;
+  rebuildActiveIntervals(target);
 
   const sourceSummary = source.lastRunWallTime;
   const targetSummary = target.lastRunWallTime;
@@ -1005,6 +1606,32 @@ function mergeTaskWallRun(
     )
   ) {
     target.lastRunWallTime = sourceSummary;
+  }
+  if (target.phase === "active") rebuildActiveIntervals(target);
+  else {
+    target.lastRunLifecycleEvents = lifecycleCandidates;
+    target.lastRunCarriedIntervals = mergeIntervals(
+      target.lastRunCarriedIntervals,
+      source.lastRunCarriedIntervals,
+    );
+    target.lastRunIntervals = mergeIntervals(
+      target.lastRunIntervals,
+      target.lastRunCarriedIntervals,
+    );
+    if (target.lastRunWallTime) {
+      target.lastRunWallTime = {
+        ...target.lastRunWallTime,
+        wallTime: intervalElapsed(target.lastRunIntervals),
+        completedAt: Math.max(
+          target.lastRunWallTime.completedAt,
+          source.lastRunWallTime?.completedAt ?? target.lastRunWallTime.completedAt,
+        ),
+        startedAt: Math.min(
+          target.lastRunWallTime.startedAt,
+          ...target.lastRunIntervals.map((interval) => interval.start),
+        ),
+      };
+    }
   }
 }
 
@@ -1042,9 +1669,10 @@ function rememberSessionParent(
   if (!sessionID || !parentID || sessionID === parentID) return false;
   const previous = store.sessionParents.get(sessionID);
   if (previous !== parentID) store.sessionParents.set(sessionID, parentID);
+  const repaired = repairKnownParents(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
   const migrated = migrateTaskWallRuns(store, rootSessionID);
-  return previous !== parentID || migrated;
+  return previous !== parentID || repaired || migrated;
 }
 
 function sessionEventSources(
@@ -1082,7 +1710,7 @@ function rootSessionIDFor(
   sessionID: string,
   info?: ObjectRecord,
 ): string {
-  const parent = parentSessionID(api, sessionID, info);
+  const parent = parentSessionID(api, sessionID, info, store);
   if (parent) rememberSessionParent(store, sessionID, parent);
   const rootSessionID = knownRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
@@ -1131,7 +1759,8 @@ export function taskWallTimeForSession(
   const run = findTaskWallRun(store, rootSessionID, sessionID);
   if (!run) return undefined;
   if (run.phase === "active" && run.runStartedAt !== undefined) {
-    return Math.max(0, now - run.runStartedAt);
+    rebuildActiveIntervals(run, now);
+    return Math.max(0, run.activeElapsed);
   }
   if (run.lastRunWallTime) return run.lastRunWallTime.wallTime;
   return undefined;
@@ -1165,6 +1794,8 @@ function recordDelta(
 ): void {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
+  const parentID = readStringFrom([properties, event], ["parentSessionID", "parentSessionId", "parentID"]);
+  if (parentID) rememberSessionParent(store, sessionID, parentID);
   const messageID = readMessageID(properties);
   const delta = readDelta(properties, event);
   if (!delta) return;
@@ -1245,10 +1876,140 @@ function recordStepFallback(
   store.bump();
 }
 
-function addOptimisticRecord(store: RuntimeStore, record: HistoryRecord): void {
+interface HistoryLayerCandidate {
+  record: HistoryRecord;
+  quality?: RecordQuality;
+  source: "disk" | "optimistic" | "incoming";
+  order: number;
+}
+
+function baseHistoryRecords(store: RuntimeStore): HistoryRecord[] {
+  if (store.diskRecords.length > 0 || store.records.length === 0) return store.diskRecords;
+  const optimisticIDs = new Set(store.optimistic.keys());
+  return store.records.filter((record) => !optimisticIDs.has(record.messageID));
+}
+
+function preferredHistoryLayer(
+  candidate: HistoryLayerCandidate,
+  existing: HistoryLayerCandidate,
+): HistoryLayerCandidate {
+  const candidateQuality = candidate.quality ?? "exact";
+  const existingQuality = existing.quality ?? "exact";
+  const candidateCompleteness = recordCompleteness(candidate.record);
+  const existingCompleteness = recordCompleteness(existing.record);
+  if (
+    candidateQuality !== existingQuality
+  ) {
+    if (
+      candidate.source !== "disk"
+      && candidateQuality === "exact"
+      && existing.source === "disk"
+      && existingQuality === "provisional"
+    ) return candidate;
+    if (
+      existing.source !== "disk"
+      && existingQuality === "exact"
+      && candidate.source === "disk"
+      && candidateQuality === "provisional"
+    ) return existing;
+    if (
+      candidate.source === "disk"
+      && candidateQuality === "exact"
+      && candidateCompleteness > existingCompleteness
+    ) return candidate;
+    if (
+      existing.source === "disk"
+      && existingQuality === "exact"
+      && existingCompleteness > candidateCompleteness
+    ) return existing;
+    if (candidateQuality === "exact" && existingQuality === "provisional") {
+      return candidate;
+    }
+    if (candidateQuality === "provisional" && existingQuality === "exact") {
+      return existing;
+    }
+    return candidateQuality === "exact" ? candidate : existing;
+  }
+  if (
+    candidate.source !== "disk"
+    && existing.source === "disk"
+    && candidateCompleteness !== existingCompleteness
+  ) {
+    return candidateCompleteness > existingCompleteness ? candidate : existing;
+  }
+  if (
+    existing.source !== "disk"
+    && candidate.source === "disk"
+    && candidateCompleteness !== existingCompleteness
+  ) {
+    return candidateCompleteness > existingCompleteness ? candidate : existing;
+  }
+  if (candidateQuality === "exact" && existingQuality === "exact") {
+    if (candidate.source !== "disk" && existing.source === "disk") return candidate;
+    if (existing.source !== "disk" && candidate.source === "disk") return existing;
+  }
+  const candidateFreshness = recordFreshness(candidate.record);
+  const existingFreshness = recordFreshness(existing.record);
+  if (candidateFreshness !== existingFreshness) {
+    return candidateFreshness > existingFreshness ? candidate : existing;
+  }
+  if (candidateCompleteness !== existingCompleteness) {
+    return candidateCompleteness > existingCompleteness ? candidate : existing;
+  }
+  if (candidate.order !== existing.order) return candidate.order > existing.order ? candidate : existing;
+  return candidate.source === "optimistic" ? candidate : existing;
+}
+
+function addOptimisticRecord(
+  store: RuntimeStore,
+  record: HistoryRecord,
+  quality: RecordQuality,
+): boolean {
+  recordQualityByObject.set(record, quality);
   store.optimistic.set(record.messageID, record);
-  store.records = mergeHistoryLayers(store.records, store.optimistic, store.maxRecords);
+  store.optimisticQuality.set(record.messageID, quality);
+  store.optimisticOrder.set(record.messageID, store.nextOptimisticOrder);
+  store.nextOptimisticOrder += 1;
+  store.records = mergeHistoryLayers(
+    baseHistoryRecords(store),
+    store.optimistic,
+    store.maxRecords,
+    store.optimisticQuality,
+    store.optimisticOrder,
+  );
   store.bump();
+  return true;
+}
+
+function selectCommitRecord(
+  store: RuntimeStore,
+  record: HistoryRecord,
+  quality: RecordQuality,
+): HistoryLayerCandidate {
+  const candidates: HistoryLayerCandidate[] = [{
+    record,
+    quality,
+    source: "incoming",
+    order: store.nextOptimisticOrder,
+  }];
+  const previous = store.optimistic.get(record.messageID);
+  const previousQuality = store.optimisticQuality.get(record.messageID)
+    ?? (previous ? recordQualityByObject.get(previous) : undefined)
+    ?? "exact";
+  if (previous) {
+    candidates.push({
+      record: previous,
+      quality: previousQuality,
+      source: "optimistic",
+      order: store.optimisticOrder.get(record.messageID) ?? Number.NEGATIVE_INFINITY,
+    });
+  }
+  const diskRecord = baseHistoryRecords(store).find((entry) => entry.messageID === record.messageID);
+  if (diskRecord) candidates.push({ record: diskRecord, quality: diskRecordQuality(diskRecord), source: "disk", order: 0 });
+  return candidates.slice(1).reduce(
+    (best, candidate) => preferredHistoryLayer(candidate, best),
+    candidates[0],
+  );
 }
 
 function handleMessageUpdated(
@@ -1285,18 +2046,12 @@ function handleMessageUpdated(
     return false;
   }
 
-  if (store.completedMessageIDs.has(messageID)) {
-    store.active.delete(messageID);
-    const runtime = getSessionRuntime(store, sessionID);
-    if (runtime.activeMessageID === messageID) runtime.activeMessageID = undefined;
-    return false;
-  }
   const state = takeActiveState(store.active, messageID, sessionID);
   const tokens = makeTokens(info, state, bytesPerToken);
   const record = makeHistoryRecord({
     messageID,
     sessionID,
-    parentSessionID: parentSessionID(api, sessionID, info),
+    parentSessionID: parentSessionID(api, sessionID, info, store),
     model: modelName(info) ?? state?.model,
     cost: readNumber(info.cost) ?? state?.cost ?? 0,
     tokens,
@@ -1307,6 +2062,7 @@ function handleMessageUpdated(
     state,
     info,
     completedAt: timestamp,
+    quality: "exact",
   });
   commitRecord(store, record, true);
   noteTaskRecord(store, api, record);
@@ -1329,7 +2085,7 @@ function flushIdleStates(
     const record = makeHistoryRecord({
       messageID: state.messageID,
       sessionID,
-      parentSessionID: parentSessionID(api, sessionID),
+      parentSessionID: parentSessionID(api, sessionID, undefined, store),
       model: state.model,
       cost: state.cost ?? 0,
       tokens,
@@ -1339,6 +2095,7 @@ function flushIdleStates(
       }),
       state,
       completedAt,
+      quality: "provisional",
     });
     commitRecord(store, record, false);
     flushed = true;
@@ -1394,9 +2151,14 @@ export function handleSessionLifecycle(
   const status = sessionRunStatus(type, properties, event);
   if (!sessionID || status === undefined) return false;
   const timestamp = eventTimestamp(event, properties);
+  const eventParent = readStringFrom(
+    sessionEventSources(properties, event),
+    ["parentID", "parentSessionID", "parentSessionId", "parent.id"],
+  );
+  if (eventParent) rememberSessionParent(store, sessionID, eventParent);
   const rootSessionID = rootSessionIDFor(store, api, sessionID);
   const taskRun = status === "idle"
-    ? findTaskWallRun(store, rootSessionID, sessionID)
+    ? findTaskWallRun(store, rootSessionID, sessionID) ?? getTaskWallRun(store, rootSessionID)
     : getTaskWallRun(store, rootSessionID);
   if (status === "idle") {
     const finishedSession = finishSessionRun(store, api, sessionID, bytesPerToken, timestamp);
@@ -1419,15 +2181,41 @@ export function mergeHistoryLayers(
   diskRecords: readonly HistoryRecord[],
   optimistic: ReadonlyMap<string, HistoryRecord>,
   maxRecords: number,
+  optimisticQuality?: ReadonlyMap<string, RecordQuality>,
+  optimisticOrder?: ReadonlyMap<string, number>,
 ): HistoryRecord[] {
-  const byMessage = new Map<string, HistoryRecord>();
+  const byMessage = new Map<string, HistoryLayerCandidate>();
   for (const record of diskRecords) {
-    byMessage.set(record.messageID, record);
+    const candidate: HistoryLayerCandidate = {
+      record,
+      quality: diskRecordQuality(record),
+      source: "disk",
+      order: 0,
+    };
+    const existing = byMessage.get(record.messageID);
+    byMessage.set(
+      record.messageID,
+      existing ? preferredHistoryLayer(candidate, existing) : candidate,
+    );
   }
   for (const [messageID, record] of optimistic) {
-    byMessage.set(messageID, record);
+    const candidate: HistoryLayerCandidate = {
+      record,
+      quality: optimisticQuality?.get(messageID) ?? recordQualityByObject.get(record) ?? "exact",
+      source: "optimistic",
+      order: optimisticOrder?.get(messageID) ?? 0,
+    };
+    const existing = byMessage.get(messageID);
+    byMessage.set(
+      messageID,
+      existing ? preferredHistoryLayer(candidate, existing) : candidate,
+    );
   }
-  return [...byMessage.values()].slice(-maxRecords);
+  return [...byMessage.values()].map((candidate) => candidate.record).slice(-maxRecords);
+}
+
+export function classifyTokenFields(value: unknown): Partial<TokenCounts> {
+  return tokenFields(value);
 }
 
 function tokenCountsEqual(left: TokenCounts, right: TokenCounts): boolean {
@@ -1452,11 +2240,34 @@ export function historyRecordsEquivalent(
     && left.time.firstToken === right.time.firstToken
     && left.time.completed === right.time.completed
     && left.time.ttft === right.time.ttft
-    && left.time.duration === right.time.duration;
+    && left.time.duration === right.time.duration
+    && (left.quality ?? "exact") === (right.quality ?? "exact");
 }
 
 function recordCompletedAt(record: HistoryRecord): number {
   return record.time.completed ?? record.time.start;
+}
+
+function recordQuality(record: HistoryRecord): RecordQuality {
+  return recordQualityByObject.get(record) ?? "exact";
+}
+
+function diskRecordQuality(record: HistoryRecord): RecordQuality {
+  if (record.quality === "provisional" || record.quality === "exact") return record.quality;
+  // HistoryRecord predates the in-memory quality marker. A persisted record
+  // with timing/sample calibration is treated as complete; older snapshots
+  // without that evidence remain provisional.
+  return record.time.firstToken !== undefined
+    || record.time.ttft !== undefined
+    || record.samples.length > 0
+    ? "exact"
+    : "provisional";
+}
+
+function removeOptimisticRecord(store: RuntimeStore, messageID: string): void {
+  store.optimistic.delete(messageID);
+  store.optimisticQuality.delete(messageID);
+  store.optimisticOrder.delete(messageID);
 }
 
 function hydrateHistoryState(
@@ -1465,14 +2276,53 @@ function hydrateHistoryState(
 ): void {
   for (const record of diskRecords) {
     const overlay = store.optimistic.get(record.messageID);
-    if (overlay && !historyRecordsEquivalent(overlay, record)) continue;
+    let selected = record;
+    if (overlay) {
+      const overlayQuality = store.optimisticQuality.get(record.messageID)
+        ?? recordQualityByObject.get(overlay)
+        ?? "provisional";
+      const preferred = preferredHistoryLayer(
+        { record, quality: diskRecordQuality(record), source: "disk", order: 0 },
+        {
+          record: overlay,
+          quality: overlayQuality,
+          source: "optimistic",
+          order: store.optimisticOrder.get(record.messageID) ?? 0,
+        },
+      );
+      if (preferred.record === overlay) {
+        selected = overlay;
+        if (overlayQuality === "exact") store.completedMessageIDs.add(record.messageID);
+        const existing = store.lastCompletedBySession.get(overlay.sessionID);
+        if (
+          overlayQuality === "exact"
+          && (existing === undefined || recordCompletedAt(overlay) >= recordCompletedAt(existing.record))
+        ) {
+          const runtime = store.sessionRuntime.get(overlay.sessionID);
+          store.lastCompletedBySession.set(
+            overlay.sessionID,
+            makeLastCompletedSnapshot(overlay, runtime?.runEpoch ?? 0),
+          );
+        }
+        store.completedMessageIDs.add(overlay.messageID);
+        const overlayRuntime = store.sessionRuntime.get(overlay.sessionID);
+        if (overlayRuntime?.contributions.has(overlay.messageID)) {
+          applyRecordToSessionRuntime(overlayRuntime, overlay, "exact");
+        }
+        continue;
+      }
+      removeOptimisticRecord(store, record.messageID);
+    }
     store.completedMessageIDs.add(record.messageID);
+    const runtime = store.sessionRuntime.get(record.sessionID);
+    if (runtime?.contributions.has(record.messageID)) {
+      applyRecordToSessionRuntime(runtime, selected, "exact");
+    }
     const existing = store.lastCompletedBySession.get(record.sessionID);
     if (
       existing === undefined
       || recordCompletedAt(record) >= recordCompletedAt(existing.record)
     ) {
-      const runtime = store.sessionRuntime.get(record.sessionID);
       store.lastCompletedBySession.set(
         record.sessionID,
         makeLastCompletedSnapshot(record, runtime?.runEpoch ?? 0),
@@ -1492,14 +2342,16 @@ async function reloadHistory(
   try {
     const diskRecords = (await readHistoryFile(path)).slice(-maxRecords);
     if (store.disposed || generation !== store.historyGeneration) return;
-    for (const record of diskRecords) {
-      const overlay = store.optimistic.get(record.messageID);
-      if (overlay && historyRecordsEquivalent(overlay, record)) {
-        store.optimistic.delete(record.messageID);
-      }
-    }
-    hydrateHistoryState(store, diskRecords);
-    store.records = mergeHistoryLayers(diskRecords, store.optimistic, maxRecords);
+    store.diskRecords = diskRecords;
+    repairKnownParents(store);
+    hydrateHistoryState(store, store.diskRecords);
+    store.records = mergeHistoryLayers(
+      store.diskRecords,
+      store.optimistic,
+      maxRecords,
+      store.optimisticQuality,
+      store.optimisticOrder,
+    );
     store.bump();
   } catch (error) {
     warnWithToast(api, "history read failed", error);
@@ -1540,8 +2392,12 @@ export function createRuntimeStore(maxRecords: number): RuntimeStore {
     const [revision, setRevision] = createSignal(0);
     return {
       maxRecords,
+      diskRecords: [],
       records: [],
       optimistic: new Map<string, HistoryRecord>(),
+      optimisticQuality: new Map<string, RecordQuality>(),
+      optimisticOrder: new Map<string, number>(),
+      nextOptimisticOrder: 1,
       active: new Map<string, ActiveState>(),
       completedMessageIDs: new Set<string>(),
       sessionRuntime: new Map<string, SessionRuntime>(),
@@ -1587,11 +2443,19 @@ function generatedTokens(tokens: TokenCounts): number {
 }
 
 export function totalTokens(tokens: TokenCounts): number {
-  return tokens.input + tokens.cacheRead + tokens.output + tokens.reasoning;
+  return tokens.input + tokens.cacheRead + tokens.cacheWrite + tokens.output + tokens.reasoning;
+}
+
+function recordsWithKnownParents(
+  records: readonly HistoryRecord[],
+  store?: RuntimeStore,
+): HistoryRecord[] {
+  if (!store || store.sessionParents.size === 0) return [...records];
+  return records.map((record) => rewriteRecordParent(record, store.sessionParents.get(record.sessionID)));
 }
 
 export function cacheHitRate(tokens: TokenCounts): number | undefined {
-  const denominator = tokens.input + tokens.cacheRead;
+  const denominator = tokens.input + tokens.cacheRead + tokens.cacheWrite;
   if (!Number.isFinite(denominator) || denominator <= 0) return undefined;
   const rate = tokens.cacheRead / denominator;
   return Number.isFinite(rate) ? rate : undefined;
@@ -1751,7 +2615,7 @@ function summaryLines(
 ): string[] {
   return [
     label,
-    `  Total tokens (input + generated) ${formatCompactNumber(totalTokens(tokens))}`,
+    `  Total tokens (input + generated + cache) ${formatCompactNumber(totalTokens(tokens))}`,
     `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`,
     `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`,
     `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`,
@@ -1787,7 +2651,7 @@ function pulseMetricRows(
   responseCount: number,
 ): PulseMetric[] {
   return [
-    { label: "Total tokens (input + generated)", value: formatCompactNumber(totalTokens(tokens)) },
+    { label: "Total tokens (input + generated + cache)", value: formatCompactNumber(totalTokens(tokens)) },
     { label: "Uncached input", value: formatCompactNumber(tokens.input) },
     { label: "Cache read (reused)", value: formatCompactNumber(tokens.cacheRead) },
     { label: "Cache hit rate", value: formatCacheHitRate(cacheHitRate(tokens)) },
@@ -1880,12 +2744,14 @@ function ChildAgentRows(props: {
 function aggregateForSession(
   records: readonly HistoryRecord[],
   sessionID: string | undefined,
+  store?: RuntimeStore,
 ): SessionAggregate | undefined {
   if (!sessionID) return undefined;
-  const direct = aggregateSession(records, sessionID);
+  const repairedRecords = recordsWithKnownParents(records, store);
+  const direct = aggregateSession(repairedRecords, sessionID);
   if (direct) return direct;
 
-  const roots = aggregateSessionTree(records);
+  const roots = aggregateSessionTree(repairedRecords);
   const children: SessionAggregate[] = [];
   const visit = (node: SessionAggregate) => {
     if (node.parentSessionID === sessionID) children.push(node);
@@ -1916,24 +2782,27 @@ function aggregateForSession(
 function recordsForSession(
   records: readonly HistoryRecord[],
   sessionID: string | undefined,
+  store?: RuntimeStore,
 ): HistoryRecord[] {
   if (!sessionID) return [...records];
-  const aggregate = aggregateForSession(records, sessionID);
-  if (!aggregate) return records.filter((record) => record.sessionID === sessionID);
+  const aggregate = aggregateForSession(records, sessionID, store);
+  const repairedRecords = recordsWithKnownParents(records, store);
+  if (!aggregate) return repairedRecords.filter((record) => record.sessionID === sessionID);
   const ids = new Set<string>();
   const visit = (node: SessionAggregate) => {
     ids.add(node.sessionID);
     node.children.forEach(visit);
   };
   visit(aggregate);
-  return records.filter((record) => ids.has(record.sessionID));
+  return repairedRecords.filter((record) => ids.has(record.sessionID));
 }
 
 function recentRecords(
   records: readonly HistoryRecord[],
   sessionID: string | undefined,
+  store?: RuntimeStore,
 ): HistoryRecord[] {
-  return recordsForSession(records, sessionID)
+  return recordsForSession(records, sessionID, store)
     .slice()
     .sort((left, right) => (
       (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start)
@@ -1944,18 +2813,20 @@ function recentRecords(
 function childRows(
   records: readonly HistoryRecord[],
   aggregate: SessionAggregate | undefined,
+  store?: RuntimeStore,
 ): ChildRow[] {
   if (!aggregate) return [];
   const rows: ChildRow[] = [];
+  const repairedRecords = recordsWithKnownParents(records, store);
   const visit = (node: SessionAggregate, depth: number) => {
-    const directRecords = records.filter((record) => record.sessionID === node.sessionID);
+    const directRecords = repairedRecords.filter((record) => record.sessionID === node.sessionID);
     const subtreeIDs = new Set<string>();
     const collectIDs = (current: SessionAggregate) => {
       subtreeIDs.add(current.sessionID);
       current.children.forEach(collectIDs);
     };
     collectIDs(node);
-    const subtreeRecords = records.filter((record) => subtreeIDs.has(record.sessionID));
+    const subtreeRecords = repairedRecords.filter((record) => subtreeIDs.has(record.sessionID));
     const displayRecords = directRecords.length > 0 ? directRecords : subtreeRecords;
     const directGenerated = generatedTokens(node.directTokens);
     const responseCount = node.directResponseCount || node.responseCount;
@@ -2102,7 +2973,7 @@ function SummaryBlock(props: {
 }): JSX.Element {
   const lines = createMemo(() => {
     props.store.revision();
-    const aggregate = aggregateForSession(props.store.records, props.sessionID);
+    const aggregate = aggregateForSession(props.store.records, props.sessionID, props.store);
     if (!aggregate) return emptySummaryLines();
     return [
       ...summaryLines(
@@ -2132,7 +3003,7 @@ function HistoryView(props: {
 }): JSX.Element {
   const rows = createMemo(() => {
     props.store.revision();
-    return recentRecords(props.store.records, props.sessionID);
+    return recentRecords(props.store.records, props.sessionID, props.store);
   });
   return (
     <box flexDirection="column" flexGrow={1} backgroundColor={props.api.theme.current.background}>
@@ -2206,7 +3077,7 @@ function BottomContent(props: {
   const view = createMemo((): AggregateView => {
     props.store.revision();
     return {
-      aggregate: aggregateForSession(props.store.records, sessionID()),
+      aggregate: aggregateForSession(props.store.records, sessionID(), props.store),
       records: props.store.records,
     };
   });
@@ -2214,7 +3085,7 @@ function BottomContent(props: {
     props.store.revision();
     return taskWallTimeForSession(props.store, sessionID());
   });
-  const rows = createMemo(() => childRows(view().records, view().aggregate));
+  const rows = createMemo(() => childRows(view().records, view().aggregate, props.store));
   const sections = createMemo((): PulseSectionData[] => {
     const aggregate = view().aggregate;
     if (!aggregate) {
@@ -2562,6 +3433,9 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     clearInterval(interval);
     store.active.clear();
     store.optimistic.clear();
+    store.optimisticQuality.clear();
+    store.optimisticOrder.clear();
+    store.diskRecords = [];
     store.records = [];
     store.completedMessageIDs.clear();
     store.sessionRuntime.clear();

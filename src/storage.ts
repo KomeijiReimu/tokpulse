@@ -182,7 +182,12 @@ export function parseHistoryJsonl(content: string): HistoryRecord[] {
     try {
       const parsed: unknown = JSON.parse(line);
       const record = normalizeHistoryRecord(parsed);
-      if (record) byMessage.set(record.messageID, record);
+      if (record) {
+        const existing = byMessage.get(record.messageID);
+        if (!existing || isPreferredRecord(record, existing)) {
+          byMessage.set(record.messageID, record);
+        }
+      }
     } catch {
       // Keep valid records when one line was truncated or otherwise corrupt.
     }
@@ -194,7 +199,11 @@ export function serializeHistoryJsonl(records: readonly HistoryRecord[]): string
   const unique = new Map<string, HistoryRecord>();
   for (const record of records) {
     const normalized = normalizeHistoryRecord(record);
-    if (normalized) unique.set(normalized.messageID, normalized);
+    if (!normalized) continue;
+    const existing = unique.get(normalized.messageID);
+    if (!existing || isPreferredRecord(normalized, existing)) {
+      unique.set(normalized.messageID, normalized);
+    }
   }
   if (unique.size === 0) return "";
   return `${[...unique.values()].map((record) => JSON.stringify(record)).join("\n")}\n`;
@@ -210,6 +219,9 @@ export function normalizeHistoryRecord(value: unknown): HistoryRecord | undefine
   const samples = Array.isArray(value.samples)
     ? value.samples.map(normalizeSample).filter((sample): sample is SpeedSample => sample !== undefined)
     : [];
+  const quality = value.quality === "provisional" || value.quality === "exact"
+    ? value.quality
+    : undefined;
   return {
     version: HISTORY_VERSION,
     messageID: value.messageID,
@@ -222,18 +234,24 @@ export function normalizeHistoryRecord(value: unknown): HistoryRecord | undefine
     cost: nonNegativeNumber(value.cost),
     time,
     samples,
+    ...(quality ? { quality } : {}),
   };
 }
 
 function upsertRecord(records: readonly HistoryRecord[], record: HistoryRecord): HistoryRecord[] {
   const normalized = normalizeHistoryRecord(record);
   if (!normalized) throw new TypeError("Invalid history record");
+  const existing = records.find((entry) => entry.messageID === normalized.messageID);
+  const chosen = existing && !isPreferredRecord(normalized, existing) ? existing : normalized;
   const result = records.filter((entry) => entry.messageID !== normalized.messageID);
-  result.push(normalized);
+  result.push(chosen);
   return result;
 }
 
 function isPreferredRecord(candidate: HistoryRecord, existing: HistoryRecord): boolean {
+  const candidateQuality = candidate.quality ?? "exact";
+  const existingQuality = existing.quality ?? "exact";
+  if (candidateQuality !== existingQuality) return candidateQuality === "exact";
   const candidateCompleteness = recordCompleteness(candidate);
   const existingCompleteness = recordCompleteness(existing);
   if (candidateCompleteness !== existingCompleteness) {

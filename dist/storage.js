@@ -142,7 +142,12 @@ export function parseHistoryJsonl(content) {
     try {
       const parsed = JSON.parse(line);
       const record = normalizeHistoryRecord(parsed);
-      if (record) byMessage.set(record.messageID, record);
+      if (record) {
+        const existing = byMessage.get(record.messageID);
+        if (!existing || isPreferredRecord(record, existing)) {
+          byMessage.set(record.messageID, record);
+        }
+      }
     } catch {
       // Keep valid records when one line was truncated or otherwise corrupt.
     }
@@ -153,7 +158,11 @@ export function serializeHistoryJsonl(records) {
   const unique = new Map();
   for (const record of records) {
     const normalized = normalizeHistoryRecord(record);
-    if (normalized) unique.set(normalized.messageID, normalized);
+    if (!normalized) continue;
+    const existing = unique.get(normalized.messageID);
+    if (!existing || isPreferredRecord(normalized, existing)) {
+      unique.set(normalized.messageID, normalized);
+    }
   }
   if (unique.size === 0) return "";
   return `${[...unique.values()].map(record => JSON.stringify(record)).join("\n")}\n`;
@@ -166,6 +175,7 @@ export function normalizeHistoryRecord(value) {
   const tokens = normalizeTokens(value.tokens);
   const time = normalizeTime(value.time);
   const samples = Array.isArray(value.samples) ? value.samples.map(normalizeSample).filter(sample => sample !== undefined) : [];
+  const quality = value.quality === "provisional" || value.quality === "exact" ? value.quality : undefined;
   return {
     version: HISTORY_VERSION,
     messageID: value.messageID,
@@ -179,17 +189,25 @@ export function normalizeHistoryRecord(value) {
     tokens,
     cost: nonNegativeNumber(value.cost),
     time,
-    samples
+    samples,
+    ...(quality ? {
+      quality
+    } : {})
   };
 }
 function upsertRecord(records, record) {
   const normalized = normalizeHistoryRecord(record);
   if (!normalized) throw new TypeError("Invalid history record");
+  const existing = records.find(entry => entry.messageID === normalized.messageID);
+  const chosen = existing && !isPreferredRecord(normalized, existing) ? existing : normalized;
   const result = records.filter(entry => entry.messageID !== normalized.messageID);
-  result.push(normalized);
+  result.push(chosen);
   return result;
 }
 function isPreferredRecord(candidate, existing) {
+  const candidateQuality = candidate.quality ?? "exact";
+  const existingQuality = existing.quality ?? "exact";
+  if (candidateQuality !== existingQuality) return candidateQuality === "exact";
   const candidateCompleteness = recordCompleteness(candidate);
   const existingCompleteness = recordCompleteness(existing);
   if (candidateCompleteness !== existingCompleteness) {

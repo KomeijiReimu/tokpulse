@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord } from "../src/core.js";
 import {
+  createHistoryStorage,
   mergeHistoryRecords,
+  parseHistoryJsonl,
   readHistoryFile,
   serializeHistoryJsonl,
 } from "../src/storage.js";
@@ -91,6 +93,33 @@ test("mergeHistoryRecords keeps temp-only records and resolves newer ties", () =
   assert.equal(merged.length, 2);
   assert.equal(merged.find((record) => record.messageID === "same")?.cost, 2);
   assert.equal(merged.some((record) => record.messageID === "only-temp"), true);
+});
+
+test("quality survives JSONL round trips and exact beats a later provisional snapshot", async (context) => {
+  const exact = historyRecord("quality", { quality: "exact" });
+  const provisional = historyRecord("quality", {
+    quality: "provisional",
+    time: { start: 1, completed: 30, duration: 29 },
+  });
+  const parsed = parseHistoryJsonl(serializeHistoryJsonl([provisional, exact]));
+  assert.equal(parsed[0]?.quality, "exact");
+
+  const merged = mergeHistoryRecords([exact], [provisional]);
+  assert.equal(merged[0]?.quality, "exact");
+
+  const directory = await makeTestDirectory(context);
+  const storage = createHistoryStorage(join(directory, "quality.jsonl"));
+  await storage.upsert(exact);
+  await storage.upsert(provisional);
+  const stored = await storage.read();
+  assert.equal(stored[0]?.quality, "exact");
+});
+
+test("legacy records without quality remain readable", () => {
+  const legacy = JSON.stringify({ ...historyRecord("legacy"), quality: undefined });
+  const parsed = parseHistoryJsonl(`${legacy}\n`);
+  assert.equal(parsed[0]?.quality, undefined);
+  assert.equal(parsed[0]?.messageID, "legacy");
 });
 
 async function makeTestDirectory(context: { after: (callback: () => Promise<void>) => void }): Promise<string> {

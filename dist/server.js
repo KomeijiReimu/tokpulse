@@ -57,11 +57,11 @@ async function handleEvent(rawEvent, input, storage, active, completedMessageIDs
       return;
     }
     if (type === "session.next.step.ended") {
-      recordStepFallback(active, properties, event, timestamp);
+      recordStepFallback(active, completedMessageIDs, properties, event, timestamp);
       return;
     }
     if (isIdleEvent(type, properties)) {
-      await flushIdleStates(input, storage, active, properties, event, timestamp, bytesPerToken);
+      await flushIdleStates(input, storage, active, completedMessageIDs, properties, event, timestamp, bytesPerToken);
     }
   } catch (error) {
     warn("event parsing failed", error);
@@ -92,17 +92,15 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
   state[stream].samples.push(sample);
   active.set(messageID ?? key, state);
 }
-function recordStepFallback(active, properties, event, timestamp) {
+function recordStepFallback(active, completedMessageIDs, properties, event, timestamp) {
   const sessionID = readString(properties, event, ["sessionID", "sessionId"]);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
+  if (messageID && completedMessageIDs.has(messageID)) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
   const tokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
-  state.fallbackTokens = {
-    ...state.fallbackTokens,
-    ...tokens
-  };
+  state.fallbackTokens = mergeFallbackTokens(state.fallbackTokens, tokens);
   state.model = state.model ?? modelName(info);
   if (state.cost === undefined) state.cost = numberOrUndefined(info?.cost ?? properties.cost);
   active.set(messageID ?? pendingKey(sessionID), state);
@@ -125,8 +123,8 @@ async function handleMessageUpdated(input, storage, active, completedMessageIDs,
     input: exactOrFallback(exactTokens.input, fallback.input, estimate.input),
     output: exactOrFallback(exactTokens.output, fallback.output, estimate.output),
     reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, estimate.reasoning),
-    cacheRead: exactOrFallback(exactTokens.cacheRead, fallback.cacheRead, 0),
-    cacheWrite: exactOrFallback(exactTokens.cacheWrite, fallback.cacheWrite, 0)
+    cacheRead: cacheOrFallback(exactTokens.cacheRead, fallback.cacheRead),
+    cacheWrite: cacheOrFallback(exactTokens.cacheWrite, fallback.cacheWrite)
   };
   const candidateSamples = chooseSamples(state);
   const samples = calibrateResponseSamples(candidateSamples, {
@@ -144,17 +142,19 @@ async function handleMessageUpdated(input, storage, active, completedMessageIDs,
     samples,
     state,
     info,
-    completedAt: timestamp
+    completedAt: timestamp,
+    quality: "exact"
   });
   if (await safeUpsert(storage, record)) completedMessageIDs.add(messageID);else if (state) active.set(messageID, state);
 }
-async function flushIdleStates(input, storage, active, properties, event, timestamp, bytesPerToken) {
+async function flushIdleStates(input, storage, active, completedMessageIDs, properties, event, timestamp, bytesPerToken) {
   const sessionID = readString(properties, event, ["sessionID", "sessionId"]);
   if (!sessionID) return;
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
     active.delete(key);
     if (state.messageID.startsWith("__pending__:")) continue;
+    if (completedMessageIDs.has(state.messageID)) continue;
     const estimate = estimateStateTokens(state, bytesPerToken);
     const tokens = {
       input: state.fallbackTokens.input ?? estimate.input,
@@ -177,7 +177,8 @@ async function flushIdleStates(input, storage, active, properties, event, timest
       }),
       state,
       info: undefined,
-      completedAt: timestamp
+      completedAt: timestamp,
+      quality: "provisional"
     });
     await safeUpsert(storage, record);
   }
@@ -212,7 +213,8 @@ function makeHistoryRecord(input) {
       } : {}),
       duration
     },
-    samples: input.samples
+    samples: input.samples,
+    quality: input.quality
   };
 }
 function chooseSamples(state) {
@@ -274,10 +276,7 @@ function mergeStates(target, source) {
   }
   target.model = target.model ?? source.model;
   target.cost = target.cost ?? source.cost;
-  target.fallbackTokens = {
-    ...source.fallbackTokens,
-    ...target.fallbackTokens
-  };
+  target.fallbackTokens = mergeFallbackTokens(source.fallbackTokens, target.fallbackTokens);
   target.legacy.hasData ||= source.legacy.hasData;
   target.legacy.samples.push(...source.legacy.samples);
   target.v2.hasData ||= source.v2.hasData;
@@ -307,20 +306,42 @@ function eventInfo(properties, event) {
 function tokenFields(value) {
   if (!isRecord(value)) return {};
   const normalized = normalizeTokenCounts(value);
+  const inputDetails = isRecord(value.inputTokenDetails) ? value.inputTokenDetails : undefined;
+  const outputDetails = isRecord(value.outputTokenDetails) ? value.outputTokenDetails : undefined;
   const fields = {};
-  if (hasNumber(value.input)) fields.input = normalized.input;
-  if (hasNumber(value.output)) fields.output = normalized.output;
-  if (hasNumber(value.reasoning)) fields.reasoning = normalized.reasoning;
-  if (hasNumber(value.cacheRead) || isRecord(value.cache) && hasNumber(value.cache.read)) {
+  if (hasNumber(value.input) || hasNumber(value.inputTokens)) fields.input = normalized.input;
+  if (hasNumber(value.output) || hasNumber(value.outputTokens)) fields.output = normalized.output;
+  if (hasNumber(value.reasoning) || hasNumber(value.reasoningTokens) || hasNumber(outputDetails?.reasoningTokens) || hasNumber(outputDetails?.reasoning)) {
+    fields.reasoning = normalized.reasoning;
+  }
+  if (hasNumber(value.cacheRead) || hasNumber(value.cache_read) || isRecord(value.cache) && hasNumber(value.cache.read) || hasNumber(value.cachedInputTokens) || hasNumber(value.cacheReadTokens) || hasNumber(inputDetails?.cacheReadTokens) || hasNumber(inputDetails?.cacheRead)) {
     fields.cacheRead = normalized.cacheRead;
   }
-  if (hasNumber(value.cacheWrite) || isRecord(value.cache) && hasNumber(value.cache.write)) {
+  if (hasNumber(value.cacheWrite) || hasNumber(value.cache_write) || isRecord(value.cache) && hasNumber(value.cache.write) || hasNumber(value.cacheWriteTokens) || hasNumber(inputDetails?.cacheWriteTokens) || hasNumber(inputDetails?.cacheWrite)) {
     fields.cacheWrite = normalized.cacheWrite;
   }
   return fields;
 }
+function mergeFallbackTokens(previous, incoming) {
+  const result = {
+    ...previous,
+    ...incoming
+  };
+  if (previous.cacheRead !== undefined && incoming.cacheRead !== undefined) {
+    result.cacheRead = Math.max(previous.cacheRead, incoming.cacheRead);
+  }
+  if (previous.cacheWrite !== undefined && incoming.cacheWrite !== undefined) {
+    result.cacheWrite = Math.max(previous.cacheWrite, incoming.cacheWrite);
+  }
+  return result;
+}
 function exactOrFallback(exact, fallback, estimate) {
   return exact ?? fallback ?? Math.max(0, Math.round(estimate));
+}
+function cacheOrFallback(exact, fallback) {
+  if (exact === undefined) return fallback ?? 0;
+  if (exact === 0 && fallback !== undefined && fallback > 0) return fallback;
+  return exact;
 }
 function isCompleted(info, properties, event) {
   const values = [info.completed, properties.completed, event.completed];

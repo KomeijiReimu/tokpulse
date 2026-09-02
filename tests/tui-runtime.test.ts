@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
+import { aggregateSession } from "../src/core.js";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import {
   aggregateSpeed,
   applyRecordToSessionRuntime,
   cacheHitRate,
+  classifyTokenFields,
   cacheSessionParentFromEvent,
   createActiveState,
   createRuntimeStore,
@@ -23,8 +25,10 @@ import {
   handleSessionLifecycle,
   historyRecordsEquivalent,
   lockStreamSource,
+  makeTokens,
   makeLastCompletedSnapshot,
   mergeHistoryLayers,
+  noteTaskRunRecord,
   noteTaskRecord,
   recordSpeedSummary,
   selectedSamples,
@@ -143,6 +147,188 @@ test("history reload keeps a newer overlay over an in-flight disk snapshot", () 
   assert.equal(historyRecordsEquivalent(disk, disk), true);
 });
 
+test("a late exact completion replaces an idle provisional record without double counting", () => {
+  const runtime = createSessionRuntime();
+  transitionSessionRuntime(runtime, "busy", 0);
+  const provisional = record("same", "s", 4, 1, {
+    time: { start: 0, completed: 2_000, duration: 2_000 },
+  });
+  const exact = record("same", "s", 40, 5, {
+    time: { start: 0, firstToken: 100, completed: 2_100, ttft: 100, duration: 2_100 },
+  });
+  applyRecordToSessionRuntime(runtime, provisional, "provisional");
+  assert.deepEqual(runtime.runTotals, provisional.tokens);
+  applyRecordToSessionRuntime(runtime, exact, "exact");
+  assert.deepEqual(runtime.runTotals, exact.tokens);
+  assert.equal(runtime.runResponseCount, 1);
+  assert.equal(applyRecordToSessionRuntime(runtime, exact, "exact"), false);
+});
+
+test("late exact completion repairs the completed epoch instead of the next epoch", () => {
+  const runtime = createSessionRuntime();
+  transitionSessionRuntime(runtime, "busy", 0);
+  const provisional = record("old", "s", 4, 0, {
+    time: { start: 0, completed: 1_000, duration: 1_000 },
+  });
+  applyRecordToSessionRuntime(runtime, provisional, "provisional");
+  freezeSessionRun(runtime, 1_000);
+  transitionSessionRuntime(runtime, "busy", 5_000);
+  const exact = record("old", "s", 40, 0, {
+    time: { start: 0, firstToken: 100, completed: 1_100, ttft: 100, duration: 1_100 },
+  });
+  applyRecordToSessionRuntime(runtime, exact, "exact");
+  assert.equal(runtime.runEpoch, 2);
+  assert.equal(runtime.runTotals.output, 0);
+  assert.equal(runtime.runSummaries.get(1)?.tokens.output, 40);
+  assert.equal(runtime.lastRunSummary?.runEpoch, 1);
+  assert.equal(runtime.lastRunSummary?.tokens.output, 40);
+});
+
+test("exact completion after idle corrects the stored run summary", () => {
+  const runtime = createSessionRuntime();
+  transitionSessionRuntime(runtime, "busy", 0);
+  const provisional = record("idle-late", "s", 4, 0, {
+    time: { start: 0, completed: 1_000, duration: 1_000 },
+  });
+  applyRecordToSessionRuntime(runtime, provisional, "provisional");
+  freezeSessionRun(runtime, 1_000);
+  const exact = record("idle-late", "s", 40, 0, {
+    time: { start: 0, firstToken: 100, completed: 1_100, ttft: 100, duration: 1_100 },
+  });
+  applyRecordToSessionRuntime(runtime, exact, "exact");
+  assert.equal(runtime.runSummaries.get(1)?.tokens.output, 40);
+  assert.equal(runtime.lastRunSummary?.tokens.output, 40);
+});
+
+test("cache field parsing preserves explicit cache counts and raw SDK shapes", () => {
+  assert.deepEqual(classifyTokenFields({
+    inputTokens: 100,
+    cachedInputTokens: 20,
+    outputTokens: 30,
+    inputTokenDetails: { cacheWrite: 6 },
+    outputTokenDetails: { reasoningTokens: 5, textTokens: 25 },
+  }), {
+    input: 74,
+    output: 25,
+    reasoning: 5,
+    cacheRead: 20,
+    cacheWrite: 6,
+  });
+  assert.deepEqual(classifyTokenFields({
+    input: 80,
+    cacheRead: 0,
+    cacheWrite: 0,
+    output: 25,
+    reasoning: 5,
+  }), {
+    input: 80,
+    output: 25,
+    reasoning: 5,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
+});
+
+test("fallback cache counts survive a later explicit zero", () => {
+  const state = createActiveState("m", "s", 0);
+  state.fallbackTokens = { cacheRead: 12, cacheWrite: 4 };
+  assert.deepEqual(makeTokens({ cacheRead: 0, cacheWrite: 0 }, state, 4), {
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cacheRead: 12,
+    cacheWrite: 4,
+  });
+});
+
+test("a complete disk record wins over an incomplete optimistic overlay", () => {
+  const disk = record("same", "s", 30, 4, { model: "model", samples: [{ timestamp: 1, tokens: 3 }] });
+  const optimistic = record("same", "s", 3, 0, {
+    model: undefined,
+    time: { start: 0, completed: 1_100, duration: 1_100 },
+  });
+  const merged = mergeHistoryLayers([disk], new Map([[optimistic.messageID, optimistic]]), 10);
+  assert.equal(merged[0].tokens.output, 30);
+  assert.equal(merged[0].samples.length, 1);
+});
+
+test("an exact optimistic update is not replaced by a stale disk snapshot", () => {
+  const disk = record("same", "s", 10, 1, { cost: 0.5 });
+  const optimistic = record("same", "s", 20, 2, { cost: 0.8 });
+  const store = createRuntimeStore(10);
+  store.diskRecords = [disk];
+  store.records = [disk];
+  store.optimistic.set("same", optimistic);
+  store.optimisticQuality.set("same", "exact");
+  store.optimisticOrder.set("same", 1);
+  store.nextOptimisticOrder = 2;
+  const merged = mergeHistoryLayers(store.diskRecords, store.optimistic, 10, store.optimisticQuality, store.optimisticOrder);
+  assert.equal(merged[0].tokens.output, 20);
+  assert.equal(merged[0].cost, 0.8);
+  store.disposeSignals();
+});
+
+test("a late disk snapshot with a newer provisional completion cannot replace exact memory", () => {
+  const disk = record("same", "s", 3, 0, {
+    model: undefined,
+    samples: [],
+    time: { start: 0, completed: 9_000, duration: 9_000 },
+  });
+  const exact = record("same", "s", 40, 0, {
+    model: "model",
+    samples: [{ timestamp: 100, tokens: 40, estimatedTokens: 40, kind: "output" }],
+    time: { start: 0, firstToken: 100, completed: 1_100, ttft: 100, duration: 1_100 },
+  });
+  const merged = mergeHistoryLayers(
+    [disk],
+    new Map([[exact.messageID, exact]]),
+    10,
+    new Map([[exact.messageID, "exact"]]),
+    new Map([[exact.messageID, 1]]),
+  );
+  assert.equal(merged[0].tokens.output, 40);
+  assert.equal(merged[0].time.completed, 1_100);
+});
+
+test("an old disk snapshot cannot replace exact memory even when its timestamp is later", () => {
+  const disk = record("same", "s", 200, 0, {
+    model: undefined,
+    samples: [],
+    time: { start: 0, completed: 9_000, duration: 9_000 },
+  });
+  const exact = record("same", "s", 40, 0, {
+    model: undefined,
+    samples: [],
+    time: { start: 0, completed: 1_100, duration: 1_100 },
+  });
+  const merged = mergeHistoryLayers(
+    [disk],
+    new Map([[exact.messageID, exact]]),
+    10,
+    new Map([[exact.messageID, "exact"]]),
+    new Map([[exact.messageID, 4]]),
+  );
+  assert.equal(merged[0].tokens.output, 40);
+  assert.equal(merged[0].time.completed, 1_100);
+});
+
+test("late child parent mapping repairs existing records and folds the child into the root", () => {
+  const store = createRuntimeStore(10);
+  const root = record("root-message", "root", 10, 1);
+  const child = record("child-message", "child", 20, 2);
+  store.diskRecords = [root, child];
+  store.records = [root, child];
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "session.updated",
+    properties: { session: { id: "child", parentID: "root" } },
+  }), true);
+  assert.equal(store.records.find((entry) => entry.messageID === child.messageID)?.parentSessionID, "root");
+  const aggregate = aggregateSession(store.records, "root");
+  assert.equal(aggregate?.responseCount, 2);
+  assert.equal(aggregate?.tokens.output, 30);
+  store.disposeSignals();
+});
+
 test("stream source locks once and never double-counts legacy with v2", () => {
   const state = createActiveState("message", "s", 0);
   state.selectedSource = lockStreamSource(state.selectedSource, "legacy");
@@ -167,7 +353,7 @@ test("compact formatter keeps small values readable and large values short", () 
   assert.equal(formatCompactRate(57_500), "57.5k tok/s");
 });
 
-test("total token count excludes cache writes and collapsed pulse shows speed", () => {
+test("total token count includes cache writes and collapsed pulse shows speed", () => {
   const counts: TokenCounts = {
     input: 10,
     output: 20,
@@ -175,21 +361,21 @@ test("total token count excludes cache writes and collapsed pulse shows speed", 
     cacheRead: 2,
     cacheWrite: 900,
   };
-  assert.equal(totalTokens(counts), 37);
-  assert.equal(cacheHitRate({ ...counts, input: 0, cacheRead: 0 }), undefined);
+  assert.equal(totalTokens(counts), 937);
+  assert.equal(cacheHitRate({ ...counts, input: 0, cacheRead: 0 }), 0);
   assert.equal(formatCacheHitRate(undefined), "--");
   assert.equal(cacheHitRate({ ...counts, input: 10, cacheRead: 0 }), 0);
   assert.equal(formatCacheHitRate(cacheHitRate({ ...counts, input: 10, cacheRead: 0 })), "0%");
-  assert.equal(cacheHitRate({ ...counts, input: 0, cacheRead: 10 }), 1);
-  assert.equal(formatCacheHitRate(cacheHitRate({ ...counts, input: 0, cacheRead: 10 })), "100%");
+  assert.equal(cacheHitRate({ ...counts, input: 0, cacheRead: 10 }), 10 / 910);
+  assert.equal(formatCacheHitRate(cacheHitRate({ ...counts, input: 0, cacheRead: 10 })), "1%");
   const mixed = { ...counts, input: 10, cacheRead: 2, cacheWrite: 0 };
   assert.equal(cacheHitRate(mixed), 2 / 12);
-  assert.equal(cacheHitRate({ ...mixed, cacheWrite: 900 }), 2 / 12);
+  assert.equal(cacheHitRate({ ...mixed, cacheWrite: 900 }), 2 / 912);
   assert.equal(formatCacheHitRate(cacheHitRate(mixed)), "17%");
-  assert.equal(formatPulseMetrics(counts, 293), "37 total · 293 tok/s · cache 17%");
-  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "0 total · cache --");
-  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  37 total · 293 tok/s · cache 17%");
-  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  0 total · cache --");
+  assert.equal(formatPulseMetrics(counts, 293), "937 total · 293 tok/s · cache 0%");
+  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "900 total · cache 0%");
+  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  937 total · 293 tok/s · cache 0%");
+  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  900 total · cache 0%");
 });
 
 test("aggregate speed is generated-weighted instead of response-average", () => {
@@ -243,7 +429,7 @@ test("slot registration appends sidebar content without taking the footer or app
   assert.match(source, /formatCacheHitRate\(cacheHitRate\(tokens\)\)/);
   assert.match(source, /backgroundColor=\{props\.api\.theme\.current\.backgroundElement\}/);
   assert.match(source, /CHILD AGENTS/);
-  assert.match(source, /Total tokens \(input \+ generated\)/);
+  assert.match(source, /Total tokens \(input \+ generated \+ cache\)/);
   assert.match(source, /Cache read \(reused\)/);
   assert.match(source, /Cache write/);
   store.disposeSignals();
@@ -286,6 +472,208 @@ test("task wall time starts a new epoch after a long idle gap", () => {
   store.taskRuns.set("root", run);
   assert.equal(taskWallTimeForSession(store, "root"), 6_000);
   store.disposeSignals();
+});
+
+test("task wall time sums active intervals and excludes all-idle gaps", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  const first = transitionTaskWallRun(run, "root", "idle", 1_000);
+  transitionTaskWallRun(run, "root", "busy", 5_000);
+  const second = transitionTaskWallRun(run, "root", "idle", 7_000);
+  assert.equal(first?.wallTime, 1_000);
+  assert.equal(second?.wallTime, 2_000);
+  assert.equal((first?.wallTime ?? 0) + (second?.wallTime ?? 0), 3_000);
+});
+
+test("parallel root and child activity contributes one interval union", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "child", "busy", 500);
+  transitionTaskWallRun(run, "root", "idle", 1_000);
+  const summary = transitionTaskWallRun(run, "child", "idle", 2_000);
+  assert.equal(summary?.wallTime, 2_000);
+});
+
+test("duplicate lifecycle events do not extend active intervals", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "root", "idle", 1_000);
+  transitionTaskWallRun(run, "root", "idle", 1_000);
+  assert.equal(run.lastRunWallTime?.wallTime, 1_000);
+});
+
+test("out-of-order child idle then busy lifecycle keeps the valid interval", () => {
+  const run = createTaskWallRun("root");
+  assert.equal(transitionTaskWallRun(run, "child", "idle", 100), undefined);
+  transitionTaskWallRun(run, "child", "busy", 200);
+  const summary = transitionTaskWallRun(run, "child", "idle", 500);
+  assert.equal(summary?.startedAt, 200);
+  assert.equal(summary?.wallTime, 300);
+  assert.equal(run.activeSessions.size, 0);
+});
+
+test("child-only and child-first activity starts the task run at the earliest child", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "child", "busy", 2_000);
+  transitionTaskWallRun(run, "root", "busy", 3_000);
+  transitionTaskWallRun(run, "root", "idle", 4_000);
+  const summary = transitionTaskWallRun(run, "child", "idle", 7_000);
+  assert.equal(summary?.startedAt, 2_000);
+  assert.equal(summary?.wallTime, 5_000);
+});
+
+test("out-of-order lifecycle events do not lose the participant state", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "child", "busy", 2_000);
+  transitionTaskWallRun(run, "child", "idle", 1_000);
+  assert.equal(run.activeSessions.has("child"), true);
+  const summary = transitionTaskWallRun(run, "child", "idle", 3_000);
+  assert.equal(summary?.wallTime, 1_000);
+});
+
+test("late busy lifecycle patches a completed run without reopening it", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "root", "idle", 1_000);
+  transitionTaskWallRun(run, "root", "idle", 500);
+  transitionTaskWallRun(run, "root", "busy", 200);
+  assert.equal(run.phase, "idle");
+  assert.equal(run.lastRunWallTime?.wallTime, 500);
+});
+
+test("out-of-order idle before a child run is retained until its later busy event", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "child", "idle", 100);
+  transitionTaskWallRun(run, "child", "busy", 200);
+  transitionTaskWallRun(run, "child", "idle", 500);
+  assert.equal(run.lastRunWallTime?.wallTime, 300);
+  assert.equal(run.activeSessions.has("child"), false);
+});
+
+test("session lifecycle keeps an unknown child's idle event before busy", () => {
+  const store = createRuntimeStore(10);
+  const api = {} as TuiPluginApi;
+  handleSessionLifecycle(store, api, "session.idle", { sessionID: "child" }, {
+    type: "session.idle",
+    timestamp: 100,
+    properties: { sessionID: "child" },
+  }, 4);
+  handleSessionLifecycle(store, api, "session.status", { sessionID: "child", status: "busy" }, {
+    type: "session.status",
+    timestamp: 200,
+    properties: { sessionID: "child", status: "busy" },
+  }, 4);
+  handleSessionLifecycle(store, api, "session.idle", { sessionID: "child" }, {
+    type: "session.idle",
+    timestamp: 500,
+    properties: { sessionID: "child" },
+  }, 4);
+  assert.equal(store.taskRuns.get("child")?.lastRunWallTime?.wallTime, 300);
+  store.disposeSignals();
+});
+
+test("child-first run can migrate while still active without losing its start", () => {
+  const store = createRuntimeStore(10);
+  const childRun = createTaskWallRun("child");
+  store.taskRuns.set("child", childRun);
+  transitionTaskWallRun(childRun, "child", "busy", 2_000);
+  transitionTaskWallRun(childRun, "helper", "busy", 2_500);
+  transitionTaskWallRun(childRun, "child", "idle", 3_000);
+  assert.equal(childRun.activeElapsed, 1_000);
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "session.created",
+    properties: { session: { id: "child", parentID: "root" } },
+  }), true);
+  const rootRun = store.taskRuns.get("root");
+  assert.equal(rootRun?.phase, "active");
+  assert.equal(rootRun?.runStartedAt, 2_000);
+  assert.equal(rootRun?.activeElapsed, 1_000);
+  assert.equal(rootRun?.activeSessions.has("helper"), true);
+  const summary = transitionTaskWallRun(rootRun!, "helper", "idle", 6_000);
+  assert.equal(summary?.wallTime, 4_000);
+  store.disposeSignals();
+});
+
+test("completed child run migrates its historical interval into an active root run", () => {
+  const store = createRuntimeStore(10);
+  const childRun = createTaskWallRun("child");
+  const rootRun = createTaskWallRun("root");
+  store.taskRuns.set("child", childRun);
+  store.taskRuns.set("root", rootRun);
+  transitionTaskWallRun(childRun, "child", "busy", 0);
+  transitionTaskWallRun(childRun, "child", "idle", 1_000);
+  transitionTaskWallRun(rootRun, "root", "busy", 500);
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "session.updated",
+    properties: { sessionID: "child", parentID: "root" },
+  }), true);
+  const merged = store.taskRuns.get("root");
+  assert.equal(merged?.phase, "active");
+  transitionTaskWallRun(merged!, "root", "idle", 2_000);
+  assert.equal(merged?.lastRunWallTime?.wallTime, 2_000);
+  store.disposeSignals();
+});
+
+test("completed child history and a later root interval remain a disjoint union", () => {
+  const store = createRuntimeStore(10);
+  const childRun = createTaskWallRun("child");
+  const rootRun = createTaskWallRun("root");
+  store.taskRuns.set("child", childRun);
+  store.taskRuns.set("root", rootRun);
+  transitionTaskWallRun(childRun, "child", "busy", 0);
+  transitionTaskWallRun(childRun, "child", "idle", 1_000);
+  transitionTaskWallRun(rootRun, "root", "busy", 1_500);
+  cacheSessionParentFromEvent(store, {
+    type: "session.updated",
+    properties: { sessionID: "child", parentID: "root" },
+  });
+  const merged = store.taskRuns.get("root")!;
+  const summary = transitionTaskWallRun(merged, "root", "idle", 2_000);
+  assert.equal(summary?.wallTime, 1_500);
+  store.disposeSignals();
+});
+
+test("mapping merges child and root runs without losing active union state", () => {
+  const store = createRuntimeStore(10);
+  const childRun = createTaskWallRun("child");
+  const rootRun = createTaskWallRun("root");
+  store.taskRuns.set("child", childRun);
+  store.taskRuns.set("root", rootRun);
+  transitionTaskWallRun(childRun, "child", "busy", 1_000);
+  transitionTaskWallRun(rootRun, "root", "busy", 1_500);
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "session.updated",
+    properties: { sessionID: "child", parentID: "root" },
+  }), true);
+  const merged = store.taskRuns.get("root");
+  assert.equal(merged?.runStartedAt, 1_000);
+  assert.equal(merged?.activeSessions.has("root"), true);
+  transitionTaskWallRun(merged!, "root", "idle", 5_000);
+  const summary = transitionTaskWallRun(merged!, "child", "idle", 5_000);
+  assert.equal(summary?.wallTime, 4_000);
+  store.disposeSignals();
+});
+
+test("message completion does not end a busy task participant", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 1_000);
+  assert.equal(noteTaskRunRecord(run, "root", 1_000, 2_000), undefined);
+  assert.equal(run.phase, "active");
+  const summary = transitionTaskWallRun(run, "root", "idle", 4_000);
+  assert.equal(summary?.wallTime, 3_000);
+});
+
+test("root idle waits for child, and parallel participants are counted once", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "child-a", "busy", 1_000);
+  transitionTaskWallRun(run, "child-b", "busy", 1_000);
+  transitionTaskWallRun(run, "root", "idle", 2_000);
+  assert.equal(run.phase, "active");
+  transitionTaskWallRun(run, "child-a", "idle", 3_000);
+  const summary = transitionTaskWallRun(run, "child-b", "idle", 4_000);
+  assert.equal(summary?.wallTime, 4_000);
 });
 
 test("a completed record does not invent a task wall run without lifecycle start", () => {

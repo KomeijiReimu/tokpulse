@@ -1,6 +1,7 @@
 export const DEFAULT_BYTES_PER_TOKEN = 5.5;
 export const DEFAULT_ROLLING_WINDOW_MS = 10_000;
 export const HISTORY_VERSION = 1;
+export type HistoryRecordQuality = "provisional" | "exact";
 
 export type SampleKind = "output" | "reasoning";
 
@@ -38,6 +39,7 @@ export interface HistoryRecord {
   cost: number;
   time: ResponseTiming;
   samples: SpeedSample[];
+  quality?: HistoryRecordQuality;
 }
 
 export interface RateStats {
@@ -102,12 +104,60 @@ export function emptyTokenCounts(): TokenCounts {
 export function normalizeTokenCounts(value: unknown): TokenCounts {
   const source = isRecord(value) ? value : {};
   const cache = isRecord(source.cache) ? source.cache : {};
+  const inputDetails = isRecord(source.inputTokenDetails) ? source.inputTokenDetails : {};
+  const outputDetails = isRecord(source.outputTokenDetails) ? source.outputTokenDetails : {};
+  const rawCacheRead = firstNonNegativeNumber(
+    source.cachedInputTokens,
+    source.cacheReadTokens,
+    inputDetails.cacheReadTokens,
+    inputDetails.cacheRead,
+  );
+  const rawCacheWrite = firstNonNegativeNumber(
+    source.cacheWriteTokens,
+    inputDetails.cacheWriteTokens,
+    inputDetails.cacheWrite,
+  );
+  const cacheRead = firstNonNegativeNumber(
+    source.cacheRead,
+    source.cache_read,
+    cache.read,
+    rawCacheRead,
+  );
+  const cacheWrite = firstNonNegativeNumber(
+    source.cacheWrite,
+    source.cache_write,
+    cache.write,
+    rawCacheWrite,
+  );
+  const rawInputTokens = nonNegativeNumberOrUndefined(source.inputTokens);
+  const rawOutputTokens = nonNegativeNumberOrUndefined(source.outputTokens);
+  const reasoning = firstNonNegativeNumber(
+    source.reasoning,
+    source.reasoningTokens,
+    outputDetails.reasoningTokens,
+    outputDetails.reasoning,
+  );
+  const hasRawInputDetails = rawInputTokens !== undefined
+    || rawCacheRead !== undefined
+    || rawCacheWrite !== undefined;
+  const hasRawOutputDetails = rawOutputTokens !== undefined
+    || reasoning !== undefined;
   return {
-    input: nonNegativeNumber(source.input),
-    output: nonNegativeNumber(source.output),
-    reasoning: nonNegativeNumber(source.reasoning),
-    cacheRead: nonNegativeNumber(source.cacheRead ?? cache.read),
-    cacheWrite: nonNegativeNumber(source.cacheWrite ?? cache.write),
+    input: firstNonNegativeNumber(
+      source.input,
+      !hasRawInputDetails || rawInputTokens === undefined
+        ? undefined
+        : rawInputTokens - (cacheRead ?? 0) - (cacheWrite ?? 0),
+    ) ?? 0,
+    output: firstNonNegativeNumber(
+      source.output,
+      !hasRawOutputDetails || rawOutputTokens === undefined
+        ? undefined
+        : rawOutputTokens - (reasoning ?? 0),
+    ) ?? 0,
+    reasoning: reasoning ?? 0,
+    cacheRead: cacheRead ?? 0,
+    cacheWrite: cacheWrite ?? 0,
   };
 }
 
@@ -301,9 +351,22 @@ export function dedupeHistoryRecords(records: readonly HistoryRecord[]): History
   const byMessage = new Map<string, HistoryRecord>();
   for (const record of records) {
     if (!record || typeof record.messageID !== "string" || record.messageID.length === 0) continue;
-    byMessage.set(record.messageID, record);
+    const existing = byMessage.get(record.messageID);
+    if (!existing || preferredHistoryRecord(record, existing)) {
+      byMessage.set(record.messageID, record);
+    }
   }
   return [...byMessage.values()];
+}
+
+function preferredHistoryRecord(candidate: HistoryRecord, existing: HistoryRecord): boolean {
+  const candidateQuality = candidate.quality ?? "exact";
+  const existingQuality = existing.quality ?? "exact";
+  if (candidateQuality !== existingQuality) return candidateQuality === "exact";
+  const candidateCompleted = candidate.time.completed ?? candidate.time.start;
+  const existingCompleted = existing.time.completed ?? existing.time.start;
+  if (candidateCompleted !== existingCompleted) return candidateCompleted > existingCompleted;
+  return true;
 }
 
 export function aggregateSessionTree(
@@ -502,6 +565,23 @@ function finiteNumber(value: unknown, fallback: number): number {
 
 function nonNegativeNumber(value: unknown): number {
   return Math.max(0, finiteNumber(value, 0));
+}
+
+function nonNegativeNumberOrUndefined(value: unknown): number | undefined {
+  const number = finiteNumberOrUndefined(value);
+  return number === undefined ? undefined : Math.max(0, number);
+}
+
+function firstNonNegativeNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const number = nonNegativeNumberOrUndefined(value);
+    if (number !== undefined) return number;
+  }
+  return undefined;
+}
+
+function finiteNumberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function trimDecimal(value: number): string {

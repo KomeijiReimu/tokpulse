@@ -14,6 +14,7 @@ import {
   formatDuration,
   formatNumber,
   formatTokens,
+  normalizeTokenCounts,
   rollingTokenRate,
   utf8ByteLength,
 } from "../src/core.js";
@@ -54,6 +55,69 @@ test("bytes-to-token estimation handles defaults and invalid input", () => {
   assert.equal(bytesToTokens(22, 11), 2);
   assert.equal(bytesToTokens(10, 0), 0);
   assert.equal(utf8ByteLength("hello"), 5);
+});
+
+test("normalizes OpenCode and raw AI SDK token shapes into canonical counts", () => {
+  assert.deepEqual(normalizeTokenCounts({
+    input: 10,
+    output: 20,
+    reasoning: 3,
+    cache: { read: 4, write: 5 },
+  }), {
+    input: 10,
+    output: 20,
+    reasoning: 3,
+    cacheRead: 4,
+    cacheWrite: 5,
+  });
+  assert.deepEqual(normalizeTokenCounts({
+    input: 1,
+    output: 2,
+    reasoning: 3,
+    cacheRead: 4,
+    cacheWrite: 5,
+  }), {
+    input: 1,
+    output: 2,
+    reasoning: 3,
+    cacheRead: 4,
+    cacheWrite: 5,
+  });
+
+  assert.deepEqual(normalizeTokenCounts({
+    inputTokens: 100,
+    cachedInputTokens: 20,
+    outputTokens: 40,
+    inputTokenDetails: { cacheWriteTokens: 10 },
+    outputTokenDetails: { reasoningTokens: 15 },
+  }), {
+    input: 70,
+    output: 25,
+    reasoning: 15,
+    cacheRead: 20,
+    cacheWrite: 10,
+  });
+
+  assert.deepEqual(normalizeTokenCounts({
+    inputTokens: 100,
+    cachedInputTokens: 20,
+    outputTokens: 40,
+    reasoningTokens: 15,
+  }), {
+    input: 80,
+    output: 25,
+    reasoning: 15,
+    cacheRead: 20,
+    cacheWrite: 0,
+  });
+
+  assert.deepEqual(normalizeTokenCounts({ inputTokens: 12, outputTokens: 8 }), {
+    input: 12,
+    output: 8,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
 });
 
 test("rolling samples and rate stats respect the time window", () => {
