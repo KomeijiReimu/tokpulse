@@ -4,6 +4,9 @@ import test from "node:test";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { aggregateSession } from "../src/core.js";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
+import { replayActivity } from "../src/activity.js";
+import type { ActivityEventInput } from "../src/activity.js";
+import { resolveRunsPath } from "../src/runs-storage.js";
 import {
   aggregateSpeed,
   applyRecordToSessionRuntime,
@@ -23,6 +26,7 @@ import {
   formatPulseSummary,
   freezeSessionRun,
   handleSessionLifecycle,
+  hasLiveTaskWallActivity,
   historyRecordsEquivalent,
   lockStreamSource,
   makeTokens,
@@ -48,6 +52,24 @@ function tokens(output: number, reasoning = 0): TokenCounts {
     cacheRead: 2,
     cacheWrite: 1,
   };
+}
+
+function intervalElapsedForTest(intervals: readonly { start: number; end: number }[]): number {
+  return intervals.reduce((total, interval) => total + interval.end - interval.start, 0);
+}
+
+function activityLifecycle(
+  sessionID: string,
+  state: "busy" | "retry" | "idle" | "completed" | "failed",
+  timestamp: number,
+  instanceID = "instance",
+): ActivityEventInput {
+  return { kind: "lifecycle", sessionID, state, timestamp, instanceID };
+}
+
+function hydrateActivity(store: ReturnType<typeof createRuntimeStore>, events: readonly ActivityEventInput[]): void {
+  store.activityReplay = replayActivity(events);
+  store.activityEvents = store.activityReplay.events;
 }
 
 function record(
@@ -458,7 +480,7 @@ test("task wall time spans root and children without summing parallel work", () 
   assert.equal(transitionTaskWallRun(run, "child-b", "idle", 12_000), undefined);
 });
 
-test("task wall time starts a new epoch after a long idle gap", () => {
+test("task wall time accumulates epochs while excluding a long idle gap", () => {
   const run = createTaskWallRun("root");
   transitionTaskWallRun(run, "root", "busy", 1_000);
   const first = transitionTaskWallRun(run, "root", "idle", 3_000);
@@ -466,11 +488,11 @@ test("task wall time starts a new epoch after a long idle gap", () => {
   transitionTaskWallRun(run, "root", "busy", 10_000_000);
   const second = transitionTaskWallRun(run, "root", "idle", 10_006_000);
   assert.equal(second?.runEpoch, 2);
-  assert.equal(second?.wallTime, 6_000);
+  assert.equal(second?.wallTime, 8_000);
 
   const store = createRuntimeStore(10);
   store.taskRuns.set("root", run);
-  assert.equal(taskWallTimeForSession(store, "root"), 6_000);
+  assert.equal(taskWallTimeForSession(store, "root"), 8_000);
   store.disposeSignals();
 });
 
@@ -481,8 +503,144 @@ test("task wall time sums active intervals and excludes all-idle gaps", () => {
   transitionTaskWallRun(run, "root", "busy", 5_000);
   const second = transitionTaskWallRun(run, "root", "idle", 7_000);
   assert.equal(first?.wallTime, 1_000);
-  assert.equal(second?.wallTime, 2_000);
-  assert.equal((first?.wallTime ?? 0) + (second?.wallTime ?? 0), 3_000);
+  assert.equal(second?.wallTime, 3_000);
+  assert.equal(run.carriedIntervals.length, 2);
+  assert.equal(intervalElapsedForTest(run.carriedIntervals), 3_000);
+});
+
+test("late lifecycle correction replaces the carried epoch before the next epoch", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "root", "idle", 1_000);
+  assert.deepEqual(run.carriedIntervals, [{ start: 0, end: 1_000 }]);
+
+  transitionTaskWallRun(run, "root", "idle", 500);
+  transitionTaskWallRun(run, "root", "busy", 200);
+  assert.deepEqual(run.carriedIntervals, [{ start: 0, end: 500 }]);
+
+  transitionTaskWallRun(run, "root", "busy", 2_000);
+  transitionTaskWallRun(run, "root", "idle", 2_100);
+  assert.equal(run.lastRunWallTime?.wallTime, 600);
+  assert.deepEqual(run.carriedIntervals, [
+    { start: 0, end: 500 },
+    { start: 2_000, end: 2_100 },
+  ]);
+});
+
+test("late correction of an earlier completed epoch rebuilds the full cumulative history", () => {
+  const run = createTaskWallRun("root");
+  const store = createRuntimeStore(10);
+  store.taskRuns.set("root", run);
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "root", "idle", 100);
+  transitionTaskWallRun(run, "root", "busy", 200);
+  transitionTaskWallRun(run, "root", "idle", 300);
+
+  transitionTaskWallRun(run, "root", "idle", 50);
+  assert.equal(taskWallTimeForSession(store, "root", 400), 150);
+  assert.deepEqual(run.carriedIntervals, [
+    { start: 0, end: 50 },
+    { start: 200, end: 300 },
+  ]);
+
+  transitionTaskWallRun(run, "root", "busy", 400);
+  transitionTaskWallRun(run, "root", "idle", 500);
+  assert.equal(taskWallTimeForSession(store, "root", 600), 250);
+  store.disposeSignals();
+});
+
+test("late historical child busy and retry do not reopen the current epoch", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 0);
+  transitionTaskWallRun(run, "child", "busy", 10);
+  transitionTaskWallRun(run, "root", "idle", 20);
+  transitionTaskWallRun(run, "child", "idle", 100);
+  assert.equal(run.phase, "idle");
+
+  transitionTaskWallRun(run, "root", "busy", 200);
+  transitionTaskWallRun(run, "child", "busy", 50);
+  transitionTaskWallRun(run, "child", "retry", 60);
+  assert.deepEqual([...run.activeSessions], ["root"]);
+  assert.equal(run.lifecycleEvents.has("child"), false);
+  assert.equal(run.pendingLifecycleEvents.has("child"), false);
+  assert.equal(run.sessionStates.has("child"), false);
+  assert.equal(run.lastActivityAt.has("child"), false);
+
+  const summary = transitionTaskWallRun(run, "root", "idle", 300);
+  assert.equal(summary?.wallTime, 200);
+  assert.equal(run.phase, "idle");
+  assert.equal(run.activeSessions.size, 0);
+});
+
+test("late parent migration uses corrected full history instead of stale carried intervals", () => {
+  const store = createRuntimeStore(10);
+  const childRun = createTaskWallRun("child");
+  const rootRun = createTaskWallRun("root");
+  store.taskRuns.set("child", childRun);
+  store.taskRuns.set("root", rootRun);
+
+  transitionTaskWallRun(childRun, "child", "busy", 0);
+  transitionTaskWallRun(childRun, "child", "idle", 100);
+  transitionTaskWallRun(childRun, "child", "busy", 200);
+  transitionTaskWallRun(childRun, "child", "idle", 300);
+  transitionTaskWallRun(childRun, "child", "idle", 50);
+
+  transitionTaskWallRun(rootRun, "root", "busy", 1_000);
+  transitionTaskWallRun(rootRun, "root", "idle", 1_100);
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "session.updated",
+    properties: { sessionID: "child", parentID: "root" },
+  }), true);
+
+  assert.equal(taskWallTimeForSession(store, "root", 2_000), 250);
+  assert.deepEqual(store.taskRuns.get("root")?.carriedIntervals, [
+    { start: 0, end: 50 },
+    { start: 200, end: 300 },
+    { start: 1_000, end: 1_100 },
+  ]);
+  store.disposeSignals();
+});
+
+test("completed source migration does not inject historical lifecycle state into an active root", () => {
+  const store = createRuntimeStore(10);
+  const childRun = createTaskWallRun("child");
+  const rootRun = createTaskWallRun("root");
+  store.taskRuns.set("child", childRun);
+  store.taskRuns.set("root", rootRun);
+
+  transitionTaskWallRun(childRun, "child", "busy", 0);
+  transitionTaskWallRun(childRun, "helper", "busy", 10);
+  transitionTaskWallRun(childRun, "child", "idle", 50);
+  transitionTaskWallRun(childRun, "helper", "idle", 100);
+  transitionTaskWallRun(childRun, "child", "busy", 75);
+  transitionTaskWallRun(childRun, "child", "retry", 80);
+
+  transitionTaskWallRun(rootRun, "root", "busy", 200);
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "session.updated",
+    properties: { sessionID: "child", parentID: "root" },
+  }), true);
+  const merged = store.taskRuns.get("root")!;
+  assert.equal(merged.lifecycleEvents.has("child"), false);
+  assert.equal(merged.lifecycleEvents.has("helper"), false);
+  assert.equal(merged.pendingLifecycleEvents.has("child"), false);
+  assert.equal(merged.activeSessions.has("child"), false);
+
+  const summary = transitionTaskWallRun(merged, "root", "idle", 300);
+  assert.equal(summary?.wallTime, 200);
+  assert.equal(merged.phase, "idle");
+  assert.equal(taskWallTimeForSession(store, "root", 500), 200);
+  store.disposeSignals();
+});
+
+test("lifecycle-only active task runs keep the wall-time ticker live", () => {
+  const store = createRuntimeStore(10);
+  assert.equal(hasLiveTaskWallActivity(store), false);
+  store.taskRuns.set("root", createTaskWallRun("root"));
+  assert.equal(hasLiveTaskWallActivity(store), false);
+  transitionTaskWallRun(store.taskRuns.get("root")!, "root", "retry", 1_000);
+  assert.equal(hasLiveTaskWallActivity(store), true);
+  store.disposeSignals();
 });
 
 test("parallel root and child activity contributes one interval union", () => {
@@ -748,4 +906,138 @@ test("v1.18.18 session.status payload drives retry and idle lifecycle", () => {
   assert.equal(handleSessionLifecycle(store, api, idle.type, idle.properties, idle, 5.5), true);
   assert.equal(taskWallTimeForSession(store, "root"), 2_500);
   store.disposeSignals();
+});
+
+test("persisted activity contributes across completed intervals without taskRuns", () => {
+  const store = createRuntimeStore(10);
+  hydrateActivity(store, [
+    activityLifecycle("root", "busy", 0),
+    activityLifecycle("root", "idle", 2_000),
+    activityLifecycle("root", "busy", 10_000),
+    activityLifecycle("root", "completed", 16_000),
+  ]);
+  assert.equal(taskWallTimeForSession(store, "root", 20_000), 8_000);
+  assert.equal(store.taskRuns.size, 0);
+  store.disposeSignals();
+});
+
+test("persisted root and child activity uses one interval union", () => {
+  const store = createRuntimeStore(10);
+  hydrateActivity(store, [
+    { kind: "parent", sessionID: "child", parentSessionID: "root", timestamp: 0 },
+    activityLifecycle("root", "busy", 0),
+    activityLifecycle("child", "busy", 500),
+    activityLifecycle("root", "idle", 1_000),
+    activityLifecycle("child", "idle", 2_000),
+  ]);
+  assert.equal(taskWallTimeForSession(store, "child", 3_000), 2_000);
+  store.disposeSignals();
+});
+
+test("persisted intervals and live task overlay are merged without double counting", () => {
+  const store = createRuntimeStore(10);
+  hydrateActivity(store, [
+    activityLifecycle("root", "busy", 0),
+    activityLifecycle("root", "idle", 1_000),
+  ]);
+  const run = createTaskWallRun("root");
+  store.taskRuns.set("root", run);
+  transitionTaskWallRun(run, "root", "busy", 500);
+  transitionTaskWallRun(run, "root", "idle", 1_500);
+  assert.equal(taskWallTimeForSession(store, "root", 2_000), 1_500);
+  store.disposeSignals();
+});
+
+test("canonical v2 retry and failed lifecycle transitions the live task run", () => {
+  const store = createRuntimeStore(10);
+  const api = {} as TuiPluginApi;
+  const retried = {
+    type: "session.next.retried",
+    timestamp: 1_000,
+    properties: { sessionID: "root" },
+  };
+  assert.equal(handleSessionLifecycle(store, api, retried.type, retried.properties, retried, 4), false);
+  assert.equal(store.taskRuns.get("root")?.phase, "active");
+  const failed = {
+    type: "session.next.step.failed",
+    timestamp: 2_000,
+    properties: { sessionID: "root" },
+  };
+  assert.equal(handleSessionLifecycle(store, api, failed.type, failed.properties, failed, 4), true);
+  assert.equal(store.taskRuns.get("root")?.lastRunWallTime?.wallTime, 1_000);
+  store.disposeSignals();
+});
+
+test("historical idle and failed events do not freeze the current session runtime", () => {
+  const store = createRuntimeStore(10);
+  const api = {} as TuiPluginApi;
+  const lifecycle = (type: string, timestamp: number) => ({
+    type,
+    timestamp,
+    properties: { sessionID: "root" },
+  });
+
+  handleSessionLifecycle(store, api, "session.status", { sessionID: "root", status: "busy" }, lifecycle("session.status", 0), 4);
+  handleSessionLifecycle(store, api, "session.idle", { sessionID: "root" }, lifecycle("session.idle", 100), 4);
+  handleSessionLifecycle(store, api, "session.status", { sessionID: "root", status: "busy" }, lifecycle("session.status", 200), 4);
+  const runtime = store.sessionRuntime.get("root")!;
+  const liveRecord = record("message", "root", 7, 1, {
+    time: { start: 200, firstToken: 220, completed: 250, ttft: 20, duration: 50 },
+  });
+  applyRecordToSessionRuntime(runtime, liveRecord);
+  runtime.activeMessageID = "message";
+  const runEpoch = runtime.runEpoch;
+  const runStartedAt = runtime.runStartedAt;
+  const runTotals = { ...runtime.runTotals };
+  const contributionCount = runtime.contributions.size;
+  store.active.set("message", createActiveState("message", "root", 210));
+
+  const revisionBeforeHistory = store.revision();
+  handleSessionLifecycle(store, api, "session.idle", { sessionID: "root" }, lifecycle("session.idle", 50), 4);
+  assert.equal(store.revision() > revisionBeforeHistory, true);
+  handleSessionLifecycle(
+    store,
+    api,
+    "session.next.step.failed",
+    { sessionID: "root" },
+    lifecycle("session.next.step.failed", 60),
+    4,
+  );
+  assert.equal(runtime.status, "busy");
+  assert.equal(runtime.runEpoch, runEpoch);
+  assert.equal(runtime.runStartedAt, runStartedAt);
+  assert.deepEqual(runtime.runTotals, runTotals);
+  assert.equal(runtime.activeMessageID, "message");
+  assert.equal(runtime.contributions.size, contributionCount);
+  assert.equal(runtime.lastRunSummary?.completedAt, 100);
+  assert.equal(store.active.has("message"), true);
+  assert.equal(store.taskRuns.get("root")?.phase, "active");
+
+  handleSessionLifecycle(store, api, "session.idle", { sessionID: "root" }, lifecycle("session.idle", 300), 4);
+  assert.equal(runtime.status, "idle");
+  assert.equal(runtime.lastRunSummary?.completedAt, 300);
+  assert.equal(store.taskRuns.get("root")?.phase, "idle");
+  store.disposeSignals();
+});
+
+test("message parentID is not treated as a session parent", () => {
+  const store = createRuntimeStore(10);
+  assert.equal(cacheSessionParentFromEvent(store, {
+    type: "message.updated",
+    properties: { info: { id: "message", sessionID: "child", parentID: "parent-message" } },
+  }), false);
+  assert.equal(store.sessionParents.has("child"), false);
+  store.disposeSignals();
+});
+
+test("activity reload uses the sidecar path and only reads it", async () => {
+  assert.equal(resolveRunsPath("/tmp/project/history.jsonl"), "/tmp/project/runs.jsonl");
+  assert.equal(
+    resolveRunsPath("/tmp/project/history.jsonl", "activity/runs.jsonl"),
+    "/tmp/project/activity/runs.jsonl",
+  );
+  const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8");
+  assert.match(source, /readActivityFile/);
+  assert.match(source, /resolveRunsPath\(historyPath, options\.runsPath\)/);
+  assert.doesNotMatch(source, /activity\.(append|rewrite|compact)\(/);
 });

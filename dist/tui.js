@@ -11,7 +11,9 @@ import { createElement as _$createElement } from "@opentui/solid";
 import { isAbsolute, join } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup } from "solid-js";
 import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calculateSpeedStats, calibrateResponseSamples, bytesToTokens, durationOf, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, rollingTokenRate, timeToFirstToken, utf8ByteLength } from "./core.js";
+import { replayActivity, resolveRootSessionID } from "./activity.js";
 import { DEFAULT_MAX_RECORDS, readHistoryFile } from "./storage.js";
+import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
@@ -32,6 +34,48 @@ function mergeLifecycleEvents(left, right) {
     }
   }
   return [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
+}
+function sameLifecycleEvents(left, right) {
+  return left.length === right.length && left.every((event, index) => event.timestamp === right[index]?.timestamp && event.state === right[index]?.state);
+}
+function recordLifecycleFact(eventsBySession, sessionID, state, timestamp) {
+  const previous = eventsBySession.get(sessionID) ?? [];
+  const next = mergeLifecycleEvents(previous, [{
+    state,
+    timestamp
+  }]);
+  if (sameLifecycleEvents(previous, next)) return false;
+  eventsBySession.set(sessionID, next);
+  return true;
+}
+function cloneLifecycleEventMap(eventsBySession) {
+  return new Map([...eventsBySession.entries()].map(([sessionID, events]) => [sessionID, events.map(event => ({
+    ...event
+  }))]));
+}
+function mergeLifecycleEventMaps(left, right) {
+  const merged = cloneLifecycleEventMap(left);
+  for (const [sessionID, events] of right) {
+    merged.set(sessionID, mergeLifecycleEvents(merged.get(sessionID) ?? [], events));
+  }
+  return merged;
+}
+function completeLifecycleHistoryForRun(run) {
+  return mergeLifecycleEventMaps(mergeLifecycleEventMaps(mergeLifecycleEventMaps(run.lifecycleHistory, run.lifecycleEvents), run.pendingLifecycleEvents), run.lastRunLifecycleEvents);
+}
+function lifecycleHistorySignature(run) {
+  return JSON.stringify([...completeLifecycleHistoryForRun(run).entries()].sort(([left], [right]) => left.localeCompare(right)).map(([sessionID, events]) => [sessionID, events.map(event => [event.timestamp, event.state])]));
+}
+function closeLifecycleHistoryAt(eventsBySession, completedAt) {
+  const closed = cloneLifecycleEventMap(eventsBySession);
+  if (completedAt === undefined || !Number.isFinite(completedAt)) return closed;
+  for (const [sessionID, events] of closed) {
+    const latest = events.filter(event => event.timestamp <= completedAt).at(-1);
+    if (latest && activeTaskSessionState(latest.state) && latest.timestamp < completedAt) {
+      recordLifecycleFact(closed, sessionID, "completed", completedAt);
+    }
+  }
+  return closed;
 }
 function cloneIntervals(intervals) {
   return intervals.map(interval => ({
@@ -193,6 +237,7 @@ export function createTaskWallRun(rootSessionID) {
     pendingSessions: new Map(),
     pendingLifecycleEvents: new Map(),
     lifecycleEvents: new Map(),
+    lifecycleHistory: new Map(),
     carriedIntervals: [],
     activeIntervals: [],
     activeElapsed: 0,
@@ -213,7 +258,7 @@ function clearTaskRunCycle(run) {
   run.activeIntervals = [];
   run.activeElapsed = 0;
 }
-function mergeIntervals(left, right) {
+function mergeIntervals(left, right = []) {
   return [...left, ...right].filter(interval => interval.end > interval.start).sort((a, b) => a.start - b.start || a.end - b.end).reduce((merged, interval) => {
     const previous = merged.at(-1);
     if (previous && interval.start <= previous.end) {
@@ -230,31 +275,43 @@ function intervalElapsed(intervals) {
   return intervals.reduce((total, interval) => total + interval.end - interval.start, 0);
 }
 function recordLifecycleEvent(run, sessionID, state, timestamp) {
-  const target = run.phase === "active" ? run.lifecycleEvents : run.pendingLifecycleEvents;
-  const events = target.get(sessionID) ?? [];
-  const existing = events.find(event => event.timestamp === timestamp);
-  if (existing) {
-    if (existing.state === state) return false;
-    if (activeTaskSessionState(existing.state) && !activeTaskSessionState(state)) return false;
-    existing.state = state;
-  } else {
-    events.push({
-      state,
-      timestamp
-    });
-    events.sort((left, right) => left.timestamp - right.timestamp);
-  }
-  target.set(sessionID, events);
-  return true;
+  const currentEpoch = run.phase === "active" && lifecycleFactBelongsToCurrentEpoch(run, timestamp);
+  const target = run.phase === "active" ? currentEpoch ? run.lifecycleEvents : undefined : run.pendingLifecycleEvents;
+  const historyChanged = recordLifecycleFact(run.lifecycleHistory, sessionID, state, timestamp);
+  const currentChanged = target !== undefined && currentEpoch ? recordLifecycleFact(target, sessionID, state, timestamp) : false;
+  return {
+    historyChanged,
+    currentEpoch,
+    currentChanged
+  };
+}
+function lifecycleFactBelongsToCurrentEpoch(run, timestamp) {
+  if (run.phase !== "active") return false;
+  // Once a task has completed, that completion timestamp is the exclusive
+  // lower boundary for the next active epoch. Facts before it are historical
+  // corrections and must not mutate current participant state.
+  const previousCompletion = run.lastRunWallTime?.completedAt;
+  return previousCompletion === undefined || timestamp >= previousCompletion;
 }
 function rebuildActiveIntervals(run, through) {
-  const computedIntervals = lifecycleIntervals(run.lifecycleEvents, through);
-  const intervals = mergeIntervals(run.carriedIntervals, computedIntervals);
+  const completeHistory = completeLifecycleHistoryForRun(run);
+  const hasLifecycleFacts = [...completeHistory.values()].some(events => events.length > 0);
+  if (!hasLifecycleFacts) {
+    run.activeIntervals = cloneIntervals(run.carriedIntervals);
+    run.activeElapsed = intervalElapsed(run.activeIntervals);
+    return;
+  }
+  run.lifecycleHistory = completeHistory;
+  // Lifecycle facts are authoritative. Carry is only a compatibility snapshot
+  // of closed history and must not be unioned with a corrected full replay.
+  run.carriedIntervals = cloneIntervals(lifecycleIntervals(completeHistory));
+  const intervals = lifecycleIntervals(completeHistory, through);
   run.activeIntervals = intervals;
   run.activeElapsed = intervalElapsed(intervals);
 }
 function lifecycleIntervals(lifecycleEvents, through) {
-  const points = [...lifecycleEvents.values()].flatMap(events => events.map(event => event.timestamp)).sort((left, right) => left - right);
+  const boundedLifecycleEvents = through === undefined || !Number.isFinite(through) ? lifecycleEvents : new Map([...lifecycleEvents.entries()].map(([sessionID, events]) => [sessionID, events.filter(event => event.timestamp <= through)]));
+  const points = [...boundedLifecycleEvents.values()].flatMap(events => events.map(event => event.timestamp)).sort((left, right) => left - right);
   if (through !== undefined && Number.isFinite(through)) points.push(through);
   points.sort((left, right) => left - right);
   const uniquePoints = [...new Set(points)];
@@ -263,7 +320,7 @@ function lifecycleIntervals(lifecycleEvents, through) {
     const start = uniquePoints[index];
     const end = uniquePoints[index + 1];
     if (end === undefined || end <= start) continue;
-    const active = [...lifecycleEvents.values()].some(events => activeTaskSessionState(lifecycleStateAt(events, start)));
+    const active = [...boundedLifecycleEvents.values()].some(events => activeTaskSessionState(lifecycleStateAt(events, start)));
     if (!active) continue;
     const previous = computedIntervals.at(-1);
     if (previous?.end === start) previous.end = end;else computedIntervals.push({
@@ -295,7 +352,6 @@ function startTaskWallRun(run, timestamp, explicitRootStart) {
   run.hasExplicitRootStart = explicitRootStart;
   clearTaskRunParticipants(run);
   clearTaskRunCycle(run);
-  run.carriedIntervals = [];
   run.runStartedAt = timestamp;
   run.activeIntervals = [];
   run.activeElapsed = 0;
@@ -324,12 +380,19 @@ function startTaskWallRun(run, timestamp, explicitRootStart) {
     run.lastActivityAt.set(run.rootSessionID, timestamp);
     recordLifecycleEvent(run, run.rootSessionID, "busy", timestamp);
   }
-  run.runStartedAt = earliestActiveTimestamp(run) ?? timestamp;
+  const carriedStart = run.carriedIntervals.length > 0 ? Math.min(...run.carriedIntervals.map(interval => interval.start)) : undefined;
+  const currentStart = earliestActiveTimestamp(run);
+  run.runStartedAt = Math.min(carriedStart ?? timestamp, currentStart ?? timestamp);
   rebuildActiveIntervals(run);
 }
 function recordTaskSessionActivity(run, sessionID, state, timestamp) {
+  const recorded = recordLifecycleEvent(run, sessionID, state, timestamp);
+  if (!recorded.currentEpoch) {
+    if (recorded.historyChanged) rebuildActiveIntervals(run);
+    return false;
+  }
   run.participantSessions.add(sessionID);
-  if (!recordLifecycleEvent(run, sessionID, state, timestamp)) return false;
+  if (!recorded.currentChanged) return recorded.historyChanged;
   const events = run.lifecycleEvents.get(sessionID) ?? [];
   const latest = events.at(-1);
   if (!latest) return false;
@@ -347,22 +410,21 @@ function recordTaskSessionActivity(run, sessionID, state, timestamp) {
 }
 function finishTaskWallRun(run, timestamp) {
   if (run.phase !== "active" || run.activeSessions.size > 0) return undefined;
-  const startedAt = run.runStartedAt ?? timestamp;
   const activityEnd = Math.max(timestamp, ...run.lastActivityAt.values());
-  rebuildActiveIntervals(run, activityEnd);
-  const completedIntervals = [...run.activeIntervals];
+  const completeHistory = completeLifecycleHistoryForRun(run);
+  run.lifecycleHistory = completeHistory;
+  const completedIntervals = lifecycleIntervals(completeHistory, activityEnd);
   const completedActiveElapsed = intervalElapsed(completedIntervals);
+  const cumulativeStart = completedIntervals.length > 0 ? Math.min(...completedIntervals.map(interval => interval.start)) : run.runStartedAt ?? timestamp;
   const summary = {
     runEpoch: run.runEpoch,
-    startedAt,
+    startedAt: cumulativeStart,
     completedAt: activityEnd,
     wallTime: Math.max(0, completedActiveElapsed)
   };
   run.lastRunIntervals = completedIntervals;
-  run.lastRunLifecycleEvents = new Map([...run.lifecycleEvents.entries()].map(([sessionID, events]) => [sessionID, events.map(event => ({
-    ...event
-  }))]));
-  run.lastRunCarriedIntervals = cloneIntervals(run.carriedIntervals);
+  run.lastRunLifecycleEvents = cloneLifecycleEventMap(completeHistory);
+  run.lastRunCarriedIntervals = cloneIntervals(completedIntervals);
   run.lastRunWallTime = summary;
   run.phase = "idle";
   run.rootBusy = false;
@@ -379,19 +441,22 @@ function finishTaskWallRun(run, timestamp) {
 }
 function patchCompletedTaskWallRun(run, sessionID, state, timestamp) {
   if (!run.lastRunWallTime || timestamp >= run.lastRunWallTime.completedAt) return false;
-  const previous = run.lastRunLifecycleEvents.get(sessionID) ?? [];
-  const next = mergeLifecycleEvents(previous, [{
-    state,
-    timestamp
-  }]);
-  run.lastRunLifecycleEvents.set(sessionID, next);
-  const computed = lifecycleIntervals(run.lastRunLifecycleEvents, run.lastRunWallTime.completedAt);
-  run.lastRunIntervals = mergeIntervals(run.lastRunCarriedIntervals, computed);
+  if (!recordLifecycleFact(run.lifecycleHistory, sessionID, state, timestamp)) return false;
+  const completeHistory = completeLifecycleHistoryForRun(run);
+  run.lifecycleHistory = completeHistory;
+  const correctedIntervals = lifecycleIntervals(completeHistory, run.lastRunWallTime.completedAt);
+  run.lastRunIntervals = mergeIntervals(correctedIntervals);
   run.lastRunWallTime = {
     ...run.lastRunWallTime,
     startedAt: Math.min(run.lastRunWallTime.startedAt, ...run.lastRunIntervals.map(interval => interval.start)),
     wallTime: intervalElapsed(run.lastRunIntervals)
   };
+  // A late event corrects the finished epoch. Keep the cumulative carry and
+  // all persisted-in-memory summaries on the same corrected interval union
+  // so a subsequent epoch cannot resurrect stale time.
+  run.carriedIntervals = cloneIntervals(run.lastRunIntervals);
+  run.lastRunCarriedIntervals = cloneIntervals(run.lastRunIntervals);
+  run.lastRunLifecycleEvents = cloneLifecycleEventMap(completeHistory);
   return true;
 }
 export function transitionTaskWallRun(run, sessionID, state, timestamp) {
@@ -814,6 +879,8 @@ function commitRecord(store, record, markCompleted) {
   }
 }
 function parentSessionID(api, sessionID, info, store) {
+  const explicit = readStringFrom([info], ["parentSessionID", "parentSessionId"]);
+  if (explicit) return explicit;
   let stateParent;
   try {
     const session = api.state.session.get(sessionID);
@@ -821,7 +888,7 @@ function parentSessionID(api, sessionID, info, store) {
   } catch {
     // State can still be syncing while a response completes.
   }
-  return stateParent ?? readStringFrom([info], ["parentSessionID", "parentSessionId", "parentID"]) ?? store?.sessionParents.get(sessionID);
+  return stateParent ?? store?.sessionParents.get(sessionID);
 }
 function knownRootSessionID(store, sessionID) {
   let root = sessionID;
@@ -886,24 +953,24 @@ function repairKnownParents(store) {
 function mergeTaskWallRun(target, source, rootSessionID) {
   const targetWasActive = target.phase === "active";
   const sourceWasActive = source.phase === "active";
+  const targetHistory = completeLifecycleHistoryForRun(target);
+  const sourceHistory = sourceWasActive ? completeLifecycleHistoryForRun(source) : closeLifecycleHistoryAt(completeLifecycleHistoryForRun(source), source.lastRunWallTime?.completedAt);
   const sourceIntervals = sourceWasActive ? source.activeIntervals : mergeIntervals(source.lastRunIntervals, source.carriedIntervals);
   const carriedSourceIntervals = mergeIntervals(source.lastRunIntervals, source.carriedIntervals);
-  const sourceLifecycleEvents = sourceWasActive ? source.lifecycleEvents : source.lastRunLifecycleEvents;
+  const sourceLifecycleEvents = sourceWasActive ? source.lifecycleEvents : new Map();
   const activeCandidates = new Set([...target.activeSessions, ...source.activeSessions]);
   target.rootSessionID = rootSessionID;
+  target.lifecycleHistory = mergeLifecycleEventMaps(targetHistory, sourceHistory);
+  const historicalIntervals = lifecycleIntervals(target.lifecycleHistory);
+  target.carriedIntervals = cloneIntervals(historicalIntervals);
+  target.lastRunIntervals = cloneIntervals(historicalIntervals);
+  target.lastRunCarriedIntervals = cloneIntervals(historicalIntervals);
+  target.lastRunLifecycleEvents = cloneLifecycleEventMap(target.lifecycleHistory);
   target.phase = target.phase === "active" || source.phase === "active" ? "active" : "idle";
   target.runEpoch = Math.max(target.runEpoch, source.runEpoch);
   target.rootBusy = target.rootBusy || source.rootBusy;
   target.rootObserved = target.rootObserved || source.rootObserved;
   target.hasExplicitRootStart = target.hasExplicitRootStart || source.hasExplicitRootStart;
-  target.lastRunIntervals = mergeIntervals(target.lastRunIntervals, carriedSourceIntervals);
-  if (targetWasActive) {
-    target.carriedIntervals = mergeIntervals(target.carriedIntervals, sourceWasActive ? source.carriedIntervals : carriedSourceIntervals);
-  } else if (sourceWasActive) {
-    target.carriedIntervals = cloneIntervals(source.carriedIntervals);
-  } else {
-    target.carriedIntervals = [];
-  }
   const lifecycleCandidates = new Map();
   for (const [sessionID, events] of target.lifecycleEvents) {
     lifecycleCandidates.set(sessionID, mergeLifecycleEvents(events, []));
@@ -988,10 +1055,22 @@ function mergeTaskWallRun(target, source, rootSessionID) {
   if (targetSummary === undefined || sourceSummary !== undefined && (sourceSummary.runEpoch > targetSummary.runEpoch || sourceSummary.runEpoch === targetSummary.runEpoch && sourceSummary.completedAt > targetSummary.completedAt)) {
     target.lastRunWallTime = sourceSummary;
   }
+  if (target.lastRunWallTime) {
+    const completedAt = Math.max(target.lastRunWallTime.completedAt, source.lastRunWallTime?.completedAt ?? target.lastRunWallTime.completedAt);
+    const completedIntervals = lifecycleIntervals(target.lifecycleHistory, completedAt);
+    target.lastRunIntervals = cloneIntervals(completedIntervals);
+    target.lastRunCarriedIntervals = cloneIntervals(completedIntervals);
+    target.lastRunWallTime = {
+      ...target.lastRunWallTime,
+      completedAt,
+      startedAt: Math.min(target.lastRunWallTime.startedAt, ...completedIntervals.map(interval => interval.start)),
+      wallTime: intervalElapsed(completedIntervals)
+    };
+  }
   if (target.phase === "active") rebuildActiveIntervals(target);else {
-    target.lastRunLifecycleEvents = lifecycleCandidates;
-    target.lastRunCarriedIntervals = mergeIntervals(target.lastRunCarriedIntervals, source.lastRunCarriedIntervals);
-    target.lastRunIntervals = mergeIntervals(target.lastRunIntervals, target.lastRunCarriedIntervals);
+    target.lastRunLifecycleEvents = cloneLifecycleEventMap(target.lifecycleHistory);
+    target.lastRunCarriedIntervals = cloneIntervals(target.carriedIntervals);
+    target.lastRunIntervals = cloneIntervals(target.carriedIntervals);
     if (target.lastRunWallTime) {
       target.lastRunWallTime = {
         ...target.lastRunWallTime,
@@ -1033,8 +1112,20 @@ function rememberSessionParent(store, sessionID, parentID) {
   const migrated = migrateTaskWallRuns(store, rootSessionID);
   return previous !== parentID || repaired || migrated;
 }
-function sessionEventSources(properties, event) {
-  return [asRecord(properties.info), asRecord(properties.session), asRecord(event.info), asRecord(event.session), properties, event].filter(value => value !== undefined);
+function sessionParentFromEvent(type, properties, event) {
+  const normalizedType = type.toLowerCase();
+  const sources = [properties, event, asRecord(properties.info), asRecord(properties.message), asRecord(properties.session), asRecord(properties.event), asRecord(event.info), asRecord(event.session), asRecord(event.event)];
+  const explicit = readStringFrom(sources, ["parentSessionID", "parentSessionId"]);
+  if (explicit) return explicit;
+  if (!normalizedType.startsWith("session.")) return undefined;
+  const sessionEntitySources = [asRecord(properties.session), asRecord(event.session), asRecord(properties.event)?.session, asRecord(event.event)?.session, asRecord(properties.info)?.session, asRecord(event.info)?.session].filter(value => isRecord(value));
+  const isSessionEntityEvent = normalizedType === "session.created" || normalizedType === "session.updated";
+  if (isSessionEntityEvent) {
+    for (const source of [properties, event, asRecord(properties.info), asRecord(event.info), asRecord(properties.event), asRecord(event.event)]) {
+      if (source) sessionEntitySources.push(source);
+    }
+  }
+  return readStringFrom(sessionEntitySources, ["parentID", "parent.id"]);
 }
 export function cacheSessionParentFromEvent(store, input) {
   const event = normalizeEvent(input);
@@ -1043,7 +1134,7 @@ export function cacheSessionParentFromEvent(store, input) {
   if (type !== "session.created" && type !== "session.updated") return false;
   const properties = eventProperties(event);
   const sessionID = readSessionID(properties, event);
-  const parentID = readStringFrom(sessionEventSources(properties, event), ["parentID", "parentSessionID", "parentSessionId", "parent.id"]);
+  const parentID = sessionParentFromEvent(type, properties, event);
   if (!sessionID || !parentID) return false;
   return rememberSessionParent(store, sessionID, parentID);
 }
@@ -1062,28 +1153,101 @@ function getTaskWallRun(store, rootSessionID) {
   store.taskRuns.set(rootSessionID, run);
   return run;
 }
+function taskWallRunsForActivityRoot(store, rootSessionID) {
+  const runs = [];
+  for (const [key, run] of store.taskRuns) {
+    const sessionIDs = new Set([key, run.rootSessionID, ...run.participantSessions, ...run.activeSessions, ...run.sessionStates.keys(), ...run.pendingSessions.keys()]);
+    if ([...sessionIDs].some(sessionID => activityRootSessionID(store, sessionID) === rootSessionID)) {
+      runs.push(run);
+    }
+  }
+  return runs;
+}
 function findTaskWallRun(store, rootSessionID, sessionID) {
   const direct = store.taskRuns.get(rootSessionID);
   if (direct) return direct;
-  for (const [key, run] of store.taskRuns) {
-    if (key === sessionID || run.rootSessionID === sessionID || run.participantSessions.has(sessionID) || run.activeSessions.has(sessionID) || run.sessionStates.has(sessionID) || run.pendingSessions.has(sessionID)) {
-      return run;
-    }
-  }
-  return undefined;
+  return taskWallRunsForActivityRoot(store, rootSessionID).find(run => run.rootSessionID === sessionID || run.participantSessions.has(sessionID));
 }
 export function taskWallTimeForSession(store, sessionID, now = Date.now()) {
   if (!sessionID) return undefined;
-  const rootSessionID = knownRootSessionID(store, sessionID);
+  const rootSessionID = activityRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
-  const run = findTaskWallRun(store, rootSessionID, sessionID);
-  if (!run) return undefined;
-  if (run.phase === "active" && run.runStartedAt !== undefined) {
-    rebuildActiveIntervals(run, now);
-    return Math.max(0, run.activeElapsed);
+  const runs = taskWallRunsForActivityRoot(store, rootSessionID);
+  const liveIntervals = [];
+  let hasCompletedLiveActivity = false;
+  for (const run of runs) {
+    if (run.phase === "active") {
+      rebuildActiveIntervals(run, now);
+      liveIntervals.push(...run.activeIntervals);
+      hasCompletedLiveActivity = run.lifecycleEvents.size > 0 || run.carriedIntervals.length > 0;
+    } else {
+      liveIntervals.push(...run.lastRunIntervals, ...run.carriedIntervals);
+      hasCompletedLiveActivity = run.lastRunWallTime !== undefined || run.lastRunLifecycleEvents.size > 0 || run.lastRunIntervals.length > 0 || run.carriedIntervals.length > 0;
+    }
   }
-  if (run.lastRunWallTime) return run.lastRunWallTime.wallTime;
+  const persistedIntervals = persistedActivityIntervalsForRoot(store.activityReplay, rootSessionID, store.sessionParents);
+  const intervals = mergeTaskActivityIntervals(store.activityReplay, sessionID, liveIntervals, store.sessionParents);
+  if (intervals.length > 0) return intervalElapsed(intervals);
+  const hasCompletedPersistedActivity = persistedCompletedActivityForRoot(store.activityReplay, rootSessionID, store.sessionParents);
+  if (hasCompletedPersistedActivity || hasCompletedLiveActivity || persistedIntervals.length > 0) return 0;
   return undefined;
+}
+export function hasLiveTaskWallActivity(store) {
+  if (store.active.size > 0) return true;
+  for (const run of store.taskRuns.values()) {
+    if (run.phase === "active") return true;
+  }
+  return false;
+}
+export function mergeTaskActivityIntervals(replay, sessionID, liveIntervals = [], sessionParents) {
+  if (!replay) return mergeIntervals([], liveIntervals);
+  const rootSessionID = activityRootSessionIDFromReplay(replay, sessionID, sessionParents);
+  const persisted = persistedActivityIntervalsForRoot(replay, rootSessionID, sessionParents);
+  return mergeIntervals(persisted, liveIntervals);
+}
+function activityParentMap(replay, sessionParents) {
+  const parents = new Map();
+  for (const [sessionID, parentSessionID] of replay.parentBySessionID) {
+    if (parentSessionID) parents.set(sessionID, parentSessionID);
+  }
+  if (sessionParents) {
+    for (const [sessionID, parentSessionID] of sessionParents) {
+      if (parentSessionID) parents.set(sessionID, parentSessionID);
+    }
+  }
+  return parents;
+}
+function activityRootSessionIDFromReplay(replay, sessionID, sessionParents) {
+  return resolveRootSessionID(sessionID, activityParentMap(replay, sessionParents));
+}
+function activityRootSessionID(store, sessionID) {
+  return activityRootSessionIDFromReplay(store.activityReplay, sessionID, store.sessionParents);
+}
+function activityParticipantIDs(replay) {
+  const sessionIDs = new Set();
+  for (const participant of replay.participants) sessionIDs.add(participant.sessionID);
+  for (const [sessionID, parentSessionID] of replay.parentBySessionID) {
+    sessionIDs.add(sessionID);
+    if (parentSessionID) sessionIDs.add(parentSessionID);
+  }
+  return sessionIDs;
+}
+function persistedActivityIntervalsForRoot(replay, rootSessionID, sessionParents) {
+  const intervals = [];
+  for (const sessionID of activityParticipantIDs(replay)) {
+    if (activityRootSessionIDFromReplay(replay, sessionID, sessionParents) !== rootSessionID) continue;
+    const timeline = replay.timelines.get(sessionID);
+    if (timeline) intervals.push(...timeline.activeIntervals);
+  }
+  return mergeIntervals(intervals, []);
+}
+function persistedCompletedActivityForRoot(replay, rootSessionID, sessionParents) {
+  for (const sessionID of activityParticipantIDs(replay)) {
+    if (activityRootSessionIDFromReplay(replay, sessionID, sessionParents) !== rootSessionID) continue;
+    const timeline = replay.timelines.get(sessionID);
+    if (timeline && timeline.events.length > 0 && !timeline.open) return true;
+  }
+  return false;
 }
 export function noteTaskRecord(store, api, record) {
   const info = record.parentSessionID ? {
@@ -1098,7 +1262,7 @@ export function noteTaskRecord(store, api, record) {
 function recordDelta(store, properties, event, stream, explicitKind, bytesPerToken) {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
-  const parentID = readStringFrom([properties, event], ["parentSessionID", "parentSessionId", "parentID"]);
+  const parentID = sessionParentFromEvent("message.part.delta", properties, event);
   if (parentID) rememberSessionParent(store, sessionID, parentID);
   const messageID = readMessageID(properties);
   const delta = readDelta(properties, event);
@@ -1313,16 +1477,24 @@ function flushIdleStates(store, api, sessionID, bytesPerToken, completedAt = Dat
   return flushed;
 }
 function sessionRunStatus(type, properties, event) {
-  if (type === "session.idle") return "idle";
-  if (type !== "session.status" && !type.endsWith(".status")) return undefined;
-  const value = properties.status ?? properties.state ?? event.status;
-  const name = statusName(value);
+  const normalizedType = type.toLowerCase();
+  if (normalizedType === "session.next.retried") return "retry";
+  if (normalizedType === "session.next.step.failed") return "idle";
+  if (normalizedType === "session.idle" || normalizedType === "session.error" || normalizedType === "session.abort" || normalizedType === "session.aborted" || normalizedType === "session.cancel" || normalizedType === "session.cancelled" || normalizedType === "session.stop" || normalizedType === "session.stopped" || normalizedType === "session.completed") return "idle";
+  if (normalizedType !== "session.status" && !normalizedType.endsWith(".status")) return undefined;
+  const value = properties.status ?? properties.state ?? event.status ?? getPath(properties, "info.status") ?? getPath(properties, "info.state") ?? getPath(event, "info.status") ?? getPath(event, "info.state");
+  const name = statusName(value)?.toLowerCase();
   if (name === "busy" || name === "retry") return name;
   if (terminalStatus(value)) return "idle";
   return undefined;
 }
+function isSessionLifecycleEventType(type) {
+  const normalizedType = type.toLowerCase();
+  return normalizedType === "session.idle" || normalizedType === "session.status" || normalizedType === "session.next.retried" || normalizedType === "session.next.step.failed" || normalizedType === "session.error" || normalizedType === "session.abort" || normalizedType === "session.aborted" || normalizedType === "session.cancel" || normalizedType === "session.cancelled" || normalizedType === "session.stop" || normalizedType === "session.stopped" || normalizedType === "session.completed";
+}
 function finishSessionRun(store, api, sessionID, bytesPerToken, completedAt) {
   const runtime = getSessionRuntime(store, sessionID);
+  if (!sessionLifecycleFactBelongsToCurrentEpoch(runtime, completedAt)) return false;
   const hadActive = [...store.active.values()].some(state => state.sessionID === sessionID);
   const wasRunning = runtime.status !== "idle" || hadActive;
   const flushed = flushIdleStates(store, api, sessionID, bytesPerToken, completedAt);
@@ -1335,27 +1507,35 @@ function finishSessionRun(store, api, sessionID, bytesPerToken, completedAt) {
   }
   return false;
 }
+function sessionLifecycleFactBelongsToCurrentEpoch(runtime, timestamp) {
+  const previousCompletion = runtime.lastRunSummary?.completedAt;
+  return previousCompletion === undefined || timestamp >= previousCompletion;
+}
 export function handleSessionLifecycle(store, api, type, properties, event, bytesPerToken) {
   const sessionID = readSessionID(properties, event);
   const status = sessionRunStatus(type, properties, event);
   if (!sessionID || status === undefined) return false;
   const timestamp = eventTimestamp(event, properties);
-  const eventParent = readStringFrom(sessionEventSources(properties, event), ["parentID", "parentSessionID", "parentSessionId", "parent.id"]);
+  const eventParent = sessionParentFromEvent(type, properties, event);
   if (eventParent) rememberSessionParent(store, sessionID, eventParent);
   const rootSessionID = rootSessionIDFor(store, api, sessionID);
   const taskRun = status === "idle" ? findTaskWallRun(store, rootSessionID, sessionID) ?? getTaskWallRun(store, rootSessionID) : getTaskWallRun(store, rootSessionID);
   if (status === "idle") {
+    const historyBefore = taskRun ? lifecycleHistorySignature(taskRun) : undefined;
     const finishedSession = finishSessionRun(store, api, sessionID, bytesPerToken, timestamp);
     const finishedTask = taskRun ? transitionTaskWallRun(taskRun, sessionID, "idle", timestamp) : undefined;
-    if (finishedTask) store.bump();
-    return finishedSession || finishedTask !== undefined;
+    const historyChanged = taskRun !== undefined && historyBefore !== lifecycleHistorySignature(taskRun);
+    if (finishedTask || historyChanged) store.bump();
+    return finishedSession || finishedTask !== undefined || historyChanged;
   }
   if (!taskRun) return false;
   const runtime = getSessionRuntime(store, sessionID);
-  const changed = transitionSessionRuntime(runtime, status, timestamp);
+  const historyBefore = lifecycleHistorySignature(taskRun);
+  const currentEpoch = sessionLifecycleFactBelongsToCurrentEpoch(runtime, timestamp);
+  const changed = currentEpoch ? transitionSessionRuntime(runtime, status, timestamp) : false;
   const finishedTask = transitionTaskWallRun(taskRun, sessionID, status, timestamp);
-  if (changed) store.bump();
-  if (finishedTask) store.bump();
+  const historyChanged = historyBefore !== lifecycleHistorySignature(taskRun);
+  if (changed || finishedTask || historyChanged) store.bump();
   return false;
 }
 export function mergeHistoryLayers(diskRecords, optimistic, maxRecords, optimisticQuality, optimisticOrder) {
@@ -1468,12 +1648,39 @@ async function reloadHistory(store, api, path, maxRecords, generation = store.hi
     warnWithToast(api, "history read failed", error);
   }
 }
+async function reloadActivity(store, api, path, generation = store.activityGeneration) {
+  if (store.disposed) return;
+  try {
+    const activityEvents = await readActivityFile(path);
+    const activityReplay = replayActivity(activityEvents);
+    if (store.disposed || generation !== store.activityGeneration) return;
+    store.activityEvents = activityEvents;
+    store.activityReplay = activityReplay;
+    store.activityGeneration = generation;
+    let parentChanged = false;
+    for (const [sessionID, parentSessionID] of activityReplay.parentBySessionID) {
+      if (!parentSessionID || store.sessionParents.get(sessionID) === parentSessionID) continue;
+      store.sessionParents.set(sessionID, parentSessionID);
+      parentChanged = true;
+    }
+    if (parentChanged) {
+      repairKnownParents(store);
+      for (const sessionID of activityReplay.parentBySessionID.keys()) {
+        migrateTaskWallRuns(store, activityRootSessionID(store, sessionID));
+      }
+    }
+    store.bump();
+  } catch (error) {
+    warnWithToast(api, "activity read failed", error);
+  }
+}
 function resolveOptions(value) {
   const options = asRecord(value);
   const maxRecordsValue = readNumber(options?.maxRecords);
   const bytesPerTokenValue = readNumber(options?.bytesPerToken);
   return {
     historyPath: readString(options?.historyPath),
+    runsPath: readString(options?.runsPath),
     maxRecords: maxRecordsValue !== undefined && maxRecordsValue > 0 ? Math.max(1, Math.floor(maxRecordsValue)) : DEFAULT_MAX_RECORDS,
     bytesPerToken: bytesPerTokenValue !== undefined && bytesPerTokenValue > 0 ? bytesPerTokenValue : DEFAULT_BYTES_PER_TOKEN,
     enabled: options?.enabled !== false
@@ -1501,6 +1708,9 @@ export function createRuntimeStore(maxRecords) {
       taskRuns: new Map(),
       sessionParents: new Map(),
       lastCompletedBySession: new Map(),
+      activityEvents: [],
+      activityReplay: replayActivity([]),
+      activityGeneration: 0,
       pulseExpanded: false,
       historyGeneration: 0,
       revision,
@@ -2363,9 +2573,12 @@ const tui = async (api, rawOptions) => {
   if (!options.enabled) return;
   const store = createRuntimeStore(options.maxRecords);
   const historyPath = resolveHistoryPath(api, options.historyPath);
+  const runsPath = resolveRunsPath(historyPath, options.runsPath);
   let disposed = false;
   let reloadTimer;
+  let activityReloadTimer;
   let reloadGeneration = 0;
+  let activityReloadGeneration = 0;
   const scheduleReload = () => {
     reloadGeneration += 1;
     const generation = reloadGeneration;
@@ -2382,6 +2595,25 @@ const tui = async (api, rawOptions) => {
       }
     };
     reloadTimer = setTimeout(() => {
+      void run(0);
+    }, 30);
+  };
+  const scheduleActivityReload = () => {
+    activityReloadGeneration += 1;
+    const generation = activityReloadGeneration;
+    store.activityGeneration = generation;
+    if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
+    const run = async attempt => {
+      if (disposed || generation !== activityReloadGeneration) return;
+      activityReloadTimer = undefined;
+      await reloadActivity(store, api, runsPath, generation);
+      if (!disposed && generation === activityReloadGeneration && attempt < 3) {
+        activityReloadTimer = setTimeout(() => {
+          void run(attempt + 1);
+        }, 100);
+      }
+    };
+    activityReloadTimer = setTimeout(() => {
       void run(0);
     }, 30);
   };
@@ -2472,6 +2704,7 @@ const tui = async (api, rawOptions) => {
         if (sessionID) rootSessionIDFor(store, api, sessionID);
         setFocusSession(store, sessionID);
         if (mapped) store.bump();
+        scheduleActivityReload();
         return;
       }
       if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
@@ -2496,12 +2729,13 @@ const tui = async (api, rawOptions) => {
         if (handleMessageUpdated(store, api, properties, event, options.bytesPerToken)) {
           scheduleReload();
         }
+        scheduleActivityReload();
         return;
       }
-      if (type === "session.idle" || type === "session.status") {
-        if (handleSessionLifecycle(store, api, type, properties, event, options.bytesPerToken)) {
-          scheduleReload();
-        }
+      if (isSessionLifecycleEventType(type)) {
+        const changed = handleSessionLifecycle(store, api, type, properties, event, options.bytesPerToken);
+        if (changed) scheduleReload();
+        scheduleActivityReload();
       }
     } catch (error) {
       console.warn("[oc-tps] event parsing failed", error);
@@ -2515,15 +2749,26 @@ const tui = async (api, rawOptions) => {
   subscribe("session.next.step.ended", handleEvent);
   subscribe("session.idle", handleEvent);
   subscribe("session.status", handleEvent);
+  subscribe("session.next.retried", handleEvent);
+  subscribe("session.next.step.failed", handleEvent);
+  subscribe("session.error", handleEvent);
+  subscribe("session.abort", handleEvent);
+  subscribe("session.aborted", handleEvent);
+  subscribe("session.cancel", handleEvent);
+  subscribe("session.cancelled", handleEvent);
+  subscribe("session.stop", handleEvent);
+  subscribe("session.stopped", handleEvent);
+  subscribe("session.completed", handleEvent);
   subscribe("session.created", handleEvent);
   subscribe("session.updated", handleEvent);
   const interval = setInterval(() => {
-    if (!disposed && store.active.size > 0) store.bump();
+    if (!disposed && hasLiveTaskWallActivity(store)) store.bump();
   }, 500);
   api.lifecycle.onDispose(() => {
     disposed = true;
     store.disposed = true;
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
+    if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
     clearInterval(interval);
     store.active.clear();
     store.optimistic.clear();
@@ -2535,12 +2780,14 @@ const tui = async (api, rawOptions) => {
     store.sessionRuntime.clear();
     store.taskRuns.clear();
     store.sessionParents.clear();
+    store.activityEvents = [];
+    store.activityReplay = replayActivity([]);
     store.lastCompletedBySession.clear();
     store.focusSessionID = undefined;
     store.disposeSignals();
   });
   store.historyGeneration += 1;
-  await reloadHistory(store, api, historyPath, options.maxRecords, store.historyGeneration);
+  await Promise.all([reloadHistory(store, api, historyPath, options.maxRecords, store.historyGeneration), reloadActivity(store, api, runsPath, store.activityGeneration)]);
 };
 const plugin = {
   id: "oc-tps",
