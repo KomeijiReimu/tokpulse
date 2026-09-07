@@ -18,6 +18,7 @@ import {
   createSessionRuntime,
   createTaskWallRun,
   createTuiSlotPlugin,
+  displayedSessionID,
   finalSamples,
   formatCacheHitRate,
   formatCompactNumber,
@@ -35,6 +36,7 @@ import {
   noteTaskRunRecord,
   noteTaskRecord,
   recordSpeedSummary,
+  rememberVisibleSession,
   selectedSamples,
   takeActiveState,
   taskWallTimeForSession,
@@ -313,7 +315,7 @@ test("a late disk snapshot with a newer provisional completion cannot replace ex
 });
 
 test("an old disk snapshot cannot replace exact memory even when its timestamp is later", () => {
-  const disk = record("same", "s", 200, 0, {
+  const disk = record("same", "s", 8, 0, {
     model: undefined,
     samples: [],
     time: { start: 0, completed: 9_000, duration: 9_000 },
@@ -332,6 +334,36 @@ test("an old disk snapshot cannot replace exact memory even when its timestamp i
   );
   assert.equal(merged[0].tokens.output, 40);
   assert.equal(merged[0].time.completed, 1_100);
+});
+
+test("a larger exact disk record replaces a smaller exact overlay", () => {
+  const disk = record("same", "s", 200, 0, {
+    model: "model",
+    samples: [{ timestamp: 1, tokens: 200 }],
+    time: { start: 0, completed: 9_000, duration: 9_000 },
+  });
+  const overlay = record("same", "s", 40, 0, {
+    model: "model",
+    samples: [{ timestamp: 1, tokens: 40 }],
+    time: { start: 0, completed: 1_100, duration: 1_100 },
+  });
+  const merged = mergeHistoryLayers(
+    [disk],
+    new Map([[overlay.messageID, overlay]]),
+    10,
+    new Map([[overlay.messageID, "exact"]]),
+    new Map([[overlay.messageID, 4]]),
+  );
+  assert.equal(merged[0].tokens.output, 200);
+  assert.equal(merged[0].time.completed, 9_000);
+});
+
+test("sidebar totals stay on the opened session after a child event hijacks focus", () => {
+  const store = createRuntimeStore(10);
+  rememberVisibleSession(store, "child");
+  assert.equal(store.focusSessionID, "child");
+  assert.equal(displayedSessionID(store, "root"), "root");
+  store.disposeSignals();
 });
 
 test("late child parent mapping repairs existing records and folds the child into the root", () => {
@@ -447,6 +479,9 @@ test("slot registration appends sidebar content without taking the footer or app
   assert.match(source, /\+ Token Pulse/);
   assert.match(source, /- Token Pulse/);
   assert.match(source, /formatPulseMetrics\(summary\.tokens, summary\.speed\)/);
+  assert.match(source, /displayedSessionID\(props\.store, props\.sessionID\)/);
+  assert.doesNotMatch(source, /setFocusSession\(store, (sessionID|eventSessionID)\)/);
+  assert.doesNotMatch(source, /focusSessionID \?\? props\.sessionID/);
   assert.match(source, /Cache hit rate/);
   assert.match(source, /formatCacheHitRate\(cacheHitRate\(tokens\)\)/);
   assert.match(source, /backgroundColor=\{props\.api\.theme\.current\.backgroundElement\}/);

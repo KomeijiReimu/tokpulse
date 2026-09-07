@@ -1356,9 +1356,10 @@ function preferredHistoryLayer(candidate, existing) {
   if (existing.source !== "disk" && candidate.source === "disk" && candidateCompleteness !== existingCompleteness) {
     return candidateCompleteness > existingCompleteness ? candidate : existing;
   }
-  if (candidateQuality === "exact" && existingQuality === "exact") {
-    if (candidate.source !== "disk" && existing.source === "disk") return candidate;
-    if (existing.source !== "disk" && candidate.source === "disk") return existing;
+  const candidateVolume = totalTokens(candidate.record.tokens);
+  const existingVolume = totalTokens(existing.record.tokens);
+  if (candidateVolume !== existingVolume) {
+    return candidateVolume > existingVolume ? candidate : existing;
   }
   const candidateFreshness = recordFreshness(candidate.record);
   const existingFreshness = recordFreshness(existing.record);
@@ -2327,7 +2328,7 @@ function HistoryView(props) {
   })();
 }
 function PromptRight(props) {
-  setFocusSession(props.store, props.sessionID);
+  rememberVisibleSession(props.store, props.sessionID);
   const label = createMemo(() => {
     props.store.revision();
     return liveLabel(props.store, props.sessionID, props.options.bytesPerToken, Math.max(1, props.api.renderer.width));
@@ -2341,10 +2342,13 @@ function PromptRight(props) {
     return _el$29;
   })();
 }
-function setFocusSession(store, sessionID) {
+export function rememberVisibleSession(store, sessionID) {
   if (!sessionID || store.focusSessionID === sessionID) return;
   store.focusSessionID = sessionID;
   store.bump();
+}
+export function displayedSessionID(_store, slotSessionID) {
+  return slotSessionID;
 }
 export function togglePulse(store) {
   store.pulseExpanded = !store.pulseExpanded;
@@ -2354,7 +2358,7 @@ export function togglePulse(store) {
 function BottomContent(props) {
   const sessionID = createMemo(() => {
     props.store.revision();
-    return props.store.focusSessionID ?? props.sessionID;
+    return displayedSessionID(props.store, props.sessionID);
   });
   const view = createMemo(() => {
     props.store.revision();
@@ -2702,13 +2706,11 @@ const tui = async (api, rawOptions) => {
         const mapped = cacheSessionParentFromEvent(store, event);
         const sessionID = readSessionID(properties, event);
         if (sessionID) rootSessionIDFor(store, api, sessionID);
-        setFocusSession(store, sessionID);
         if (mapped) store.bump();
         scheduleActivityReload();
         return;
       }
       if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
-      setFocusSession(store, eventSessionID);
       if (type === "message.part.delta") {
         recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken);
         return;
