@@ -32,9 +32,10 @@ export const server = async (input, pluginOptions) => {
   const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map();
   const completedMessageIDs = new Set();
+  const parentSessionCache = new Map();
   const event = payload => {
     const rawEvent = payload?.event;
-    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, activity, active, completedMessageIDs, bytesPerToken)).catch(error => {
+    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken)).catch(error => {
       warn("event handling failed", error);
     });
     eventQueue = next;
@@ -408,7 +409,7 @@ function unwrapIncomingEvent(value) {
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
-async function handleEvent(rawEvent, input, storage, activity, active, completedMessageIDs, bytesPerToken) {
+async function handleEvent(rawEvent, input, storage, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken) {
   try {
     const event = unwrapIncomingEvent(rawEvent);
     if (!event) return;
@@ -431,7 +432,7 @@ async function handleEvent(rawEvent, input, storage, activity, active, completed
       return;
     }
     if (type === "message.updated") {
-      await handleMessageUpdated(input, storage, activity, active, completedMessageIDs, event, properties, timestamp, bytesPerToken);
+      await handleMessageUpdated(input, storage, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken);
       return;
     }
     if (type === "session.next.step.ended") {
@@ -439,7 +440,7 @@ async function handleEvent(rawEvent, input, storage, activity, active, completed
       return;
     }
     if (isIdleEvent(type, properties, event)) {
-      await flushIdleStates(input, storage, activity, active, completedMessageIDs, properties, event, timestamp, bytesPerToken);
+      await flushIdleStates(input, storage, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken);
     }
   } catch (error) {
     warn("event parsing failed", error);
@@ -483,7 +484,7 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   if (state.cost === undefined) state.cost = numberOrUndefined(info?.cost ?? properties.cost);
   active.set(messageID ?? pendingKey(sessionID), state);
 }
-async function handleMessageUpdated(input, storage, activity, active, completedMessageIDs, event, properties, timestamp, bytesPerToken) {
+async function handleMessageUpdated(input, storage, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken) {
   const info = eventInfo(properties, event);
   if (!info || info.role !== "assistant" || !isCompleted(info, properties, event)) return;
   const messageID = readMessageID(properties, info);
@@ -509,7 +510,7 @@ async function handleMessageUpdated(input, storage, activity, active, completedM
     output: tokens.output,
     reasoning: tokens.reasoning
   });
-  const parentSessionID = await resolveParentSessionID(input, sessionID, "message.updated", properties, event);
+  const parentSessionID = await resolveParentSessionID(input, parentSessionCache, sessionID, "message.updated", properties, event);
   await safeRecordParentFact(activity, "message.updated", sessionID, parentSessionID, timestamp, properties, event);
   const record = makeHistoryRecord({
     messageID,
@@ -526,7 +527,7 @@ async function handleMessageUpdated(input, storage, activity, active, completedM
   });
   if (await safeUpsert(storage, record)) completedMessageIDs.add(messageID);else if (state) active.set(messageID, state);
 }
-async function flushIdleStates(input, storage, activity, active, completedMessageIDs, properties, event, timestamp, bytesPerToken) {
+async function flushIdleStates(input, storage, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
   if (!sessionID) return;
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
@@ -542,7 +543,7 @@ async function flushIdleStates(input, storage, activity, active, completedMessag
       cacheRead: state.fallbackTokens.cacheRead ?? 0,
       cacheWrite: state.fallbackTokens.cacheWrite ?? 0
     };
-    const parentSessionID = await resolveParentSessionID(input, sessionID, "session.idle", properties, event);
+    const parentSessionID = await resolveParentSessionID(input, parentSessionCache, sessionID, "session.idle", properties, event);
     await safeRecordParentFact(activity, "session.idle", sessionID, parentSessionID, timestamp, properties, event);
     const record = makeHistoryRecord({
       messageID: state.messageID,
@@ -735,9 +736,13 @@ function isIdleEvent(type, properties, event) {
   const state = lifecycleStateForEvent(type, properties, event);
   return state !== undefined && !isActiveState(state);
 }
-async function resolveParentSessionID(input, sessionID, type, properties, event) {
+async function resolveParentSessionID(input, cache, sessionID, type, properties, event) {
   const direct = readParentSessionIDFromEvent(type, properties, event);
-  if (direct && direct !== sessionID) return direct;
+  if (direct && direct !== sessionID) {
+    cache.set(sessionID, direct);
+    return direct;
+  }
+  if (cache.has(sessionID)) return cache.get(sessionID);
   const client = input.client;
   const get = client?.session?.get;
   const sessionClient = client?.session;
@@ -749,17 +754,22 @@ async function resolveParentSessionID(input, sessionID, type, properties, event)
         }
       })), PARENT_LOOKUP_TIMEOUT_MS);
       if (response === undefined) {
-        warn("parent lookup timed out");
+        cache.set(sessionID, undefined);
         return undefined;
       }
       const session = asRecord(response?.data) ?? asRecord(response);
       const parent = readStringFrom([session, asRecord(session?.session)], ["parentID", "parentSessionID", "parentSessionId", "parent.id", "session.parentID", "session.parentSessionID", "session.parentSessionId"]);
-      if (parent && parent !== sessionID) return parent;
-    } catch (error) {
-      warn("parent lookup failed", error);
+      const resolved = parent && parent !== sessionID ? parent : undefined;
+      cache.set(sessionID, resolved);
+      return resolved;
+    } catch {
+      cache.set(sessionID, undefined);
+      return undefined;
     }
   }
-  return direct && direct !== sessionID ? direct : undefined;
+  const fallback = direct && direct !== sessionID ? direct : undefined;
+  cache.set(sessionID, fallback);
+  return fallback;
 }
 async function withTimeout(promise, timeoutMs) {
   let timer;

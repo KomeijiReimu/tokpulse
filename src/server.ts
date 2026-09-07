@@ -93,6 +93,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
   const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map<string, ActiveState>();
   const completedMessageIDs = new Set<string>();
+  const parentSessionCache = new Map<string, string | undefined>();
 
   const event = (payload: { event?: unknown }): Promise<void> => {
     const rawEvent = payload?.event;
@@ -104,6 +105,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
         activity,
         active,
         completedMessageIDs,
+        parentSessionCache,
         bytesPerToken,
       ))
       .catch((error) => {
@@ -757,6 +759,7 @@ async function handleEvent(
   activity: ActivityRuntime,
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
+  parentSessionCache: Map<string, string | undefined>,
   bytesPerToken: number,
 ): Promise<void> {
   try {
@@ -800,6 +803,7 @@ async function handleEvent(
         activity,
         active,
         completedMessageIDs,
+        parentSessionCache,
         event,
         properties,
         timestamp,
@@ -818,6 +822,7 @@ async function handleEvent(
         activity,
         active,
         completedMessageIDs,
+        parentSessionCache,
         properties,
         event,
         timestamp,
@@ -889,6 +894,7 @@ async function handleMessageUpdated(
   activity: ActivityRuntime,
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
+  parentSessionCache: Map<string, string | undefined>,
   event: AnyRecord,
   properties: AnyRecord,
   timestamp: number,
@@ -920,7 +926,14 @@ async function handleMessageUpdated(
     output: tokens.output,
     reasoning: tokens.reasoning,
   });
-  const parentSessionID = await resolveParentSessionID(input, sessionID, "message.updated", properties, event);
+  const parentSessionID = await resolveParentSessionID(
+    input,
+    parentSessionCache,
+    sessionID,
+    "message.updated",
+    properties,
+    event,
+  );
   await safeRecordParentFact(
     activity,
     "message.updated",
@@ -953,6 +966,7 @@ async function flushIdleStates(
   activity: ActivityRuntime,
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
+  parentSessionCache: Map<string, string | undefined>,
   properties: AnyRecord,
   event: AnyRecord,
   timestamp: number,
@@ -973,7 +987,14 @@ async function flushIdleStates(
       cacheRead: state.fallbackTokens.cacheRead ?? 0,
       cacheWrite: state.fallbackTokens.cacheWrite ?? 0,
     };
-    const parentSessionID = await resolveParentSessionID(input, sessionID, "session.idle", properties, event);
+    const parentSessionID = await resolveParentSessionID(
+      input,
+      parentSessionCache,
+      sessionID,
+      "session.idle",
+      properties,
+      event,
+    );
     await safeRecordParentFact(
       activity,
       "session.idle",
@@ -1230,13 +1251,18 @@ function isIdleEvent(type: string, properties: AnyRecord, event: AnyRecord): boo
 
 async function resolveParentSessionID(
   input: PluginInput,
+  cache: Map<string, string | undefined>,
   sessionID: string,
   type: string,
   properties: AnyRecord,
   event: AnyRecord,
 ): Promise<string | undefined> {
   const direct = readParentSessionIDFromEvent(type, properties, event);
-  if (direct && direct !== sessionID) return direct;
+  if (direct && direct !== sessionID) {
+    cache.set(sessionID, direct);
+    return direct;
+  }
+  if (cache.has(sessionID)) return cache.get(sessionID);
   const client = (input as AnyRecord).client as AnyRecord | undefined;
   const get = client?.session?.get;
   const sessionClient = client?.session;
@@ -1247,7 +1273,7 @@ async function resolveParentSessionID(
         PARENT_LOOKUP_TIMEOUT_MS,
       );
       if (response === undefined) {
-        warn("parent lookup timed out");
+        cache.set(sessionID, undefined);
         return undefined;
       }
       const session = asRecord(response?.data) ?? asRecord(response);
@@ -1263,12 +1289,17 @@ async function resolveParentSessionID(
           "session.parentSessionId",
         ],
       );
-      if (parent && parent !== sessionID) return parent;
-    } catch (error) {
-      warn("parent lookup failed", error);
+      const resolved = parent && parent !== sessionID ? parent : undefined;
+      cache.set(sessionID, resolved);
+      return resolved;
+    } catch {
+      cache.set(sessionID, undefined);
+      return undefined;
     }
   }
-  return direct && direct !== sessionID ? direct : undefined;
+  const fallback = direct && direct !== sessionID ? direct : undefined;
+  cache.set(sessionID, fallback);
+  return fallback;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {

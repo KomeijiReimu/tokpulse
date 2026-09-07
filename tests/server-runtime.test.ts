@@ -375,12 +375,21 @@ test("never-resolving parent lookup times out without blocking later events", as
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
   const historyPath = join(directory, "history.jsonl");
   const runsPath = join(directory, "runs.jsonl");
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args);
+  };
   try {
+    let lookupCalls = 0;
     const never = new Promise<never>(() => undefined);
     const hooks = await server({
       directory,
       worktree: directory,
-      client: { session: { get: () => never } },
+      client: { session: { get: () => {
+        lookupCalls += 1;
+        return never;
+      } } },
     } as unknown as PluginInput, { historyPath });
     assert.ok(hooks.event);
     const completed = hooks.event({ event: {
@@ -414,7 +423,26 @@ test("never-resolving parent lookup times out without blocking later events", as
     assert.equal(laterWithinBound, true);
     assert.equal((await readRecords(historyPath)).length, 1);
     assert.deepEqual((await readRunEvents(runsPath)).map((event) => event.state), ["busy"]);
+    assert.equal(lookupCalls, 1);
+    assert.equal(warnings.some((args) => String(args[0]).includes("parent lookup")), false);
+
+    await hooks.event({ event: {
+      type: "message.updated",
+      timestamp: 400,
+      properties: {
+        info: {
+          id: "message-2",
+          sessionID: "child",
+          role: "assistant",
+          time: { created: 300, completed: 400 },
+          tokens: { input: 1, output: 2, reasoning: 0 },
+        },
+      },
+    } as never });
+    assert.equal(lookupCalls, 1);
+    assert.equal(warnings.length, 0);
   } finally {
+    console.warn = originalWarn;
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -480,6 +508,21 @@ test("completed response parent lookup is supplemental and persisted", async () 
     assert.equal(parentEvents.length, 1);
     assert.equal(parentEvents[0]?.parentSessionID, "root");
     assert.equal((await readRecords(historyPath))[0]?.parentSessionID, "root");
+    assert.equal(lookupCalls, 1);
+
+    await hooks.event({ event: {
+      type: "message.updated",
+      timestamp: 400,
+      properties: {
+        info: {
+          id: "message-2",
+          sessionID: "child",
+          role: "assistant",
+          time: { created: 300, completed: 400 },
+          tokens: { input: 1, output: 2, reasoning: 0 },
+        },
+      },
+    } as never });
     assert.equal(lookupCalls, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });
