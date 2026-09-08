@@ -1,7 +1,24 @@
 {
-  "name": "oc-tps",
+  "name": "@komeijireimu/tokpulse",
   "version": "0.1.0",
-  "description": "Token speed and response history plugin for OpenCode",
+  "description": "Token Pulse — live token speed, session totals, and response history for OpenCode",
+  "license": "AGPL-3.0-or-later",
+  "author": "KomeijiReimu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KomeijiReimu/tokpulse.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KomeijiReimu/tokpulse/issues"
+  },
+  "homepage": "https://github.com/KomeijiReimu/tokpulse#readme",
+  "keywords": [
+    "opencode",
+    "plugin",
+    "tokens",
+    "tps",
+    "throughput"
+  ],
   "type": "module",
   "exports": {
     "./server": "./dist/server.js",
@@ -9,15 +26,17 @@
   },
   "files": [
     "dist",
+    "LICENSE",
     "README.md",
+    "README.zh-CN.md",
     "package.json"
   ],
   "engines": {
     "opencode": ">=1.18.0"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "build": "bun scripts/build.mjs",
+    "test": "bun test"
   },
   "devDependencies": {
     "@babel/core": "^7.26.9",
