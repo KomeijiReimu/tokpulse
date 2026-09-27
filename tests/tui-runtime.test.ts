@@ -25,6 +25,7 @@ import {
   formatCompactRate,
   formatPulseMetrics,
   formatPulseSummary,
+  projectSessionTotals,
   freezeSessionRun,
   handleSessionLifecycle,
   hasLiveTaskWallActivity,
@@ -403,6 +404,8 @@ test("compact formatter keeps small values readable and large values short", () 
   assert.equal(formatCompactNumber(19_900), "19.9k");
   assert.equal(formatCompactNumber(57_500), "57.5k");
   assert.equal(formatCompactNumber(1_200_000), "1.2M");
+  assert.equal(formatCompactNumber(120_400_000), "120.4M");
+  assert.equal(formatCompactNumber(119_600_000), "119.6M");
   assert.equal(formatCompactNumber(1_000_000_000), "1.0B");
   assert.equal(formatCompactRate(57_500), "57.5k tok/s");
 });
@@ -1063,6 +1066,106 @@ test("message parentID is not treated as a session parent", () => {
   }), false);
   assert.equal(store.sessionParents.has("child"), false);
   store.disposeSignals();
+});
+
+test("projectSessionTotals keeps ledger usage that is outside the history window", () => {
+  const counted = {
+    tokens: { input: 0, output: 1000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: 0,
+    responseCount: 1,
+  };
+  const base = {
+    version: 1 as const,
+    sessions: { root: counted },
+    open: {},
+    settled: {},
+  };
+  assert.equal(
+    projectSessionTotals(base, [], new Map(), "root").including.tokens.output,
+    1000,
+  );
+
+  const extra = record("extra", "root", 40, 0, {
+    tokens: { input: 0, output: 40, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: 0,
+  });
+  const added = projectSessionTotals(base, [extra], new Map(), "root");
+  assert.equal(added.including.tokens.output, 1040);
+  assert.equal(added.including.responseCount, 2);
+
+  const same = record("same", "root", 10, 0, {
+    tokens: { input: 0, output: 10, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: 1,
+  });
+  const opened = projectSessionTotals({
+    sessions: {
+      root: { tokens: same.tokens, cost: same.cost, responseCount: 1 },
+    },
+    open: {
+      same: {
+        sessionID: "root",
+        quality: "exact" as const,
+        tokens: same.tokens,
+        cost: same.cost,
+      },
+    },
+  }, [same], new Map(), "root");
+  assert.equal(opened.including.tokens.output, 10);
+  assert.equal(opened.including.responseCount, 1);
+
+  const settledMessage = record("settled", "root", 25, 0, {
+    tokens: { input: 0, output: 25, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: 0,
+  });
+  const settled = projectSessionTotals({
+    sessions: { root: counted },
+    open: {},
+    settled: { settled: true },
+  }, [settledMessage], new Map(), "root");
+  assert.equal(settled.including.tokens.output, 1000);
+  assert.equal(settled.including.responseCount, 1);
+
+  const corrected = record("corrected", "root", 0, 0, {
+    tokens: { input: 15, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: 0,
+  });
+  const correctedTotals = projectSessionTotals({
+    sessions: {
+      root: {
+        tokens: { input: 10, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        cost: 0,
+        responseCount: 1,
+      },
+    },
+    open: {},
+    settled: {
+      corrected: {
+        sessionID: "root",
+        quality: "exact",
+        tokens: { input: 10, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        cost: 0,
+      },
+    },
+  }, [corrected], new Map(), "root");
+  assert.equal(correctedTotals.including.tokens.input, 15);
+  assert.equal(correctedTotals.including.responseCount, 1);
+
+  const parents = new Map<string, string>([["child", "root"]]);
+  const parentRollup = projectSessionTotals({
+    sessions: {
+      root: {
+        tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        cost: 0,
+        responseCount: 0,
+      },
+      child: counted,
+    },
+    open: {},
+  }, [], parents, "root");
+  assert.equal(parentRollup.direct.tokens.output, 0);
+  assert.equal(parentRollup.direct.responseCount, 0);
+  assert.equal(parentRollup.including.tokens.output, 1000);
+  assert.equal(parentRollup.including.responseCount, 1);
 });
 
 test("activity reload uses the sidecar path and only reads it", async () => {

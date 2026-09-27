@@ -3,6 +3,7 @@ import { HISTORY_VERSION, bytesToTokens, calibrateResponseSamples, emptyTokenCou
 import { ACTIVITY_VERSION, isActiveState, normalizeActivityEvent, replayActivity } from "./activity.js";
 import { createActivityLedger } from "./runs-storage.js";
 import { createHistoryStorage } from "./storage.js";
+import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
 const PARENT_LOOKUP_TIMEOUT_MS = 200;
@@ -13,6 +14,10 @@ export const server = async (input, pluginOptions) => {
   const historyPath = resolveHistoryPath(baseDirectory, options.historyPath);
   const storage = createHistoryStorage(historyPath, {
     maxRecords: options.maxRecords
+  });
+  const totals = createTotalsStorage({
+    historyPath,
+    totalsPath: options.totalsPath
   });
   const activity = {
     ledger: createActivityLedger({
@@ -25,9 +30,11 @@ export const server = async (input, pluginOptions) => {
     writtenFacts: new Set(),
     rawTimestamps: new Map()
   };
-  let eventQueue = initializeActivityRuntime(activity).catch(error => {
+  let eventQueue = Promise.all([initializeActivityRuntime(activity).catch(error => {
     warn("activity ledger initialization failed", error);
-  });
+  }), initializeTotals(storage, totals).catch(error => {
+    warn("totals ledger initialization failed", error);
+  })]).then(() => undefined);
   await eventQueue;
   const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map();
@@ -35,7 +42,7 @@ export const server = async (input, pluginOptions) => {
   const parentSessionCache = new Map();
   const event = payload => {
     const rawEvent = payload?.event;
-    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken)).catch(error => {
+    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken)).catch(error => {
       warn("event handling failed", error);
     });
     eventQueue = next;
@@ -65,6 +72,23 @@ function initializeActivityRuntime(runtime) {
   const settled = result.then(() => undefined, () => undefined);
   activityInitializationQueues.set(key, settled);
   return result;
+}
+async function initializeTotals(storage, totals) {
+  const retained = await storage.read();
+  try {
+    await seedRetainedTotals(totals, retained);
+  } catch (error) {
+    if (!isCorruptTotalsError(error)) throw error;
+    warn("totals ledger is corrupt", error);
+    await totals.quarantine();
+    await seedRetainedTotals(totals, retained);
+  }
+}
+async function seedRetainedTotals(totals, retained) {
+  await totals.seed(retained);
+  await totals.applyMany(retained, {
+    retainedMessageIDs: retained.map(record => record.messageID)
+  });
 }
 async function initializeActivityRuntimeNow(runtime) {
   const existing = await runtime.ledger.read({
@@ -409,7 +433,7 @@ function unwrapIncomingEvent(value) {
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
-async function handleEvent(rawEvent, input, storage, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken) {
+async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken) {
   try {
     const event = unwrapIncomingEvent(rawEvent);
     if (!event) return;
@@ -432,7 +456,7 @@ async function handleEvent(rawEvent, input, storage, activity, active, completed
       return;
     }
     if (type === "message.updated") {
-      await handleMessageUpdated(input, storage, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken);
+      await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken);
       return;
     }
     if (type === "session.next.step.ended") {
@@ -440,7 +464,7 @@ async function handleEvent(rawEvent, input, storage, activity, active, completed
       return;
     }
     if (isIdleEvent(type, properties, event)) {
-      await flushIdleStates(input, storage, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken);
+      await flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken);
     }
   } catch (error) {
     warn("event parsing failed", error);
@@ -484,7 +508,7 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   if (state.cost === undefined) state.cost = numberOrUndefined(info?.cost ?? properties.cost);
   active.set(messageID ?? pendingKey(sessionID), state);
 }
-async function handleMessageUpdated(input, storage, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken) {
+async function handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken) {
   const info = eventInfo(properties, event);
   if (!info || info.role !== "assistant" || !isCompleted(info, properties, event)) return;
   const messageID = readMessageID(properties, info);
@@ -525,9 +549,9 @@ async function handleMessageUpdated(input, storage, activity, active, completedM
     completedAt: timestamp,
     quality: "exact"
   });
-  if (await safeUpsert(storage, record)) completedMessageIDs.add(messageID);else if (state) active.set(messageID, state);
+  if (await safeUpsert(storage, totals, record)) completedMessageIDs.add(messageID);else if (state) active.set(messageID, state);
 }
-async function flushIdleStates(input, storage, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
+async function flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
   if (!sessionID) return;
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
@@ -561,7 +585,8 @@ async function flushIdleStates(input, storage, activity, active, completedMessag
       completedAt: timestamp,
       quality: "provisional"
     });
-    await safeUpsert(storage, record);
+    const wrote = await safeUpsert(storage, totals, record);
+    if (!wrote) active.set(key, state);
   }
 }
 function makeHistoryRecord(input) {
@@ -782,13 +807,47 @@ async function withTimeout(promise, timeoutMs) {
     if (timer !== undefined) clearTimeout(timer);
   }
 }
-async function safeUpsert(storage, record) {
+async function safeUpsert(storage, totals, record) {
   try {
     await storage.upsert(record);
-    return true;
   } catch (error) {
     warn("history write failed", error);
     return false;
+  }
+  let retained;
+  try {
+    retained = await storage.read();
+  } catch (error) {
+    warn("totals write failed", error);
+    return false;
+  }
+  try {
+    const retainedMessageIDs = retained.map(entry => entry.messageID);
+    const stored = retained.find(entry => entry.messageID === record.messageID);
+    if (stored) {
+      await totals.apply(stored, {
+        retainedMessageIDs
+      });
+    } else {
+      await totals.applyMany([], {
+        retainedMessageIDs
+      });
+    }
+    return true;
+  } catch (error) {
+    if (!isCorruptTotalsError(error)) {
+      warn("totals write failed", error);
+      return false;
+    }
+    warn("totals ledger is corrupt", error);
+    try {
+      await totals.quarantine();
+      await seedRetainedTotals(totals, retained);
+      return true;
+    } catch (recoveryError) {
+      warn("totals write failed", recoveryError);
+      return false;
+    }
   }
 }
 function resolveOptions(candidate) {
@@ -796,6 +855,7 @@ function resolveOptions(candidate) {
   return {
     historyPath: typeof candidate.historyPath === "string" ? candidate.historyPath : undefined,
     runsPath: typeof candidate.runsPath === "string" ? candidate.runsPath : undefined,
+    totalsPath: typeof candidate.totalsPath === "string" ? candidate.totalsPath : undefined,
     maxRecords: numberOrUndefined(candidate.maxRecords),
     bytesPerToken: numberOrUndefined(candidate.bytesPerToken)
   };

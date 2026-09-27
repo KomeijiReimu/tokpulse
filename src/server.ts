@@ -23,10 +23,12 @@ import {
 } from "./activity.js";
 import { ActivityLedger, createActivityLedger } from "./runs-storage.js";
 import { createHistoryStorage, HistoryStorage } from "./storage.js";
+import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage } from "./totals-storage.js";
 
 export interface ServerOptions {
   historyPath?: string;
   runsPath?: string;
+  totalsPath?: string;
   maxRecords?: number;
   bytesPerToken?: number;
 }
@@ -78,6 +80,10 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
   const storage = createHistoryStorage(historyPath, {
     maxRecords: options.maxRecords,
   });
+  const totals = createTotalsStorage({
+    historyPath,
+    totalsPath: options.totalsPath,
+  });
   const activity: ActivityRuntime = {
     ledger: createActivityLedger({ historyPath, runsPath: options.runsPath }),
     instanceID: randomUUID(),
@@ -86,9 +92,14 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
     writtenFacts: new Set(),
     rawTimestamps: new Map(),
   };
-  let eventQueue: Promise<void> = initializeActivityRuntime(activity).catch((error: unknown) => {
-    warn("activity ledger initialization failed", error);
-  });
+  let eventQueue: Promise<void> = Promise.all([
+    initializeActivityRuntime(activity).catch((error: unknown) => {
+      warn("activity ledger initialization failed", error);
+    }),
+    initializeTotals(storage, totals).catch((error: unknown) => {
+      warn("totals ledger initialization failed", error);
+    }),
+  ]).then(() => undefined);
   await eventQueue;
   const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map<string, ActiveState>();
@@ -102,6 +113,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
         rawEvent,
         input,
         storage,
+        totals,
         activity,
         active,
         completedMessageIDs,
@@ -140,6 +152,28 @@ function initializeActivityRuntime(runtime: ActivityRuntime): Promise<void> {
   const settled = result.then(() => undefined, () => undefined);
   activityInitializationQueues.set(key, settled);
   return result;
+}
+
+async function initializeTotals(storage: HistoryStorage, totals: TotalsStorage): Promise<void> {
+  const retained = await storage.read();
+  try {
+    await seedRetainedTotals(totals, retained);
+  } catch (error) {
+    if (!isCorruptTotalsError(error)) throw error;
+    warn("totals ledger is corrupt", error);
+    await totals.quarantine();
+    await seedRetainedTotals(totals, retained);
+  }
+}
+
+async function seedRetainedTotals(
+  totals: TotalsStorage,
+  retained: readonly HistoryRecord[],
+): Promise<void> {
+  await totals.seed(retained);
+  await totals.applyMany(retained, {
+    retainedMessageIDs: retained.map((record) => record.messageID),
+  });
 }
 
 async function initializeActivityRuntimeNow(runtime: ActivityRuntime): Promise<void> {
@@ -756,6 +790,7 @@ async function handleEvent(
   rawEvent: unknown,
   input: PluginInput,
   storage: HistoryStorage,
+  totals: TotalsStorage,
   activity: ActivityRuntime,
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
@@ -800,6 +835,7 @@ async function handleEvent(
       await handleMessageUpdated(
         input,
         storage,
+        totals,
         activity,
         active,
         completedMessageIDs,
@@ -819,6 +855,7 @@ async function handleEvent(
       await flushIdleStates(
         input,
         storage,
+        totals,
         activity,
         active,
         completedMessageIDs,
@@ -891,6 +928,7 @@ function recordStepFallback(
 async function handleMessageUpdated(
   input: PluginInput,
   storage: HistoryStorage,
+  totals: TotalsStorage,
   activity: ActivityRuntime,
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
@@ -956,13 +994,14 @@ async function handleMessageUpdated(
     completedAt: timestamp,
     quality: "exact",
   });
-  if (await safeUpsert(storage, record)) completedMessageIDs.add(messageID);
+  if (await safeUpsert(storage, totals, record)) completedMessageIDs.add(messageID);
   else if (state) active.set(messageID, state);
 }
 
 async function flushIdleStates(
   input: PluginInput,
   storage: HistoryStorage,
+  totals: TotalsStorage,
   activity: ActivityRuntime,
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
@@ -1020,7 +1059,8 @@ async function flushIdleStates(
       completedAt: timestamp,
       quality: "provisional",
     });
-    await safeUpsert(storage, record);
+    const wrote = await safeUpsert(storage, totals, record);
+    if (!wrote) active.set(key, state);
   }
 }
 
@@ -1314,13 +1354,49 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
-async function safeUpsert(storage: HistoryStorage, record: HistoryRecord): Promise<boolean> {
+async function safeUpsert(
+  storage: HistoryStorage,
+  totals: TotalsStorage,
+  record: HistoryRecord,
+): Promise<boolean> {
   try {
     await storage.upsert(record);
-    return true;
   } catch (error) {
     warn("history write failed", error);
     return false;
+  }
+
+  let retained: readonly HistoryRecord[];
+  try {
+    retained = await storage.read();
+  } catch (error) {
+    warn("totals write failed", error);
+    return false;
+  }
+
+  try {
+    const retainedMessageIDs = retained.map((entry) => entry.messageID);
+    const stored = retained.find((entry) => entry.messageID === record.messageID);
+    if (stored) {
+      await totals.apply(stored, { retainedMessageIDs });
+    } else {
+      await totals.applyMany([], { retainedMessageIDs });
+    }
+    return true;
+  } catch (error) {
+    if (!isCorruptTotalsError(error)) {
+      warn("totals write failed", error);
+      return false;
+    }
+    warn("totals ledger is corrupt", error);
+    try {
+      await totals.quarantine();
+      await seedRetainedTotals(totals, retained);
+      return true;
+    } catch (recoveryError) {
+      warn("totals write failed", recoveryError);
+      return false;
+    }
   }
 }
 
@@ -1329,6 +1405,7 @@ function resolveOptions(candidate: unknown): ServerOptions {
   return {
     historyPath: typeof candidate.historyPath === "string" ? candidate.historyPath : undefined,
     runsPath: typeof candidate.runsPath === "string" ? candidate.runsPath : undefined,
+    totalsPath: typeof candidate.totalsPath === "string" ? candidate.totalsPath : undefined,
     maxRecords: numberOrUndefined(candidate.maxRecords),
     bytesPerToken: numberOrUndefined(candidate.bytesPerToken),
   };

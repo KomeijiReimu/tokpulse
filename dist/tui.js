@@ -8,12 +8,15 @@ import { setProp as _$setProp } from "@opentui/solid";
 import { createElement as _$createElement } from "@opentui/solid";
 /** @jsxImportSource @opentui/solid */
 
+import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup } from "solid-js";
-import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calculateSpeedStats, calibrateResponseSamples, bytesToTokens, durationOf, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, rollingTokenRate, timeToFirstToken, utf8ByteLength } from "./core.js";
+import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calculateSpeedStats, dedupeHistoryRecords, calibrateResponseSamples, bytesToTokens, durationOf, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, rollingTokenRate, timeToFirstToken, utf8ByteLength } from "./core.js";
 import { replayActivity, resolveRootSessionID } from "./activity.js";
 import { DEFAULT_MAX_RECORDS, readHistoryFile } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
+import { rollupSessionTotals } from "./totals-aggregate.js";
+import { TOTALS_VERSION, resolveTotalsPath } from "./totals-storage.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
@@ -1635,19 +1638,30 @@ function hydrateHistoryState(store, diskRecords) {
     }
   }
 }
-async function reloadHistory(store, api, path, maxRecords, generation = store.historyGeneration) {
+async function reloadHistory(store, api, path, totalsPath, maxRecords, generation = store.historyGeneration) {
   if (store.disposed) return;
+  let diskRecords;
   try {
-    const diskRecords = (await readHistoryFile(path)).slice(-maxRecords);
-    if (store.disposed || generation !== store.historyGeneration) return;
-    store.diskRecords = diskRecords;
-    repairKnownParents(store);
-    hydrateHistoryState(store, store.diskRecords);
-    store.records = mergeHistoryLayers(store.diskRecords, store.optimistic, maxRecords, store.optimisticQuality, store.optimisticOrder);
-    store.bump();
+    diskRecords = (await readHistoryFile(path)).slice(-maxRecords);
   } catch (error) {
     warnWithToast(api, "history read failed", error);
+    return;
   }
+  if (store.disposed || generation !== store.historyGeneration) return;
+  let totalsLedger;
+  try {
+    totalsLedger = await readTotalsSnapshot(totalsPath);
+  } catch (error) {
+    if (store.disposed || generation !== store.historyGeneration) return;
+    warnWithToast(api, "totals read failed", error);
+  }
+  if (store.disposed || generation !== store.historyGeneration) return;
+  store.diskRecords = diskRecords;
+  if (totalsLedger) store.totalsLedger = totalsLedger;
+  repairKnownParents(store);
+  hydrateHistoryState(store, store.diskRecords);
+  store.records = mergeHistoryLayers(store.diskRecords, store.optimistic, maxRecords, store.optimisticQuality, store.optimisticOrder);
+  store.bump();
 }
 async function reloadActivity(store, api, path, generation = store.activityGeneration) {
   if (store.disposed) return;
@@ -1682,6 +1696,7 @@ function resolveOptions(value) {
   return {
     historyPath: readString(options?.historyPath),
     runsPath: readString(options?.runsPath),
+    totalsPath: readString(options?.totalsPath),
     maxRecords: maxRecordsValue !== undefined && maxRecordsValue > 0 ? Math.max(1, Math.floor(maxRecordsValue)) : DEFAULT_MAX_RECORDS,
     bytesPerToken: bytesPerTokenValue !== undefined && bytesPerTokenValue > 0 ? bytesPerTokenValue : DEFAULT_BYTES_PER_TOKEN,
     enabled: options?.enabled !== false
@@ -1708,6 +1723,7 @@ export function createRuntimeStore(maxRecords) {
       sessionRuntime: new Map(),
       taskRuns: new Map(),
       sessionParents: new Map(),
+      totalsLedger: emptyTotalsLedger(),
       lastCompletedBySession: new Map(),
       activityEvents: [],
       activityReplay: replayActivity([]),
@@ -1770,10 +1786,24 @@ export function formatCompactNumber(value) {
     scaled /= 1000;
     unitIndex += 1;
   }
-  const decimals = unitIndex === units.length - 1 ? 1 : scaled >= 100 ? 0 : 1;
-  let rendered = scaled.toFixed(decimals);
-  if (unitIndex < units.length - 1) rendered = rendered.replace(/\.0$/, "");
+  const decimals = unitIndex === 0 ? scaled >= 100 ? 0 : 1 : 1;
+  const divisors = [1_000, 1_000_000, 1_000_000_000];
+  const rendered = formatScaledUnit(absolute, divisors[unitIndex] ?? 1_000, decimals, unitIndex === 0);
   return `${sign}${rendered}${units[unitIndex]}`;
+}
+function formatScaledUnit(absolute, divisor, decimals, trimTrailingZero) {
+  let rendered;
+  if (decimals <= 0) {
+    rendered = String(Math.round(absolute / divisor));
+  } else {
+    const factor = 10 ** decimals;
+    const rounded = Math.round(absolute / (divisor / factor));
+    const whole = Math.trunc(rounded / factor);
+    const fraction = Math.abs(rounded % factor);
+    rendered = `${whole}.${String(fraction).padStart(decimals, "0")}`;
+  }
+  if (trimTrailingZero) rendered = rendered.replace(/\.0$/, "");
+  return rendered;
 }
 export function formatCompactRate(value) {
   return `${formatCompactNumber(value)} tok/s`;
@@ -2076,35 +2106,284 @@ function recordsForSession(records, sessionID, store) {
 function recentRecords(records, sessionID, store) {
   return recordsForSession(records, sessionID, store).slice().sort((left, right) => (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start)).slice(0, 24);
 }
-function childRows(records, aggregate, store) {
-  if (!aggregate) return [];
-  const rows = [];
-  const repairedRecords = recordsWithKnownParents(records, store);
-  const visit = (node, depth) => {
-    const directRecords = repairedRecords.filter(record => record.sessionID === node.sessionID);
-    const subtreeIDs = new Set();
-    const collectIDs = current => {
-      subtreeIDs.add(current.sessionID);
-      current.children.forEach(collectIDs);
-    };
-    collectIDs(node);
-    const subtreeRecords = repairedRecords.filter(record => subtreeIDs.has(record.sessionID));
-    const displayRecords = directRecords.length > 0 ? directRecords : subtreeRecords;
-    const directGenerated = generatedTokens(node.directTokens);
-    const responseCount = node.directResponseCount || node.responseCount;
-    const generated = node.directResponseCount > 0 ? directGenerated : generatedTokens(node.tokens);
-    const modelRecord = displayRecords.slice().sort((left, right) => (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start))[0];
-    rows.push({
-      depth,
-      sessionID: node.sessionID,
-      responseCount,
-      generated,
-      speed: aggregateSpeed(displayRecords),
-      model: modelRecord?.model ?? "-"
-    });
-    node.children.forEach(child => visit(child, depth + 1));
+const TOTALS_TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"];
+export function projectSessionTotals(ledger, records, parentBySessionID, sessionID) {
+  const projected = projectTotals(ledger, records, parentBySessionID);
+  return rollupSessionTotals(projected.sessions, projected.parents, sessionID);
+}
+function totalsForSession(store, sessionID) {
+  if (!sessionID) return undefined;
+  return projectSessionTotals(store.totalsLedger, store.records, store.sessionParents, sessionID);
+}
+function projectTotals(ledger, records, parentBySessionID) {
+  const unique = dedupeHistoryRecords(records);
+  return {
+    sessions: applyWindowAdjustments(ledger, unique),
+    parents: projectionParents(parentBySessionID, unique)
   };
-  aggregate.children.forEach(child => visit(child, 0));
+}
+function applyWindowAdjustments(ledger, records) {
+  const sessions = {};
+  for (const [sessionID, session] of Object.entries(ledger.sessions ?? {})) {
+    if (sessionID.length === 0 || !session) continue;
+    sessions[sessionID] = cloneDirectTotals(session);
+  }
+  const settled = ledger.settled ?? {};
+  const open = ledger.open ?? {};
+  for (const record of records) {
+    const settledValue = settled[record.messageID];
+    if (settledValue === true) continue;
+    const next = contributionNumbers(record);
+    if (!next) continue;
+    const previous = settledValue ?? open[record.messageID];
+    if (previous) {
+      const prior = openNumbers(previous);
+      if (!prior || sameContributionNumbers(prior, next)) continue;
+      if (prior.sessionID !== next.sessionID) {
+        subtractDirect(ensureDirect(sessions, prior.sessionID), prior.tokens, prior.cost);
+        addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost);
+      } else {
+        applyDirectDelta(ensureDirect(sessions, next.sessionID), prior.tokens, prior.cost, next.tokens, next.cost);
+      }
+      continue;
+    }
+    addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost);
+  }
+  return sessions;
+}
+function contributionNumbers(record) {
+  if (typeof record.sessionID !== "string" || record.sessionID.length === 0) return undefined;
+  return {
+    sessionID: record.sessionID,
+    tokens: normalizeTokenCounts(record.tokens),
+    cost: nonNegativeMetric(record.cost)
+  };
+}
+function openNumbers(contribution) {
+  if (typeof contribution?.sessionID !== "string" || contribution.sessionID.length === 0) return undefined;
+  return {
+    sessionID: contribution.sessionID,
+    tokens: normalizeTokenCounts(contribution.tokens),
+    cost: nonNegativeMetric(contribution.cost)
+  };
+}
+function sameContributionNumbers(left, right) {
+  return left.sessionID === right.sessionID && left.cost === right.cost && TOTALS_TOKEN_FIELDS.every(field => left.tokens[field] === right.tokens[field]);
+}
+function projectionParents(parentBySessionID, records) {
+  const parents = new Map();
+  for (const [sessionID, parent] of parentBySessionID) {
+    if (!isParentLink(sessionID, parent)) continue;
+    parents.set(sessionID, parent);
+  }
+  for (const record of records) {
+    if (parents.has(record.sessionID)) continue;
+    const parent = record.parentSessionID;
+    if (!isParentLink(record.sessionID, parent)) continue;
+    parents.set(record.sessionID, parent);
+  }
+  return parents;
+}
+function isParentLink(sessionID, parent) {
+  return typeof sessionID === "string" && sessionID.length > 0 && typeof parent === "string" && parent.length > 0 && parent !== sessionID;
+}
+function cloneDirectTotals(session) {
+  return {
+    tokens: normalizeTokenCounts(session.tokens),
+    cost: nonNegativeMetric(session.cost),
+    responseCount: nonNegativeMetric(session.responseCount)
+  };
+}
+function zeroDirectTotals() {
+  return {
+    tokens: emptyTokenCounts(),
+    cost: 0,
+    responseCount: 0
+  };
+}
+function ensureDirect(sessions, sessionID) {
+  const existing = sessions[sessionID];
+  if (existing) return existing;
+  const created = zeroDirectTotals();
+  sessions[sessionID] = created;
+  return created;
+}
+function addDirect(session, tokens, cost) {
+  session.tokens = clampTokenCounts(addTokenCounts(session.tokens, tokens));
+  session.cost = clampNonNegative(session.cost + cost);
+  session.responseCount = clampNonNegative(session.responseCount + 1);
+}
+function subtractDirect(session, tokens, cost) {
+  session.tokens = subtractTokenCounts(session.tokens, tokens);
+  session.cost = clampNonNegative(session.cost - cost);
+  session.responseCount = clampNonNegative(session.responseCount - 1);
+}
+function applyDirectDelta(session, previousTokens, previousCost, nextTokens, nextCost) {
+  const tokens = emptyTokenCounts();
+  for (const field of TOTALS_TOKEN_FIELDS) {
+    tokens[field] = clampNonNegative(session.tokens[field] + nextTokens[field] - previousTokens[field]);
+  }
+  session.tokens = tokens;
+  session.cost = clampNonNegative(session.cost + nextCost - previousCost);
+}
+function subtractTokenCounts(left, right) {
+  return {
+    input: clampNonNegative(left.input - right.input),
+    output: clampNonNegative(left.output - right.output),
+    reasoning: clampNonNegative(left.reasoning - right.reasoning),
+    cacheRead: clampNonNegative(left.cacheRead - right.cacheRead),
+    cacheWrite: clampNonNegative(left.cacheWrite - right.cacheWrite)
+  };
+}
+function clampTokenCounts(tokens) {
+  return {
+    input: clampNonNegative(tokens.input),
+    output: clampNonNegative(tokens.output),
+    reasoning: clampNonNegative(tokens.reasoning),
+    cacheRead: clampNonNegative(tokens.cacheRead),
+    cacheWrite: clampNonNegative(tokens.cacheWrite)
+  };
+}
+function clampNonNegative(value) {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return value;
+}
+function nonNegativeMetric(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  return value;
+}
+function totalsHaveUsage(totals) {
+  if (!totals) return false;
+  return totals.responseCount > 0 || totals.cost > 0 || totalTokens(totals.tokens) > 0;
+}
+function emptyTotalsLedger() {
+  return {
+    version: TOTALS_VERSION,
+    sessions: {},
+    open: {},
+    settled: {}
+  };
+}
+async function readTotalsSnapshot(path) {
+  // createTotalsStorage().read() keeps a process-local cache, so a ledger
+  // written by the server process would stay stale. Reload from disk instead.
+  let content;
+  try {
+    content = await readFile(path, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return emptyTotalsLedger();
+    throw error;
+  }
+  return coerceTotalsSnapshot(JSON.parse(content));
+}
+function coerceTotalsSnapshot(value) {
+  if (!isRecord(value) || value.version !== TOTALS_VERSION) {
+    throw new TypeError("Invalid totals ledger");
+  }
+  if (!isRecord(value.sessions) || !isRecord(value.open)) {
+    throw new TypeError("Invalid totals ledger");
+  }
+  const sessions = {};
+  for (const [sessionID, sessionValue] of Object.entries(value.sessions)) {
+    if (sessionID.length === 0) throw new TypeError("Invalid totals ledger");
+    sessions[sessionID] = coerceDirectTotals(sessionValue);
+  }
+  const open = {};
+  for (const [messageID, contribution] of Object.entries(value.open)) {
+    if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
+    open[messageID] = coerceOpenContribution(contribution);
+  }
+  return {
+    version: TOTALS_VERSION,
+    sessions,
+    open,
+    settled: coerceSettled(value.settled)
+  };
+}
+function coerceSettled(value) {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
+  const settled = {};
+  for (const [messageID, marker] of Object.entries(value)) {
+    if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
+    if (marker === true) {
+      settled[messageID] = true;
+      continue;
+    }
+    settled[messageID] = coerceOpenContribution(marker);
+  }
+  return settled;
+}
+function coerceDirectTotals(value) {
+  if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
+  return {
+    tokens: coerceTotalsTokens(value.tokens),
+    cost: requireNonNegative(value.cost),
+    responseCount: requireNonNegative(value.responseCount)
+  };
+}
+function coerceOpenContribution(value) {
+  if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
+  const sessionID = value.sessionID;
+  if (typeof sessionID !== "string" || sessionID.length === 0) {
+    throw new TypeError("Invalid totals ledger");
+  }
+  const quality = value.quality;
+  if (quality !== "provisional" && quality !== "exact") {
+    throw new TypeError("Invalid totals ledger");
+  }
+  return {
+    sessionID,
+    quality,
+    tokens: coerceTotalsTokens(value.tokens),
+    cost: requireNonNegative(value.cost)
+  };
+}
+function coerceTotalsTokens(value) {
+  if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
+  return {
+    input: requireNonNegative(value.input),
+    output: requireNonNegative(value.output),
+    reasoning: requireNonNegative(value.reasoning),
+    cacheRead: requireNonNegative(value.cacheRead),
+    cacheWrite: requireNonNegative(value.cacheWrite)
+  };
+}
+function requireNonNegative(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new TypeError("Invalid totals ledger");
+  }
+  return value;
+}
+function isNodeError(value) {
+  return value instanceof Error || isRecord(value);
+}
+function childRows(records, sessionID, store) {
+  if (!sessionID || !store) return [];
+  const projected = projectTotals(store.totalsLedger, records, store.sessionParents);
+  const root = rollupSessionTotals(projected.sessions, projected.parents, sessionID);
+  const rows = [];
+  const visited = new Set([sessionID]);
+  const append = (childID, depth) => {
+    if (visited.has(childID)) return;
+    visited.add(childID);
+    const rollup = rollupSessionTotals(projected.sessions, projected.parents, childID);
+    const directRecords = records.filter(record => record.sessionID === childID);
+    const show = directRecords.length > 0 || totalsHaveUsage(rollup.including);
+    if (show) {
+      const modelRecord = directRecords.slice().sort((left, right) => (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start))[0];
+      rows.push({
+        depth,
+        sessionID: childID,
+        responseCount: rollup.direct.responseCount || rollup.including.responseCount,
+        generated: rollup.direct.responseCount > 0 ? generatedTokens(rollup.direct.tokens) : generatedTokens(rollup.including.tokens),
+        speed: aggregateSpeed(directRecords),
+        model: modelRecord?.model ?? "-"
+      });
+    }
+    for (const child of rollup.children) append(child.sessionID, show ? depth + 1 : depth);
+  };
+  for (const child of root.children) append(child.sessionID, 0);
   return rows;
 }
 function activeStats(state, now, bytesPerToken) {
@@ -2217,9 +2496,10 @@ function Header(props) {
 function SummaryBlock(props) {
   const lines = createMemo(() => {
     props.store.revision();
+    const rollup = totalsForSession(props.store, props.sessionID);
     const aggregate = aggregateForSession(props.store.records, props.sessionID, props.store);
-    if (!aggregate) return emptySummaryLines();
-    return [...summaryLines("Session only", aggregate.directTokens, aggregate.directCost, aggregate.directResponseCount), ...summaryLines("Including subagents", aggregate.tokens, aggregate.cost, aggregate.responseCount)];
+    if (!rollup || !totalsHaveUsage(rollup.including) && !aggregate) return emptySummaryLines();
+    return [...summaryLines("Session only", rollup.direct.tokens, rollup.direct.cost, rollup.direct.responseCount), ...summaryLines("Including subagents", rollup.including.tokens, rollup.including.cost, rollup.including.responseCount)];
   });
   return (() => {
     var _el$17 = _$createElement("box"),
@@ -2364,48 +2644,35 @@ function BottomContent(props) {
     props.store.revision();
     return {
       aggregate: aggregateForSession(props.store.records, sessionID(), props.store),
-      records: props.store.records
+      records: props.store.records,
+      totals: totalsForSession(props.store, sessionID())
     };
   });
   const taskWallTime = createMemo(() => {
     props.store.revision();
     return taskWallTimeForSession(props.store, sessionID());
   });
-  const rows = createMemo(() => childRows(view().records, view().aggregate, props.store));
+  const rows = createMemo(() => childRows(view().records, sessionID(), props.store));
   const sections = createMemo(() => {
-    const aggregate = view().aggregate;
-    if (!aggregate) {
-      return [{
-        label: "SESSION ONLY",
-        tokens: emptyTokenCounts(),
-        cost: 0,
-        responseCount: 0
-      }, {
-        label: "INCLUDING SUBAGENTS",
-        tokens: emptyTokenCounts(),
-        cost: 0,
-        responseCount: 0
-      }];
-    }
+    const totals = view().totals;
     return [{
       label: "SESSION ONLY",
-      tokens: aggregate.directTokens,
-      cost: aggregate.directCost,
-      responseCount: aggregate.directResponseCount
+      tokens: totals?.direct.tokens ?? emptyTokenCounts(),
+      cost: totals?.direct.cost ?? 0,
+      responseCount: totals?.direct.responseCount ?? 0
     }, {
       label: "INCLUDING SUBAGENTS",
-      tokens: aggregate.tokens,
-      cost: aggregate.cost,
-      responseCount: aggregate.responseCount
+      tokens: totals?.including.tokens ?? emptyTokenCounts(),
+      cost: totals?.including.cost ?? 0,
+      responseCount: totals?.including.responseCount ?? 0
     }];
   });
   const pulseSummary = createMemo(() => {
     const currentView = view();
     const currentSessionID = sessionID();
-    const aggregate = currentView.aggregate;
     return {
-      tokens: aggregate?.tokens ?? emptyTokenCounts(),
-      speed: aggregate && currentSessionID ? aggregateSpeed(recordsForSession(currentView.records, currentSessionID)) : 0
+      tokens: currentView.totals?.including.tokens ?? emptyTokenCounts(),
+      speed: currentView.aggregate && currentSessionID ? aggregateSpeed(recordsForSession(currentView.records, currentSessionID)) : 0
     };
   });
   const metricLabel = createMemo(() => {
@@ -2475,7 +2742,7 @@ function BottomContent(props) {
           return props.api.theme;
         },
         section: section
-      }))), _$memo(() => _$memo(() => !!!view().aggregate)() && (() => {
+      }))), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
         var _el$41 = _$createElement("text");
         _$insertNode(_el$41, _$createTextNode(`No completed responses yet`));
         _$setProp(_el$41, "paddingTop", 1);
@@ -2578,6 +2845,10 @@ const tui = async (api, rawOptions) => {
   const store = createRuntimeStore(options.maxRecords);
   const historyPath = resolveHistoryPath(api, options.historyPath);
   const runsPath = resolveRunsPath(historyPath, options.runsPath);
+  const totalsPath = resolveTotalsPath({
+    historyPath,
+    totalsPath: options.totalsPath
+  });
   let disposed = false;
   let reloadTimer;
   let activityReloadTimer;
@@ -2591,7 +2862,7 @@ const tui = async (api, rawOptions) => {
     const run = async attempt => {
       if (disposed || generation !== reloadGeneration) return;
       reloadTimer = undefined;
-      await reloadHistory(store, api, historyPath, options.maxRecords, generation);
+      await reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, generation);
       if (!disposed && generation === reloadGeneration && attempt < 3 && store.optimistic.size > 0) {
         reloadTimer = setTimeout(() => {
           void run(attempt + 1);
@@ -2789,7 +3060,7 @@ const tui = async (api, rawOptions) => {
     store.disposeSignals();
   });
   store.historyGeneration += 1;
-  await Promise.all([reloadHistory(store, api, historyPath, options.maxRecords, store.historyGeneration), reloadActivity(store, api, runsPath, store.activityGeneration)]);
+  await Promise.all([reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, store.historyGeneration), reloadActivity(store, api, runsPath, store.activityGeneration)]);
 };
 const plugin = {
   id: "oc-tps",

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 import { server } from "../src/server.js";
 import { ActivityLedger } from "../src/runs-storage.js";
@@ -10,6 +10,33 @@ import { ActivityLedger } from "../src/runs-storage.js";
 async function readRecords(historyPath: string): Promise<any[]> {
   const content = await readFile(historyPath, "utf8");
   return content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+async function readTotals(historyPath: string): Promise<any> {
+  return JSON.parse(await readFile(join(dirname(historyPath), "totals.json"), "utf8"));
+}
+
+function assistantCompleted(
+  messageID: string,
+  tokens: { input?: number; output?: number; reasoning?: number },
+  timestamp: number,
+  cost = 1,
+  sessionID = "session",
+) {
+  return {
+    type: "message.updated",
+    timestamp,
+    properties: {
+      info: {
+        id: messageID,
+        sessionID,
+        role: "assistant",
+        cost,
+        time: { created: Math.max(0, timestamp - 50), completed: timestamp },
+        tokens,
+      },
+    },
+  };
 }
 
 async function readRunEvents(runsPath: string): Promise<any[]> {
@@ -524,6 +551,232 @@ test("completed response parent lookup is supplemental and persisted", async () 
       },
     } as never });
     assert.equal(lookupCalls, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a completed message writes direct usage into the sibling totals ledger", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    assert.ok(hooks.event);
+    await hooks.event({ event: assistantCompleted("message", {
+      input: 4,
+      output: 5,
+      reasoning: 1,
+    }, 200, 3) as never });
+
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.session.responseCount, 1);
+    assert.equal(totals.sessions.session.cost, 3);
+    assert.deepEqual(totals.sessions.session.tokens, {
+      input: 4,
+      output: 5,
+      reasoning: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+    assert.deepEqual((await readRecords(historyPath))[0]?.tokens, totals.sessions.session.tokens);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a second completion accumulates and a repeated message.updated does not double count", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    assert.ok(hooks.event);
+    const second = assistantCompleted("second", { input: 3, output: 1 }, 300, 2);
+    await hooks.event({ event: assistantCompleted("first", { input: 4, output: 5 }, 200, 3) as never });
+    await hooks.event({ event: second as never });
+
+    const accumulated = await readTotals(historyPath);
+    assert.equal(accumulated.sessions.session.responseCount, 2);
+    assert.equal(accumulated.sessions.session.cost, 5);
+    assert.deepEqual(accumulated.sessions.session.tokens, {
+      input: 7,
+      output: 6,
+      reasoning: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+
+    await hooks.event({ event: second as never });
+    const repeated = await readTotals(historyPath);
+    assert.equal(repeated.sessions.session.responseCount, 2);
+    assert.deepEqual(repeated.sessions.session.tokens, accumulated.sessions.session.tokens);
+    assert.equal(repeated.sessions.session.cost, accumulated.sessions.session.cost);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("history window eviction keeps settled usage in the cumulative ledger", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, {
+      historyPath,
+      maxRecords: 2,
+    });
+    assert.ok(hooks.event);
+    await hooks.event({ event: assistantCompleted("m1", { input: 10 }, 100, 1) as never });
+    await hooks.event({ event: assistantCompleted("m2", { input: 20 }, 200, 1) as never });
+    await hooks.event({ event: assistantCompleted("m3", { input: 40 }, 300, 1) as never });
+
+    const records = await readRecords(historyPath);
+    assert.equal(records.length, 2);
+    assert.deepEqual(records.map((record) => record.messageID), ["m2", "m3"]);
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.session.responseCount, 3);
+    assert.equal(totals.sessions.session.tokens.input, 70);
+    assert.equal(totals.sessions.session.cost, 3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("opening another server on the same directory does not change totals", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    assert.ok(hooks.event);
+    await hooks.event({ event: assistantCompleted("message", { input: 4, output: 5 }, 200, 3) as never });
+    const before = await readTotals(historyPath);
+
+    await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    const after = await readTotals(historyPath);
+    assert.deepEqual(after.sessions, before.sessions);
+    assert.deepEqual(after.open, before.open);
+    assert.deepEqual(after.settled, before.settled);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an idle provisional replaced by a smaller exact is not added twice", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    assert.ok(hooks.event);
+    await hooks.event({ event: {
+      type: "message.part.delta",
+      timestamp: 100,
+      properties: { sessionID: "session", messageID: "idle-fallback", delta: "x".repeat(55) },
+    } as never });
+    await hooks.event({ event: {
+      type: "session.idle",
+      timestamp: 200,
+      properties: { sessionID: "session" },
+    } as never });
+
+    const provisionalHistory = await readRecords(historyPath);
+    assert.equal(provisionalHistory[0]?.quality, "provisional");
+    const provisional = await readTotals(historyPath);
+    assert.equal(provisional.sessions.session.responseCount, 1);
+    assert.ok(provisional.sessions.session.tokens.output > 3);
+
+    await hooks.event({ event: {
+      type: "message.updated",
+      timestamp: 300,
+      properties: {
+        info: {
+          id: "idle-fallback",
+          sessionID: "session",
+          role: "assistant",
+          cost: 1,
+          time: { created: 100, completed: 300 },
+          tokens: { input: 2, output: 3, reasoning: 1, cache: { read: 0, write: 0 } },
+        },
+      },
+    } as never });
+
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.session.responseCount, 1);
+    assert.equal(totals.sessions.session.cost, 1);
+    assert.deepEqual(totals.sessions.session.tokens, {
+      input: 2,
+      output: 3,
+      reasoning: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+    const history = await readRecords(historyPath);
+    assert.equal(history.length, 1);
+    assert.equal(history[0]?.quality, "exact");
+    assert.deepEqual(history[0]?.tokens, totals.sessions.session.tokens);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a corrupt totals file is quarantined and rebuilt from the history window", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    assert.ok(hooks.event);
+    await hooks.event({ event: assistantCompleted("message", { input: 4, output: 5 }, 200, 3) as never });
+    await writeFile(join(directory, "totals.json"), "{not-json", "utf8");
+
+    await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+
+    const quarantined = (await readdir(directory)).filter((name) => name.includes(".corrupt-"));
+    assert.equal(quarantined.length, 1);
+    assert.match(quarantined[0] ?? "", /^totals\.json\.corrupt-\d+/);
+    assert.equal(await readFile(join(directory, quarantined[0] ?? ""), "utf8"), "{not-json");
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.session.tokens.input, 4);
+    assert.equal(totals.sessions.session.tokens.output, 5);
+    assert.equal(totals.sessions.session.responseCount, 1);
+    assert.equal(totals.sessions.session.cost, 3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an idle totals write failure keeps the active state for a later retry", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
+  const historyPath = join(directory, "history.jsonl");
+  const totalsPath = join(directory, "totals.json");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    assert.ok(hooks.event);
+    await rm(totalsPath);
+    await mkdir(totalsPath);
+
+    await hooks.event({ event: {
+      type: "message.part.delta",
+      timestamp: 100,
+      properties: { sessionID: "session", messageID: "idle-retry", delta: "x".repeat(55) },
+    } as never });
+    await hooks.event({ event: {
+      type: "session.idle",
+      timestamp: 200,
+      properties: { sessionID: "session" },
+    } as never });
+
+    const provisional = await readRecords(historyPath);
+    assert.equal(provisional.length, 1);
+    assert.equal(provisional[0]?.quality, "provisional");
+
+    await rm(totalsPath, { recursive: true, force: true });
+    await hooks.event({ event: {
+      type: "session.idle",
+      timestamp: 300,
+      properties: { sessionID: "session" },
+    } as never });
+
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.session.responseCount, 1);
+    assert.ok(totals.sessions.session.tokens.output > 0);
+    assert.equal((await readRecords(historyPath)).length, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
