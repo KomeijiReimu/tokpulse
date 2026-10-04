@@ -98,12 +98,16 @@ Coverage shows the responses and tokens with measurements. Older data may lack
 the timing needed for one or both averages, so historical coverage can be partial.
 An average is unavailable when there is no usable measurement.
 
+Expand Token Pulse to see the current agent's average TPS under `SESSION ONLY`.
+
 Live speed estimates token arrivals. It needs at least **1 second** and **two
 distinct observation timestamps**; until then, the display shows `WARMUP`.
 
 Open details with `/tps-details`, **Token Pulse details** in the command palette,
-or the default `Ctrl+Shift+Y`. The view captures the current session's scope when
-opened. Press `Esc` or `Ctrl+C` to close. `/tps` and `Ctrl+Shift+T` open history.
+or the default `Ctrl+Shift+Y`. The view covers the session where it was opened and
+its known descendant agents. Select an agent to inspect its own usage and averages;
+a separate summary covers the entire tree. Press `Esc` or `Ctrl+C` to close.
+`/tps` and `Ctrl+Shift+T` open history.
 
 Customize the details shortcut in the TUI plugin's tuple options:
 

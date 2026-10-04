@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
-import type { MouseEvent } from "@opentui/core";
+import type { MouseEvent, ScrollBoxRenderable, SelectRenderable } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
 import { createBindingLookup, type BindingConfig, type BindingValue } from "@opencode-ai/plugin/tui";
 import type {
@@ -3511,20 +3511,64 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
   // another bottom row rather than budgeting against the whole terminal.
   const contentHeight = () => Math.max(1, dimensions().height - Math.ceil(dimensions().height / 4) - 2);
   const compact = () => dimensions().height < 24;
-  const details = createMemo(() => {
+  const [selectedID, setSelectedID] = createSignal(props.sessionID);
+  let selector: SelectRenderable | undefined;
+  let body: ScrollBoxRenderable | undefined;
+  const tree = createMemo(() => {
     props.store.revision();
-    const direct = totalsForSession(props.store, props.sessionID)?.direct ?? zeroDirectTotals();
-    const average = getSessionAverageSummary(direct);
-    const last = props.store.lastCompletedBySession.get(props.sessionID);
-    return { direct, average, last };
+    const parents = new Map(props.store.sessionParents);
+    const candidates = new Set([props.sessionID, ...Object.keys(props.store.totalsLedger.sessions), ...parents.keys(),
+      ...baseHistoryRecords(props.store).map((record) => record.sessionID), ...Array.from(props.store.active.values(), (state) => state.sessionID)]);
+    // Cached metadata only: do not fetch children or wait on the server.
+    for (const id of candidates) {
+      try {
+        const parent = props.api.state.session.get(id)?.parentID;
+        if (isParentLink(id, parent)) { parents.set(id, parent); candidates.add(parent); }
+      } catch { /* State may still be syncing; keep the known parent map. */ }
+    }
+    return buildSessionDetailsTree(props.store, props.sessionID, parents);
   });
+  const details = createMemo(() => selectSessionDetails(tree(), selectedID(), props.store.lastCompletedBySession));
+  const sessionTitle = (id: string): string | undefined => {
+    try { return props.api.state.session.get(id)?.title; } catch { return undefined; }
+  };
+  const options = createMemo(() => tree().nodes.map((node) => ({
+    name: `${"  ".repeat(Math.min(node.depth, 4))}${sessionTitle(node.sessionID) || shortTail(node.sessionID, 24)}${node.sessionID === props.sessionID ? " (current)" : ""}`,
+    description: "", value: node.sessionID,
+  })), undefined, { equals: (before, after) => before.length === after.length && before.every((option, index) => option.name === after[index].name && option.value === after[index].value) });
+  const choose = (id: unknown): void => {
+    if (typeof id !== "string" || !tree().nodes.some((node) => node.sessionID === id)) return;
+    if (id === selectedID()) return;
+    setSelectedID(id);
+    body?.scrollTo(0);
+  };
   const theme = props.api.theme.current;
   return (
     <box flexDirection="column" paddingX={dimensions().width < 50 ? 1 : 2} paddingY={compact() ? 0 : 1} width="100%" height={contentHeight()} flexShrink={0} overflow="hidden">
       <text fg={theme.primary} flexShrink={0}>Token Pulse details</text>
-      <text fg={theme.textMuted} flexShrink={0} wrapMode="word">{`Session ${props.sessionID} · this session only; no subagents`}</text>
-      <scrollbox flexGrow={1} flexShrink={1} minHeight={0} paddingTop={1} focusable scrollY scrollX={false} viewportOptions={{ minHeight: 0, overflow: "hidden" }} contentOptions={{ flexDirection: "column", flexShrink: 0 }} ref={(scroll) => onMount(() => scroll.focus())}>
+      <text fg={theme.textMuted} flexShrink={0} wrapMode="word">{`Scope ${props.sessionID} + descendants`}</text>
+      {tree().nodes.length > 1 && <box flexDirection="column" flexShrink={0}>
+        <text fg={theme.accent}>{`SESSION TREE · ${tree().nodes.length} sessions`}</text>
+        <select height={Math.min(tree().nodes.length, compact() ? 2 : 3)} flexShrink={0}
+          options={options()} selectedIndex={Math.max(0, tree().nodes.findIndex((node) => node.sessionID === details().sessionID))}
+          showDescription={false} showScrollIndicator wrapSelection={false} itemSpacing={0}
+          textColor={theme.text} backgroundColor={theme.backgroundPanel} focusedBackgroundColor={theme.backgroundPanel}
+          selectedBackgroundColor={theme.backgroundElement} selectedTextColor={theme.accent}
+          onChange={(_index, option) => choose(option?.value)} onSelect={(_index, option) => { choose(option?.value); body?.focus(); }}
+          onKeyDown={(key) => { if (key.name === "tab") { key.preventDefault(); key.stopPropagation(); body?.focus(); } }}
+          ref={(node) => { selector = node; onMount(() => node.focus()); }} />
+        <box flexDirection="row" height={1} flexShrink={0}>
+          <text fg={theme.accent} onMouseDown={() => { selector?.focus(); selector?.moveUp(); }}>[prev]</text>
+          <text fg={theme.textMuted}> </text>
+          <text fg={theme.accent} onMouseDown={() => { selector?.focus(); selector?.moveDown(); }}>[next]</text>
+          <text fg={theme.textMuted}> · ↑/↓ · Enter/Tab</text>
+        </box>
+      </box>}
+      <scrollbox flexGrow={1} flexShrink={1} minHeight={0} paddingTop={compact() ? 0 : 1} focusable scrollY scrollX={false} viewportOptions={{ minHeight: 0, overflow: "hidden" }} contentOptions={{ flexDirection: "column", flexShrink: 0 }} onKeyDown={(key) => { if (key.name === "tab" && selector) { key.preventDefault(); key.stopPropagation(); selector.focus(); } }} ref={(scroll) => { body = scroll; onMount(() => { if (tree().nodes.length === 1) scroll.focus(); }); }}>
         <box flexDirection="column" flexShrink={0} width="100%">
+        <text fg={theme.accent}>SELECTED SESSION · direct only</text>
+        <text fg={theme.textMuted} wrapMode="word">{`${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`}</text>
+        {details().direct.responseCount === 0 && <text fg={theme.textMuted} wrapMode="word">No recorded usage for this session</text>}
         <text fg={theme.accent}>SESSION AVERAGES</text>
         <text fg={theme.text} wrapMode="word">{`Generation avg TPS  ${formatAverageRate(details().average.generation)}`}</text>
         <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.generation, details().average)}</text>
@@ -3535,8 +3579,18 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
         <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map((metric) => [metric])} />
         <text fg={theme.accent} paddingTop={1}>LAST RESPONSE</text>
         <text fg={theme.text} wrapMode="word">{details().last
-          ? `${details().last!.estimated ? "~" : ""}${formatCompactRate(details().last!.rate)} (${details().last!.record.speed?.generation ? "generation" : "response"}) · TTFT ${formatOptionalDuration(details().last!.ttft)} · elapsed ${formatDuration(details().last!.elapsed)}`
+          ? `${details().lastSpeed!.estimated ? "~" : ""}${formatCompactRate(details().lastSpeed!.avg)} (${details().lastSpeed!.basis}) · TTFT ${formatOptionalDuration(details().last!.ttft)} · response time ${formatOptionalDuration(durationOf(details().last!.record))}`
           : "No completed response in the loaded history"}</text>
+        {details().last?.record.model && <text fg={theme.textMuted} wrapMode="word">{`Last model: ${details().last!.record.model}`}</text>}
+        {tree().nodes.length > 1 ? <>
+          <text fg={theme.accent} paddingTop={1}>INCLUDING SUBAGENTS · entire scope</text>
+          <text fg={theme.textMuted} wrapMode="word">Measured token/time sums, not wall-clock throughput. Includes every descendant once.</text>
+          <text fg={theme.text} wrapMode="word">{`Generation avg TPS  ${formatAverageRate(tree().average.generation)}`}</text>
+          <text fg={theme.textMuted} wrapMode="word">{averageCoverage(tree().average.generation, tree().average)}</text>
+          <text fg={theme.text} wrapMode="word">{`Response avg TPS  ${formatAverageRate(tree().average.response)}`}</text>
+          <text fg={theme.textMuted} wrapMode="word">{averageCoverage(tree().average.response, tree().average)}</text>
+          <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map((metric) => [metric])} />
+        </> : <text fg={theme.textMuted} paddingTop={1} wrapMode="word">No known subagents in this scope</text>}
         <text fg={theme.textMuted} paddingTop={1} wrapMode="word">Average = measured generated tokens / measured time, not an average of call speeds. Generated tokens include output and reasoning; input and cache are excluded.</text>
         <text fg={theme.textMuted} wrapMode="word">~ means estimated. Coverage shows which calls have usable timing; older calls may have none. Live speed uses observed stream samples, not exact model usage.</text>
         </box>
@@ -3544,6 +3598,54 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
       <text fg={theme.textMuted} paddingTop={compact() ? 0 : 1} flexShrink={0}>esc / ctrl+c to close</text>
     </box>
   );
+}
+
+export interface SessionDetailsNode {
+  sessionID: string;
+  depth: number;
+  direct: SessionDirectTotals;
+  average: SessionAverageSummary;
+}
+
+export interface SessionDetailsTree {
+  rootID: string;
+  nodes: SessionDetailsNode[];
+  including: SessionDirectTotals;
+  average: SessionAverageSummary;
+}
+
+/** Read-only UI selection: keep ledger-only descendants, and visit cycles once. */
+export function buildSessionDetailsTree(store: RuntimeStore, rootID: string, parents: ReadonlyMap<string, string> = store.sessionParents): SessionDetailsTree {
+  const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER,
+    store.optimisticQuality, store.optimisticOrder);
+  const projected = projectTotals(store.totalsLedger, contributions, parents);
+  const children = new Map<string, string[]>();
+  for (const [id, parent] of projected.parents) {
+    const siblings = children.get(parent) ?? [];
+    siblings.push(id);
+    children.set(parent, siblings);
+  }
+  const nodes: SessionDetailsNode[] = [];
+  const visited = new Set<string>();
+  const pending = [{ sessionID: rootID, depth: 0 }];
+  while (pending.length) {
+    const node = pending.pop()!;
+    if (visited.has(node.sessionID)) continue;
+    visited.add(node.sessionID);
+    const direct = Object.prototype.hasOwnProperty.call(projected.sessions, node.sessionID)
+      ? projected.sessions[node.sessionID] : zeroDirectTotals();
+    nodes.push({ ...node, direct, average: getSessionAverageSummary(direct) });
+    const descendants = (children.get(node.sessionID) ?? []).slice().sort().reverse();
+    for (const sessionID of descendants) pending.push({ sessionID, depth: node.depth + 1 });
+  }
+  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID).including;
+  return { rootID, nodes, including, average: getSessionAverageSummary(including) };
+}
+
+export function selectSessionDetails(tree: SessionDetailsTree, sessionID: string, lastBySession: ReadonlyMap<string, LastCompletedSnapshot>) {
+  const node = tree.nodes.find((item) => item.sessionID === sessionID) ?? tree.nodes[0];
+  const last = lastBySession.get(node.sessionID);
+  return { ...node, last, lastSpeed: last ? recordSpeedSummary(last.record) : undefined };
 }
 
 export function createDetailsController(api: TuiPluginApi, store: RuntimeStore) {
@@ -4307,11 +4409,6 @@ function BottomContent(props: {
           {expanded() ? "- Token Pulse" : "+ Token Pulse"}
         </text>
       </box>
-      <box flexDirection="column" width="100%" paddingX={1} flexShrink={0}>
-        <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().label}</text>
-        <text fg={props.api.theme.current.accent} wrapMode="word" flexShrink={0}>{average().value}</text>
-        {average().coverage && <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().coverage}</text>}
-      </box>
       <text fg={props.api.theme.current.textMuted} width="100%" paddingX={1} truncate wrapMode="none">
         {metricLabel()}
       </text>
@@ -4324,9 +4421,14 @@ function BottomContent(props: {
           <text fg={props.api.theme.current.secondary} paddingTop={1} truncate wrapMode="none">
             session {shortTail(sessionID(), 18)}
           </text>
-          {sections().map((section) => (
+          {sections().map((section, index) => (<>
             <PulseSection theme={props.api.theme} section={section} />
-          ))}
+            {index === 0 && <box flexDirection="column" width="100%" paddingX={1} flexShrink={0}>
+              <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().label}</text>
+              <text fg={props.api.theme.current.accent} wrapMode="word" flexShrink={0}>{average().value}</text>
+              {average().coverage && <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().coverage}</text>}
+            </box>}
+          </>))}
           {!view().aggregate && !totalsHaveUsage(view().totals?.including) && (
             <text fg={props.api.theme.current.textMuted} paddingTop={1} truncate wrapMode="none">
               No completed responses yet

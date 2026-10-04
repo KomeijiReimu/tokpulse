@@ -89,11 +89,14 @@ bun run build
 覆盖情况（coverage）显示有测量数据的响应和 token。旧数据可能缺少一种或两种平均速度
 所需的时间信息，因此历史覆盖可能不完整。没有可用测量数据时，平均速度显示为不可用。
 
+展开 Token Pulse 后，可在 `SESSION ONLY` 用量区域查看当前 agent 的平均 TPS。
+
 实时速度估算 token 到达速率，需要至少 **1 秒**的观察时长和**两个不同时间点**的观测；
 在此之前显示 `WARMUP`。
 
 用 `/tps-details`、命令面板中的 **Token Pulse details** 或默认的 `Ctrl+Shift+Y`
-打开详情。视图以打开时的当前会话范围为快照。按 `Esc` 或 `Ctrl+C` 关闭。
+打开详情。窗口包含打开时的当前会话及已识别的全部子孙 agent，可选择各 agent
+查看其自身用量和平均速度，并查看整棵会话树的独立汇总。按 `Esc` 或 `Ctrl+C` 关闭。
 `/tps` 和 `Ctrl+Shift+T` 仍用于打开历史视图。
 
 在 `tui.json` 的插件配置选项中自定义详情快捷键：

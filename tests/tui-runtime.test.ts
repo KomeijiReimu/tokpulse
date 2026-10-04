@@ -53,6 +53,8 @@ import {
   sessionAverageDisplay,
   sessionUsageSummary,
   tokenPulseBindings,
+  buildSessionDetailsTree,
+  selectSessionDetails,
 } from "../src/tui.js";
 import { emptySpeedTotals, updateSpeedTotals } from "../src/statistics.js";
 
@@ -1236,6 +1238,75 @@ test("main average uses cumulative direct speed, excluding children and the deta
   assert.equal(sessionUsageSummary(reloaded, "root").generation.rate, 60);
   store.disposeSignals();
   reloaded.disposeSignals();
+});
+
+test("details tree retains ledger-only child/grandchild and selects their own direct average and last response", () => {
+  const store = createRuntimeStore(1);
+  const direct = (output: number, reasoning: number, generationMs: number, responseMs: number, cost: number) => ({
+    tokens: tokens(output, reasoning), cost, responseCount: 1,
+    speed: updateSpeedTotals(emptySpeedTotals(), {
+      generation: { generatedTokens: output + reasoning, durationMs: generationMs, estimated: false },
+      response: { generatedTokens: output + reasoning, durationMs: responseMs, estimated: false },
+    }, 1),
+  });
+  store.totalsLedger.sessions = { root: direct(80, 20, 1000, 2000, 1), child: direct(550, 50, 2000, 3000, 2),
+    grand: direct(30, 0, 3000, 6000, 3), unrelated: direct(999, 0, 1, 1, 99) };
+  store.sessionParents = new Map([["child", "root"], ["grand", "child"]]);
+  store.lastCompletedBySession.set("root", makeLastCompletedSnapshot(record("root-last", "root", 80, 20)));
+  store.lastCompletedBySession.set("child", makeLastCompletedSnapshot(record("child-last", "child", 550, 50,
+    { model: "known-child-model", time: { start: 0, firstToken: 222, completed: 3000 },
+      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false } } })));
+  store.lastCompletedBySession.set("grand", makeLastCompletedSnapshot(record("grand-last", "grand", 30, 0)));
+  const before = structuredClone(store.totalsLedger);
+  const tree = buildSessionDetailsTree(store, "root");
+  assert.deepEqual(tree.nodes.map((node) => [node.sessionID, node.depth]), [["root", 0], ["child", 1], ["grand", 2]]);
+  assert.equal(store.records.length, 0); // All three survive an empty trimmed detail window.
+  assert.deepEqual(tree.nodes.map((node) => node.average.generation.rate), [100, 300, 10]);
+  assert.equal(tree.average.totalGeneratedTokens, 730);
+  assert.equal(tree.including.responseCount, 3);
+  assert.equal(tree.including.cost, 6);
+  assert.equal(tree.including.tokens.input, 30);
+  assert.equal(tree.including.tokens.cacheRead, 6);
+  assert.equal(tree.average.generation.rate, 730000 / 6000);
+  assert.equal(tree.average.response.rate, 730000 / 11000);
+  assert.notEqual(tree.average.generation.rate, (100 + 300 + 10) / 3);
+  const child = selectSessionDetails(tree, "child", store.lastCompletedBySession);
+  assert.equal(child.average.generation.rate, 300);
+  assert.equal(child.average.response.rate, 200);
+  assert.equal(child.direct.tokens.output, 550);
+  assert.equal(child.direct.tokens.reasoning, 50);
+  assert.equal(child.last?.record.messageID, "child-last");
+  assert.equal(child.last?.record.model, "known-child-model");
+  assert.equal(child.last?.ttft, 222);
+  assert.equal(child.lastSpeed?.avg, 300);
+  assert.equal(child.lastSpeed?.basis, "generation");
+  assert.equal(child.lastSpeed?.estimated, false);
+  assert.equal(selectSessionDetails(tree, "grand", store.lastCompletedBySession).last?.record.messageID, "grand-last");
+  assert.equal(selectSessionDetails(tree, "unrelated", store.lastCompletedBySession).sessionID, "root");
+  const childScope = buildSessionDetailsTree(store, "child");
+  assert.deepEqual(childScope.nodes.map((node) => node.sessionID), ["child", "grand"]);
+  assert.equal(childScope.average.totalGeneratedTokens, 630);
+  assert.deepEqual(store.totalsLedger, before); // UI selection never writes the ledger.
+  store.disposeSignals();
+});
+
+test("details tree traverses empty intermediate parents, visits cycles once and handles empty/no-child scopes", () => {
+  const store = createRuntimeStore(1);
+  store.totalsLedger.sessions.child = { tokens: tokens(12, 3), cost: 1, responseCount: 1 };
+  store.sessionParents = new Map([["middle", "root"], ["child", "middle"], ["root", "child"], ["self", "self"]]);
+  const tree = buildSessionDetailsTree(store, "root");
+  assert.deepEqual(tree.nodes.map((node) => [node.sessionID, node.depth]), [["root", 0], ["middle", 1], ["child", 2]]);
+  assert.equal(tree.average.totalGeneratedTokens, 15);
+  assert.equal(tree.including.responseCount, 1);
+  assert.equal(tree.nodes[1].average.generation.available, false);
+  assert.equal(selectSessionDetails(tree, "middle", store.lastCompletedBySession).last, undefined);
+  const empty = buildSessionDetailsTree(store, "empty");
+  assert.deepEqual(empty.nodes.map((node) => node.sessionID), ["empty"]);
+  assert.equal(empty.including.responseCount, 0);
+  assert.equal(empty.average.generation.available, false);
+  assert.equal(empty.average.totalGeneratedTokens, 0);
+  assert.equal(buildSessionDetailsTree(store, "self").nodes.length, 1);
+  store.disposeSignals();
 });
 
 test("main average uses ratio of cumulative sums and identifies partial estimated timing", () => {

@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable } from "@opentui/core";
+import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable, TextRenderable } from "@opentui/core";
 import { testRender, useRenderer } from "@opentui/solid";
 import type { JSX } from "@opentui/solid";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
@@ -67,17 +67,17 @@ if (!nativeChild) {
     ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /3 pass/);
+    assert.match(output.stderr + output.stdout, /4 pass/);
   });
 }
 
 if (nativeChild) {
-test("native sidebar keeps the cumulative main average visible while collapsed and narrow", async () => {
+test("native sidebar stays compact when collapsed and shows direct average only in expanded SESSION ONLY", async () => {
   const ui = (await uiPromise)!;
   for (const width of [80, 24, 18]) {
     const store = ui.createRuntimeStore(1);
     store.totalsLedger.sessions.root = {
-      tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 1,
+      tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
       speed: updateSpeedTotals(emptySpeedTotals(), { response: { generatedTokens: 120, durationMs: 2000, estimated: true } }, 1),
     };
     const api = host(width, 45);
@@ -88,10 +88,9 @@ test("native sidebar keeps the cumulative main average visible while collapsed a
       await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
       assert.match(frame, /\+ Token Pulse/);
-      assert.match(frame, /Main avg TPS/);
-      assert.match(frame, /~60 tok\/s/);
-      assert.match(frame, /\(\s*response\)/);
+      assert.doesNotMatch(frame, /(?:Main|Session) avg TPS|Measured|~60 tok\/s/);
       assert.doesNotMatch(frame, /SESSION ONLY/);
+      assert.ok(rendered.renderer.root.getChildren()[0].height <= 3, `${width}: collapsed sidebar must stay three rows`);
       assert.equal(store.pulseExpanded, false);
       ui.togglePulse(store);
       await rendered.renderOnce();
@@ -99,6 +98,10 @@ test("native sidebar keeps the cumulative main average visible while collapsed a
       assert.match(rendered.captureCharFrame(), /SESSION ONLY/);
       assert.match(rendered.captureCharFrame(), /Main avg TPS/);
       assert.match(rendered.captureCharFrame(), /~60 tok\/s/);
+      assert.match(rendered.captureCharFrame(), /Measured 1\/2/);
+      assert.ok(rendered.captureCharFrame().indexOf("SESSION ONLY") < rendered.captureCharFrame().indexOf("Main avg TPS"));
+      const includingPosition = rendered.captureCharFrame().indexOf("INCLUDING SUBAGENTS");
+      if (includingPosition !== -1) assert.ok(rendered.captureCharFrame().indexOf("Main avg TPS") < includingPosition);
     } finally {
       rendered.renderer.destroy();
       store.disposeSignals();
@@ -197,6 +200,108 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     rendered.renderer.destroy();
     store.disposeSignals();
   }
+  }
+});
+
+test("native session-tree selector switches direct details, retains ledger-only nodes and leaves footer fixed", async () => {
+  const ui = (await uiPromise)!;
+  for (const [width, height] of [[110, 40], [80, 24], [40, 16]]) {
+    const store = ui.createRuntimeStore(1);
+    const scope = "scope-session-with-long-id";
+    const makeDirect = (generated: number, generationMs: number, responseMs: number) => ({
+      tokens: { input: 10, output: generated, reasoning: 0, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 1,
+      speed: updateSpeedTotals(emptySpeedTotals(), {
+        generation: { generatedTokens: generated, durationMs: generationMs, estimated: false },
+        response: { generatedTokens: generated, durationMs: responseMs, estimated: false },
+      }, 1),
+    });
+    store.totalsLedger.sessions = { [scope]: makeDirect(100, 1000, 2000), child: makeDirect(600, 2000, 3000),
+      grand: makeDirect(30, 3000, 6000), unrelated: makeDirect(9000, 1, 1) };
+    store.sessionParents = new Map([["child", scope], ["grand", "child"]]);
+    for (let i = 0; i < 35; i++) store.sessionParents.set(`zz-${String(i).padStart(2, "0")}`, scope);
+    store.lastCompletedBySession.set("child", ui.makeLastCompletedSnapshot({
+      version: 1, messageID: "child-last", sessionID: "child", model: "known-child-model",
+      tokens: store.totalsLedger.sessions.child.tokens, cost: 1,
+      time: { start: 0, firstToken: 222, completed: 3000 }, samples: [],
+      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false } },
+    }));
+    const api = host(width, height);
+    api.state = { session: { get: (id: string) => ({ title: id === scope ? "Main work" : id === "child" ? "Child work" : id === "grand" ? "Grand work" : undefined }) } } as unknown as TuiPluginApi["state"];
+    let content: Renderable;
+    const rendered = await testRender(() => {
+      const renderer = useRenderer();
+      api.renderer = renderer;
+      const backdrop = new BoxRenderable(renderer, { width, height, alignItems: "center", paddingTop: height / 4 });
+      const panel = new BoxRenderable(renderer, { width: 88, maxWidth: width - 2, paddingTop: 1 });
+      content = ui.TokenPulseDetails({ api, store, sessionID: scope }) as unknown as Renderable;
+      panel.add(content); backdrop.add(panel);
+      return backdrop as unknown as JSX.Element;
+    }, { width, height });
+    try {
+      await rendered.renderOnce();
+      const children = content!.getChildren();
+      const fixed = children.flatMap((node) => [node, ...node.getChildren()]);
+      const selector = fixed.find((node) => node instanceof SelectRenderable) as SelectRenderable;
+      const scroll = children.find((node) => node instanceof ScrollBoxRenderable) as ScrollBoxRenderable;
+      const footer = children.at(-1)!;
+      assert.ok(selector && scroll);
+      assert.equal(selector.options.length, 38);
+      assert.equal(selector.getSelectedOption()?.value, scope);
+      assert.equal(selector.options.some((option) => option.value === "unrelated"), false);
+      assert.equal(selector.focused, true);
+      assert.ok(scroll.viewport.height > 0);
+      assert.ok(scroll.viewport.y + scroll.viewport.height <= footer.y);
+      assert.ok(footer.y + footer.height <= height - 1);
+      assert.match(rendered.captureCharFrame(), /Token Pulse details/);
+      assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
+      if (width === 110) assert.match(rendered.captureCharFrame(), /Generation avg TPS\s+100 tok\/s/);
+      rendered.mockInput.pressArrow("down");
+      await rendered.renderOnce();
+      assert.equal(selector.getSelectedOption()?.value, "child");
+      store.bump(); await rendered.renderOnce();
+      assert.equal(selector.getSelectedOption()?.value, "child", "usage refresh must retain the selected session");
+      store.sessionParents.set("aaa-new-child", scope);
+      store.bump(); await rendered.renderOnce();
+      assert.equal(selector.getSelectedOption()?.value, "child", "a newly inserted sibling must not change the selected ID");
+      let selectedFrames = "";
+      const footerY = footer.y;
+      const titleY = children[0].y;
+      for (let offset = 0; offset <= scroll.scrollHeight; offset += Math.max(1, scroll.viewport.height - 1)) {
+        scroll.scrollTo(offset); await rendered.renderOnce();
+        selectedFrames += rendered.captureCharFrame();
+        assert.equal(footer.y, footerY);
+        assert.equal(children[0].y, titleY);
+      }
+      assert.match(selectedFrames, /Generation avg TPS\s+300 tok\/s/);
+      assert.match(selectedFrames, /Response avg TPS\s+200 tok\/s/);
+      assert.match(selectedFrames, /known-child-model/);
+      assert.match(selectedFrames, /222ms/);
+      assert.match(selectedFrames, /300 tok\/s \(generation\)/);
+      assert.match(selectedFrames, /INCLUDING SUBAGENTS/);
+      assert.match(selectedFrames, /730/);
+      assert.match(selectedFrames.replace(/[█▀▄]/g, ""), /not\s+wall-\s*clock/);
+      scroll.scrollTo(scroll.scrollHeight); await rendered.renderOnce();
+      assert.match(rendered.captureCharFrame(), /model usage\./);
+      assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
+      const next = fixed.flatMap((node) => [node, ...node.getChildren()]).find((node) => node instanceof TextRenderable && node.plainText === "[next]")!;
+      await rendered.mockMouse.click(next.x, next.y);
+      await rendered.renderOnce();
+      assert.equal(selector.getSelectedOption()?.value, "grand");
+      assert.equal(scroll.scrollTop, 0, "selecting another session resets its detail scroll");
+      rendered.mockInput.pressTab(); await rendered.renderOnce();
+      assert.equal(scroll.focused, true);
+      rendered.mockInput.pressTab(); await rendered.renderOnce();
+      assert.equal(selector.focused, true);
+      rendered.mockInput.pressEnter(); await rendered.renderOnce();
+      assert.equal(scroll.focused, true);
+      rendered.mockInput.pressTab(); await rendered.renderOnce();
+      assert.equal(selector.focused, true);
+      selector.moveDown(1000); await rendered.renderOnce();
+      assert.equal(selector.getSelectedOption()?.value, "zz-34");
+      assert.match(rendered.captureCharFrame(), /zz-34/);
+      assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
+      assert.equal(store.records.length, 0);
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
   }
 });
 

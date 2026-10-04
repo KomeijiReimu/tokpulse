@@ -1,5 +1,5 @@
-import { memo as _$memo } from "@opentui/solid";
 import { use as _$use } from "@opentui/solid";
+import { memo as _$memo } from "@opentui/solid";
 import { createTextNode as _$createTextNode } from "@opentui/solid";
 import { createComponent as _$createComponent } from "@opentui/solid";
 import { effect as _$effect } from "@opentui/solid";
@@ -2360,17 +2360,46 @@ export function TokenPulseDetails(props) {
   // another bottom row rather than budgeting against the whole terminal.
   const contentHeight = () => Math.max(1, dimensions().height - Math.ceil(dimensions().height / 4) - 2);
   const compact = () => dimensions().height < 24;
-  const details = createMemo(() => {
+  const [selectedID, setSelectedID] = createSignal(props.sessionID);
+  let selector;
+  let body;
+  const tree = createMemo(() => {
     props.store.revision();
-    const direct = totalsForSession(props.store, props.sessionID)?.direct ?? zeroDirectTotals();
-    const average = getSessionAverageSummary(direct);
-    const last = props.store.lastCompletedBySession.get(props.sessionID);
-    return {
-      direct,
-      average,
-      last
-    };
+    const parents = new Map(props.store.sessionParents);
+    const candidates = new Set([props.sessionID, ...Object.keys(props.store.totalsLedger.sessions), ...parents.keys(), ...baseHistoryRecords(props.store).map(record => record.sessionID), ...Array.from(props.store.active.values(), state => state.sessionID)]);
+    // Cached metadata only: do not fetch children or wait on the server.
+    for (const id of candidates) {
+      try {
+        const parent = props.api.state.session.get(id)?.parentID;
+        if (isParentLink(id, parent)) {
+          parents.set(id, parent);
+          candidates.add(parent);
+        }
+      } catch {/* State may still be syncing; keep the known parent map. */}
+    }
+    return buildSessionDetailsTree(props.store, props.sessionID, parents);
   });
+  const details = createMemo(() => selectSessionDetails(tree(), selectedID(), props.store.lastCompletedBySession));
+  const sessionTitle = id => {
+    try {
+      return props.api.state.session.get(id)?.title;
+    } catch {
+      return undefined;
+    }
+  };
+  const options = createMemo(() => tree().nodes.map(node => ({
+    name: `${"  ".repeat(Math.min(node.depth, 4))}${sessionTitle(node.sessionID) || shortTail(node.sessionID, 24)}${node.sessionID === props.sessionID ? " (current)" : ""}`,
+    description: "",
+    value: node.sessionID
+  })), undefined, {
+    equals: (before, after) => before.length === after.length && before.every((option, index) => option.name === after[index].name && option.value === after[index].value)
+  });
+  const choose = id => {
+    if (typeof id !== "string" || !tree().nodes.some(node => node.sessionID === id)) return;
+    if (id === selectedID()) return;
+    setSelectedID(id);
+    body?.scrollTo(0);
+  };
   const theme = props.api.theme.current;
   return (() => {
     var _el$12 = _$createElement("box"),
@@ -2381,19 +2410,21 @@ export function TokenPulseDetails(props) {
       _el$18 = _$createElement("text"),
       _el$20 = _$createElement("text"),
       _el$21 = _$createElement("text"),
-      _el$22 = _$createElement("text"),
       _el$23 = _$createElement("text"),
       _el$24 = _$createElement("text"),
+      _el$25 = _$createElement("text"),
       _el$26 = _$createElement("text"),
-      _el$28 = _$createElement("text"),
-      _el$30 = _$createElement("text"),
+      _el$27 = _$createElement("text"),
+      _el$29 = _$createElement("text"),
       _el$31 = _$createElement("text"),
       _el$33 = _$createElement("text"),
-      _el$35 = _$createElement("text");
+      _el$34 = _$createElement("text"),
+      _el$36 = _$createElement("text"),
+      _el$38 = _$createElement("text");
     _$insertNode(_el$12, _el$13);
     _$insertNode(_el$12, _el$15);
     _$insertNode(_el$12, _el$16);
-    _$insertNode(_el$12, _el$35);
+    _$insertNode(_el$12, _el$38);
     _$setProp(_el$12, "flexDirection", "column");
     _$setProp(_el$12, "width", "100%");
     _$setProp(_el$12, "flexShrink", 0);
@@ -2402,13 +2433,120 @@ export function TokenPulseDetails(props) {
     _$setProp(_el$13, "flexShrink", 0);
     _$setProp(_el$15, "flexShrink", 0);
     _$setProp(_el$15, "wrapMode", "word");
-    _$insert(_el$15, () => `Session ${props.sessionID} · this session only; no subagents`);
+    _$insert(_el$15, () => `Scope ${props.sessionID} + descendants`);
+    _$insert(_el$12, (() => {
+      var _c$ = _$memo(() => tree().nodes.length > 1);
+      return () => _c$() && (() => {
+        var _el$40 = _$createElement("box"),
+          _el$41 = _$createElement("text"),
+          _el$42 = _$createElement("select"),
+          _el$43 = _$createElement("box"),
+          _el$44 = _$createElement("text"),
+          _el$46 = _$createElement("text"),
+          _el$48 = _$createElement("text"),
+          _el$50 = _$createElement("text");
+        _$insertNode(_el$40, _el$41);
+        _$insertNode(_el$40, _el$42);
+        _$insertNode(_el$40, _el$43);
+        _$setProp(_el$40, "flexDirection", "column");
+        _$setProp(_el$40, "flexShrink", 0);
+        _$insert(_el$41, () => `SESSION TREE · ${tree().nodes.length} sessions`);
+        _$use(node => {
+          selector = node;
+          onMount(() => node.focus());
+        }, _el$42);
+        _$setProp(_el$42, "flexShrink", 0);
+        _$setProp(_el$42, "showDescription", false);
+        _$setProp(_el$42, "showScrollIndicator", true);
+        _$setProp(_el$42, "wrapSelection", false);
+        _$setProp(_el$42, "itemSpacing", 0);
+        _$setProp(_el$42, "onChange", (_index, option) => choose(option?.value));
+        _$setProp(_el$42, "onSelect", (_index, option) => {
+          choose(option?.value);
+          body?.focus();
+        });
+        _$setProp(_el$42, "onKeyDown", key => {
+          if (key.name === "tab") {
+            key.preventDefault();
+            key.stopPropagation();
+            body?.focus();
+          }
+        });
+        _$insertNode(_el$43, _el$44);
+        _$insertNode(_el$43, _el$46);
+        _$insertNode(_el$43, _el$48);
+        _$insertNode(_el$43, _el$50);
+        _$setProp(_el$43, "flexDirection", "row");
+        _$setProp(_el$43, "height", 1);
+        _$setProp(_el$43, "flexShrink", 0);
+        _$insertNode(_el$44, _$createTextNode(`[prev]`));
+        _$setProp(_el$44, "onMouseDown", () => {
+          selector?.focus();
+          selector?.moveUp();
+        });
+        _$insertNode(_el$46, _$createTextNode(` `));
+        _$insertNode(_el$48, _$createTextNode(`[next]`));
+        _$setProp(_el$48, "onMouseDown", () => {
+          selector?.focus();
+          selector?.moveDown();
+        });
+        _$insertNode(_el$50, _$createTextNode(` · ↑/↓ · Enter/Tab`));
+        _$effect(_p$ => {
+          var _v$25 = theme.accent,
+            _v$26 = Math.min(tree().nodes.length, compact() ? 2 : 3),
+            _v$27 = options(),
+            _v$28 = Math.max(0, tree().nodes.findIndex(node => node.sessionID === details().sessionID)),
+            _v$29 = theme.text,
+            _v$30 = theme.backgroundPanel,
+            _v$31 = theme.backgroundPanel,
+            _v$32 = theme.backgroundElement,
+            _v$33 = theme.accent,
+            _v$34 = theme.accent,
+            _v$35 = theme.textMuted,
+            _v$36 = theme.accent,
+            _v$37 = theme.textMuted;
+          _v$25 !== _p$.e && (_p$.e = _$setProp(_el$41, "fg", _v$25, _p$.e));
+          _v$26 !== _p$.t && (_p$.t = _$setProp(_el$42, "height", _v$26, _p$.t));
+          _v$27 !== _p$.a && (_p$.a = _$setProp(_el$42, "options", _v$27, _p$.a));
+          _v$28 !== _p$.o && (_p$.o = _$setProp(_el$42, "selectedIndex", _v$28, _p$.o));
+          _v$29 !== _p$.i && (_p$.i = _$setProp(_el$42, "textColor", _v$29, _p$.i));
+          _v$30 !== _p$.n && (_p$.n = _$setProp(_el$42, "backgroundColor", _v$30, _p$.n));
+          _v$31 !== _p$.s && (_p$.s = _$setProp(_el$42, "focusedBackgroundColor", _v$31, _p$.s));
+          _v$32 !== _p$.h && (_p$.h = _$setProp(_el$42, "selectedBackgroundColor", _v$32, _p$.h));
+          _v$33 !== _p$.r && (_p$.r = _$setProp(_el$42, "selectedTextColor", _v$33, _p$.r));
+          _v$34 !== _p$.d && (_p$.d = _$setProp(_el$44, "fg", _v$34, _p$.d));
+          _v$35 !== _p$.l && (_p$.l = _$setProp(_el$46, "fg", _v$35, _p$.l));
+          _v$36 !== _p$.u && (_p$.u = _$setProp(_el$48, "fg", _v$36, _p$.u));
+          _v$37 !== _p$.c && (_p$.c = _$setProp(_el$50, "fg", _v$37, _p$.c));
+          return _p$;
+        }, {
+          e: undefined,
+          t: undefined,
+          a: undefined,
+          o: undefined,
+          i: undefined,
+          n: undefined,
+          s: undefined,
+          h: undefined,
+          r: undefined,
+          d: undefined,
+          l: undefined,
+          u: undefined,
+          c: undefined
+        });
+        return _el$40;
+      })();
+    })(), _el$16);
     _$insertNode(_el$16, _el$17);
-    _$use(scroll => onMount(() => scroll.focus()), _el$16);
+    _$use(scroll => {
+      body = scroll;
+      onMount(() => {
+        if (tree().nodes.length === 1) scroll.focus();
+      });
+    }, _el$16);
     _$setProp(_el$16, "flexGrow", 1);
     _$setProp(_el$16, "flexShrink", 1);
     _$setProp(_el$16, "minHeight", 0);
-    _$setProp(_el$16, "paddingTop", 1);
     _$setProp(_el$16, "focusable", true);
     _$setProp(_el$16, "scrollY", true);
     _$setProp(_el$16, "scrollX", false);
@@ -2420,33 +2558,55 @@ export function TokenPulseDetails(props) {
       flexDirection: "column",
       flexShrink: 0
     });
+    _$setProp(_el$16, "onKeyDown", key => {
+      if (key.name === "tab" && selector) {
+        key.preventDefault();
+        key.stopPropagation();
+        selector.focus();
+      }
+    });
     _$insertNode(_el$17, _el$18);
     _$insertNode(_el$17, _el$20);
     _$insertNode(_el$17, _el$21);
-    _$insertNode(_el$17, _el$22);
     _$insertNode(_el$17, _el$23);
     _$insertNode(_el$17, _el$24);
+    _$insertNode(_el$17, _el$25);
     _$insertNode(_el$17, _el$26);
-    _$insertNode(_el$17, _el$28);
-    _$insertNode(_el$17, _el$30);
+    _$insertNode(_el$17, _el$27);
+    _$insertNode(_el$17, _el$29);
     _$insertNode(_el$17, _el$31);
     _$insertNode(_el$17, _el$33);
+    _$insertNode(_el$17, _el$34);
+    _$insertNode(_el$17, _el$36);
     _$setProp(_el$17, "flexDirection", "column");
     _$setProp(_el$17, "flexShrink", 0);
     _$setProp(_el$17, "width", "100%");
-    _$insertNode(_el$18, _$createTextNode(`SESSION AVERAGES`));
+    _$insertNode(_el$18, _$createTextNode(`SELECTED SESSION · direct only`));
     _$setProp(_el$20, "wrapMode", "word");
-    _$insert(_el$20, () => `Generation avg TPS  ${formatAverageRate(details().average.generation)}`);
-    _$setProp(_el$21, "wrapMode", "word");
-    _$insert(_el$21, () => averageCoverage(details().average.generation, details().average));
-    _$setProp(_el$22, "wrapMode", "word");
-    _$insert(_el$22, () => `Response avg TPS  ${formatAverageRate(details().average.response)}`);
+    _$insert(_el$20, () => `${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`);
+    _$insert(_el$17, (() => {
+      var _c$2 = _$memo(() => details().direct.responseCount === 0);
+      return () => _c$2() && (() => {
+        var _el$52 = _$createElement("text");
+        _$insertNode(_el$52, _$createTextNode(`No recorded usage for this session`));
+        _$setProp(_el$52, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$52, "fg", theme.textMuted, _$p));
+        return _el$52;
+      })();
+    })(), _el$21);
+    _$insertNode(_el$21, _$createTextNode(`SESSION AVERAGES`));
     _$setProp(_el$23, "wrapMode", "word");
-    _$insert(_el$23, () => averageCoverage(details().average.response, details().average));
-    _$insertNode(_el$24, _$createTextNode(`Response time includes TTFT and may include tool waits. Generation time needs observed start and end boundaries.`));
+    _$insert(_el$23, () => `Generation avg TPS  ${formatAverageRate(details().average.generation)}`);
     _$setProp(_el$24, "wrapMode", "word");
-    _$insertNode(_el$26, _$createTextNode(`SESSION USAGE`));
-    _$setProp(_el$26, "paddingTop", 1);
+    _$insert(_el$24, () => averageCoverage(details().average.generation, details().average));
+    _$setProp(_el$25, "wrapMode", "word");
+    _$insert(_el$25, () => `Response avg TPS  ${formatAverageRate(details().average.response)}`);
+    _$setProp(_el$26, "wrapMode", "word");
+    _$insert(_el$26, () => averageCoverage(details().average.response, details().average));
+    _$insertNode(_el$27, _$createTextNode(`Response time includes TTFT and may include tool waits. Generation time needs observed start and end boundaries.`));
+    _$setProp(_el$27, "wrapMode", "word");
+    _$insertNode(_el$29, _$createTextNode(`SESSION USAGE`));
+    _$setProp(_el$29, "paddingTop", 1);
     _$insert(_el$17, _$createComponent(PulseMetricGrid, {
       get theme() {
         return props.api.theme;
@@ -2454,58 +2614,128 @@ export function TokenPulseDetails(props) {
       get rows() {
         return pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map(metric => [metric]);
       }
-    }), _el$28);
-    _$insertNode(_el$28, _$createTextNode(`LAST RESPONSE`));
-    _$setProp(_el$28, "paddingTop", 1);
-    _$setProp(_el$30, "wrapMode", "word");
-    _$insert(_el$30, (() => {
-      var _c$ = _$memo(() => !!details().last);
-      return () => _c$() ? `${details().last.estimated ? "~" : ""}${formatCompactRate(details().last.rate)} (${details().last.record.speed?.generation ? "generation" : "response"}) · TTFT ${formatOptionalDuration(details().last.ttft)} · elapsed ${formatDuration(details().last.elapsed)}` : "No completed response in the loaded history";
-    })());
-    _$insertNode(_el$31, _$createTextNode(`Average = measured generated tokens / measured time, not an average of call speeds. Generated tokens include output and reasoning; input and cache are excluded.`));
+    }), _el$31);
+    _$insertNode(_el$31, _$createTextNode(`LAST RESPONSE`));
     _$setProp(_el$31, "paddingTop", 1);
-    _$setProp(_el$31, "wrapMode", "word");
-    _$insertNode(_el$33, _$createTextNode(`~ means estimated. Coverage shows which calls have usable timing; older calls may have none. Live speed uses observed stream samples, not exact model usage.`));
     _$setProp(_el$33, "wrapMode", "word");
-    _$insertNode(_el$35, _$createTextNode(`esc / ctrl+c to close`));
-    _$setProp(_el$35, "flexShrink", 0);
+    _$insert(_el$33, (() => {
+      var _c$3 = _$memo(() => !!details().last);
+      return () => _c$3() ? `${details().lastSpeed.estimated ? "~" : ""}${formatCompactRate(details().lastSpeed.avg)} (${details().lastSpeed.basis}) · TTFT ${formatOptionalDuration(details().last.ttft)} · response time ${formatOptionalDuration(durationOf(details().last.record))}` : "No completed response in the loaded history";
+    })());
+    _$insert(_el$17, (() => {
+      var _c$4 = _$memo(() => !!details().last?.record.model);
+      return () => _c$4() && (() => {
+        var _el$54 = _$createElement("text");
+        _$setProp(_el$54, "wrapMode", "word");
+        _$insert(_el$54, () => `Last model: ${details().last.record.model}`);
+        _$effect(_$p => _$setProp(_el$54, "fg", theme.textMuted, _$p));
+        return _el$54;
+      })();
+    })(), _el$34);
+    _$insert(_el$17, (() => {
+      var _c$5 = _$memo(() => tree().nodes.length > 1);
+      return () => _c$5() ? [(() => {
+        var _el$55 = _$createElement("text");
+        _$insertNode(_el$55, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
+        _$setProp(_el$55, "paddingTop", 1);
+        _$effect(_$p => _$setProp(_el$55, "fg", theme.accent, _$p));
+        return _el$55;
+      })(), (() => {
+        var _el$57 = _$createElement("text");
+        _$insertNode(_el$57, _$createTextNode(`Measured token/time sums, not wall-clock throughput. Includes every descendant once.`));
+        _$setProp(_el$57, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$57, "fg", theme.textMuted, _$p));
+        return _el$57;
+      })(), (() => {
+        var _el$59 = _$createElement("text");
+        _$setProp(_el$59, "wrapMode", "word");
+        _$insert(_el$59, () => `Generation avg TPS  ${formatAverageRate(tree().average.generation)}`);
+        _$effect(_$p => _$setProp(_el$59, "fg", theme.text, _$p));
+        return _el$59;
+      })(), (() => {
+        var _el$60 = _$createElement("text");
+        _$setProp(_el$60, "wrapMode", "word");
+        _$insert(_el$60, () => averageCoverage(tree().average.generation, tree().average));
+        _$effect(_$p => _$setProp(_el$60, "fg", theme.textMuted, _$p));
+        return _el$60;
+      })(), (() => {
+        var _el$61 = _$createElement("text");
+        _$setProp(_el$61, "wrapMode", "word");
+        _$insert(_el$61, () => `Response avg TPS  ${formatAverageRate(tree().average.response)}`);
+        _$effect(_$p => _$setProp(_el$61, "fg", theme.text, _$p));
+        return _el$61;
+      })(), (() => {
+        var _el$62 = _$createElement("text");
+        _$setProp(_el$62, "wrapMode", "word");
+        _$insert(_el$62, () => averageCoverage(tree().average.response, tree().average));
+        _$effect(_$p => _$setProp(_el$62, "fg", theme.textMuted, _$p));
+        return _el$62;
+      })(), _$createComponent(PulseMetricGrid, {
+        get theme() {
+          return props.api.theme;
+        },
+        get rows() {
+          return pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map(metric => [metric]);
+        }
+      })] : (() => {
+        var _el$63 = _$createElement("text");
+        _$insertNode(_el$63, _$createTextNode(`No known subagents in this scope`));
+        _$setProp(_el$63, "paddingTop", 1);
+        _$setProp(_el$63, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$63, "fg", theme.textMuted, _$p));
+        return _el$63;
+      })();
+    })(), _el$34);
+    _$insertNode(_el$34, _$createTextNode(`Average = measured generated tokens / measured time, not an average of call speeds. Generated tokens include output and reasoning; input and cache are excluded.`));
+    _$setProp(_el$34, "paddingTop", 1);
+    _$setProp(_el$34, "wrapMode", "word");
+    _$insertNode(_el$36, _$createTextNode(`~ means estimated. Coverage shows which calls have usable timing; older calls may have none. Live speed uses observed stream samples, not exact model usage.`));
+    _$setProp(_el$36, "wrapMode", "word");
+    _$insertNode(_el$38, _$createTextNode(`esc / ctrl+c to close`));
+    _$setProp(_el$38, "flexShrink", 0);
     _$effect(_p$ => {
       var _v$6 = dimensions().width < 50 ? 1 : 2,
         _v$7 = compact() ? 0 : 1,
         _v$8 = contentHeight(),
         _v$9 = theme.primary,
         _v$0 = theme.textMuted,
-        _v$1 = theme.accent,
-        _v$10 = theme.text,
+        _v$1 = compact() ? 0 : 1,
+        _v$10 = theme.accent,
         _v$11 = theme.textMuted,
-        _v$12 = theme.text,
-        _v$13 = theme.textMuted,
+        _v$12 = theme.accent,
+        _v$13 = theme.text,
         _v$14 = theme.textMuted,
-        _v$15 = theme.accent,
-        _v$16 = theme.accent,
-        _v$17 = theme.text,
-        _v$18 = theme.textMuted,
-        _v$19 = theme.textMuted,
-        _v$20 = theme.textMuted,
-        _v$21 = compact() ? 0 : 1;
+        _v$15 = theme.text,
+        _v$16 = theme.textMuted,
+        _v$17 = theme.textMuted,
+        _v$18 = theme.accent,
+        _v$19 = theme.accent,
+        _v$20 = theme.text,
+        _v$21 = theme.textMuted,
+        _v$22 = theme.textMuted,
+        _v$23 = theme.textMuted,
+        _v$24 = compact() ? 0 : 1;
       _v$6 !== _p$.e && (_p$.e = _$setProp(_el$12, "paddingX", _v$6, _p$.e));
       _v$7 !== _p$.t && (_p$.t = _$setProp(_el$12, "paddingY", _v$7, _p$.t));
       _v$8 !== _p$.a && (_p$.a = _$setProp(_el$12, "height", _v$8, _p$.a));
       _v$9 !== _p$.o && (_p$.o = _$setProp(_el$13, "fg", _v$9, _p$.o));
       _v$0 !== _p$.i && (_p$.i = _$setProp(_el$15, "fg", _v$0, _p$.i));
-      _v$1 !== _p$.n && (_p$.n = _$setProp(_el$18, "fg", _v$1, _p$.n));
-      _v$10 !== _p$.s && (_p$.s = _$setProp(_el$20, "fg", _v$10, _p$.s));
-      _v$11 !== _p$.h && (_p$.h = _$setProp(_el$21, "fg", _v$11, _p$.h));
-      _v$12 !== _p$.r && (_p$.r = _$setProp(_el$22, "fg", _v$12, _p$.r));
+      _v$1 !== _p$.n && (_p$.n = _$setProp(_el$16, "paddingTop", _v$1, _p$.n));
+      _v$10 !== _p$.s && (_p$.s = _$setProp(_el$18, "fg", _v$10, _p$.s));
+      _v$11 !== _p$.h && (_p$.h = _$setProp(_el$20, "fg", _v$11, _p$.h));
+      _v$12 !== _p$.r && (_p$.r = _$setProp(_el$21, "fg", _v$12, _p$.r));
       _v$13 !== _p$.d && (_p$.d = _$setProp(_el$23, "fg", _v$13, _p$.d));
       _v$14 !== _p$.l && (_p$.l = _$setProp(_el$24, "fg", _v$14, _p$.l));
-      _v$15 !== _p$.u && (_p$.u = _$setProp(_el$26, "fg", _v$15, _p$.u));
-      _v$16 !== _p$.c && (_p$.c = _$setProp(_el$28, "fg", _v$16, _p$.c));
-      _v$17 !== _p$.w && (_p$.w = _$setProp(_el$30, "fg", _v$17, _p$.w));
-      _v$18 !== _p$.m && (_p$.m = _$setProp(_el$31, "fg", _v$18, _p$.m));
-      _v$19 !== _p$.f && (_p$.f = _$setProp(_el$33, "fg", _v$19, _p$.f));
-      _v$20 !== _p$.y && (_p$.y = _$setProp(_el$35, "fg", _v$20, _p$.y));
-      _v$21 !== _p$.g && (_p$.g = _$setProp(_el$35, "paddingTop", _v$21, _p$.g));
+      _v$15 !== _p$.u && (_p$.u = _$setProp(_el$25, "fg", _v$15, _p$.u));
+      _v$16 !== _p$.c && (_p$.c = _$setProp(_el$26, "fg", _v$16, _p$.c));
+      _v$17 !== _p$.w && (_p$.w = _$setProp(_el$27, "fg", _v$17, _p$.w));
+      _v$18 !== _p$.m && (_p$.m = _$setProp(_el$29, "fg", _v$18, _p$.m));
+      _v$19 !== _p$.f && (_p$.f = _$setProp(_el$31, "fg", _v$19, _p$.f));
+      _v$20 !== _p$.y && (_p$.y = _$setProp(_el$33, "fg", _v$20, _p$.y));
+      _v$21 !== _p$.g && (_p$.g = _$setProp(_el$34, "fg", _v$21, _p$.g));
+      _v$22 !== _p$.p && (_p$.p = _$setProp(_el$36, "fg", _v$22, _p$.p));
+      _v$23 !== _p$.b && (_p$.b = _$setProp(_el$38, "fg", _v$23, _p$.b));
+      _v$24 !== _p$.T && (_p$.T = _$setProp(_el$38, "paddingTop", _v$24, _p$.T));
       return _p$;
     }, {
       e: undefined,
@@ -2525,10 +2755,62 @@ export function TokenPulseDetails(props) {
       m: undefined,
       f: undefined,
       y: undefined,
-      g: undefined
+      g: undefined,
+      p: undefined,
+      b: undefined,
+      T: undefined
     });
     return _el$12;
   })();
+}
+/** Read-only UI selection: keep ledger-only descendants, and visit cycles once. */
+export function buildSessionDetailsTree(store, rootID, parents = store.sessionParents) {
+  const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
+  const projected = projectTotals(store.totalsLedger, contributions, parents);
+  const children = new Map();
+  for (const [id, parent] of projected.parents) {
+    const siblings = children.get(parent) ?? [];
+    siblings.push(id);
+    children.set(parent, siblings);
+  }
+  const nodes = [];
+  const visited = new Set();
+  const pending = [{
+    sessionID: rootID,
+    depth: 0
+  }];
+  while (pending.length) {
+    const node = pending.pop();
+    if (visited.has(node.sessionID)) continue;
+    visited.add(node.sessionID);
+    const direct = Object.prototype.hasOwnProperty.call(projected.sessions, node.sessionID) ? projected.sessions[node.sessionID] : zeroDirectTotals();
+    nodes.push({
+      ...node,
+      direct,
+      average: getSessionAverageSummary(direct)
+    });
+    const descendants = (children.get(node.sessionID) ?? []).slice().sort().reverse();
+    for (const sessionID of descendants) pending.push({
+      sessionID,
+      depth: node.depth + 1
+    });
+  }
+  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID).including;
+  return {
+    rootID,
+    nodes,
+    including,
+    average: getSessionAverageSummary(including)
+  };
+}
+export function selectSessionDetails(tree, sessionID, lastBySession) {
+  const node = tree.nodes.find(item => item.sessionID === sessionID) ?? tree.nodes[0];
+  const last = lastBySession.get(node.sessionID);
+  return {
+    ...node,
+    last,
+    lastSpeed: last ? recordSpeedSummary(last.record) : undefined
+  };
 }
 export function createDetailsController(api, store) {
   let owned = false;
@@ -2982,34 +3264,34 @@ function warnWithToast(api, message, error) {
 }
 function Header(props) {
   return (() => {
-    var _el$37 = _$createElement("box"),
-      _el$38 = _$createElement("text"),
-      _el$40 = _$createElement("text"),
-      _el$41 = _$createTextNode(`session `);
-    _$insertNode(_el$37, _el$38);
-    _$insertNode(_el$37, _el$40);
-    _$setProp(_el$37, "height", 2);
-    _$setProp(_el$37, "paddingX", 1);
-    _$setProp(_el$37, "flexDirection", "column");
-    _$insertNode(_el$38, _$createTextNode(`OC TPS / history`));
-    _$insertNode(_el$40, _el$41);
-    _$setProp(_el$40, "truncate", true);
-    _$setProp(_el$40, "wrapMode", "none");
-    _$insert(_el$40, () => shortTail(props.sessionID, 18), null);
+    var _el$65 = _$createElement("box"),
+      _el$66 = _$createElement("text"),
+      _el$68 = _$createElement("text"),
+      _el$69 = _$createTextNode(`session `);
+    _$insertNode(_el$65, _el$66);
+    _$insertNode(_el$65, _el$68);
+    _$setProp(_el$65, "height", 2);
+    _$setProp(_el$65, "paddingX", 1);
+    _$setProp(_el$65, "flexDirection", "column");
+    _$insertNode(_el$66, _$createTextNode(`OC TPS / history`));
+    _$insertNode(_el$68, _el$69);
+    _$setProp(_el$68, "truncate", true);
+    _$setProp(_el$68, "wrapMode", "none");
+    _$insert(_el$68, () => shortTail(props.sessionID, 18), null);
     _$effect(_p$ => {
-      var _v$22 = props.theme.current.backgroundPanel,
-        _v$23 = props.theme.current.primary,
-        _v$24 = props.theme.current.textMuted;
-      _v$22 !== _p$.e && (_p$.e = _$setProp(_el$37, "backgroundColor", _v$22, _p$.e));
-      _v$23 !== _p$.t && (_p$.t = _$setProp(_el$38, "fg", _v$23, _p$.t));
-      _v$24 !== _p$.a && (_p$.a = _$setProp(_el$40, "fg", _v$24, _p$.a));
+      var _v$38 = props.theme.current.backgroundPanel,
+        _v$39 = props.theme.current.primary,
+        _v$40 = props.theme.current.textMuted;
+      _v$38 !== _p$.e && (_p$.e = _$setProp(_el$65, "backgroundColor", _v$38, _p$.e));
+      _v$39 !== _p$.t && (_p$.t = _$setProp(_el$66, "fg", _v$39, _p$.t));
+      _v$40 !== _p$.a && (_p$.a = _$setProp(_el$68, "fg", _v$40, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined
     });
-    return _el$37;
+    return _el$65;
   })();
 }
 function SummaryBlock(props) {
@@ -3021,30 +3303,30 @@ function SummaryBlock(props) {
     return [...summaryLines("Session only", rollup.direct.tokens, rollup.direct.cost, rollup.direct.responseCount), ...summaryLines("Including subagents", rollup.including.tokens, rollup.including.cost, rollup.including.responseCount)];
   });
   return (() => {
-    var _el$42 = _$createElement("box"),
-      _el$43 = _$createElement("text");
-    _$insertNode(_el$42, _el$43);
-    _$setProp(_el$42, "paddingX", 1);
-    _$setProp(_el$42, "flexDirection", "column");
-    _$insertNode(_el$43, _$createTextNode(`totals`));
-    _$insert(_el$42, () => lines().map(line => (() => {
-      var _el$45 = _$createElement("text");
-      _$setProp(_el$45, "wrapMode", "word");
-      _$insert(_el$45, line);
-      _$effect(_$p => _$setProp(_el$45, "fg", props.theme.current.text, _$p));
-      return _el$45;
+    var _el$70 = _$createElement("box"),
+      _el$71 = _$createElement("text");
+    _$insertNode(_el$70, _el$71);
+    _$setProp(_el$70, "paddingX", 1);
+    _$setProp(_el$70, "flexDirection", "column");
+    _$insertNode(_el$71, _$createTextNode(`totals`));
+    _$insert(_el$70, () => lines().map(line => (() => {
+      var _el$73 = _$createElement("text");
+      _$setProp(_el$73, "wrapMode", "word");
+      _$insert(_el$73, line);
+      _$effect(_$p => _$setProp(_el$73, "fg", props.theme.current.text, _$p));
+      return _el$73;
     })()), null);
     _$effect(_p$ => {
-      var _v$25 = props.theme.current.background,
-        _v$26 = props.theme.current.secondary;
-      _v$25 !== _p$.e && (_p$.e = _$setProp(_el$42, "backgroundColor", _v$25, _p$.e));
-      _v$26 !== _p$.t && (_p$.t = _$setProp(_el$43, "fg", _v$26, _p$.t));
+      var _v$41 = props.theme.current.background,
+        _v$42 = props.theme.current.secondary;
+      _v$41 !== _p$.e && (_p$.e = _$setProp(_el$70, "backgroundColor", _v$41, _p$.e));
+      _v$42 !== _p$.t && (_p$.t = _$setProp(_el$71, "fg", _v$42, _p$.t));
       return _p$;
     }, {
       e: undefined,
       t: undefined
     });
-    return _el$42;
+    return _el$70;
   })();
 }
 function HistoryView(props) {
@@ -3053,23 +3335,23 @@ function HistoryView(props) {
     return recentRecords(props.store.records, props.sessionID, props.store);
   });
   return (() => {
-    var _el$46 = _$createElement("box"),
-      _el$47 = _$createElement("box"),
-      _el$48 = _$createElement("text"),
-      _el$50 = _$createElement("scrollbox");
-    _$insertNode(_el$46, _el$47);
-    _$insertNode(_el$46, _el$50);
-    _$setProp(_el$46, "flexDirection", "column");
-    _$setProp(_el$46, "flexGrow", 1);
-    _$insert(_el$46, _$createComponent(Header, {
+    var _el$74 = _$createElement("box"),
+      _el$75 = _$createElement("box"),
+      _el$76 = _$createElement("text"),
+      _el$78 = _$createElement("scrollbox");
+    _$insertNode(_el$74, _el$75);
+    _$insertNode(_el$74, _el$78);
+    _$setProp(_el$74, "flexDirection", "column");
+    _$setProp(_el$74, "flexGrow", 1);
+    _$insert(_el$74, _$createComponent(Header, {
       get theme() {
         return props.api.theme;
       },
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$47);
-    _$insert(_el$46, _$createComponent(SummaryBlock, {
+    }), _el$75);
+    _$insert(_el$74, _$createComponent(SummaryBlock, {
       get theme() {
         return props.api.theme;
       },
@@ -3079,43 +3361,43 @@ function HistoryView(props) {
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$47);
-    _$insertNode(_el$47, _el$48);
-    _$setProp(_el$47, "height", 1);
-    _$setProp(_el$47, "paddingX", 1);
-    _$insertNode(_el$48, _$createTextNode(`TIME SESSION MODEL OUT/REAS AVG MAX MIN TTFT DUR COST SPARK`));
-    _$setProp(_el$48, "truncate", true);
-    _$setProp(_el$48, "wrapMode", "none");
-    _$setProp(_el$50, "flexGrow", 1);
-    _$setProp(_el$50, "flexDirection", "column");
-    _$setProp(_el$50, "paddingX", 1);
-    _$setProp(_el$50, "stickyScroll", true);
-    _$setProp(_el$50, "stickyStart", "top");
-    _$insert(_el$50, (() => {
-      var _c$2 = _$memo(() => rows().length === 0);
-      return () => _c$2() ? (() => {
-        var _el$51 = _$createElement("text");
-        _$insertNode(_el$51, _$createTextNode(`No completed responses yet`));
-        _$effect(_$p => _$setProp(_el$51, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$51;
+    }), _el$75);
+    _$insertNode(_el$75, _el$76);
+    _$setProp(_el$75, "height", 1);
+    _$setProp(_el$75, "paddingX", 1);
+    _$insertNode(_el$76, _$createTextNode(`TIME SESSION MODEL OUT/REAS AVG MAX MIN TTFT DUR COST SPARK`));
+    _$setProp(_el$76, "truncate", true);
+    _$setProp(_el$76, "wrapMode", "none");
+    _$setProp(_el$78, "flexGrow", 1);
+    _$setProp(_el$78, "flexDirection", "column");
+    _$setProp(_el$78, "paddingX", 1);
+    _$setProp(_el$78, "stickyScroll", true);
+    _$setProp(_el$78, "stickyStart", "top");
+    _$insert(_el$78, (() => {
+      var _c$6 = _$memo(() => rows().length === 0);
+      return () => _c$6() ? (() => {
+        var _el$79 = _$createElement("text");
+        _$insertNode(_el$79, _$createTextNode(`No completed responses yet`));
+        _$effect(_$p => _$setProp(_el$79, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$79;
       })() : rows().map(record => (() => {
-        var _el$53 = _$createElement("text");
-        _$setProp(_el$53, "truncate", true);
-        _$setProp(_el$53, "wrapMode", "none");
-        _$insert(_el$53, () => formatHistoryRow(record));
-        _$effect(_$p => _$setProp(_el$53, "fg", props.api.theme.current.text, _$p));
-        return _el$53;
+        var _el$81 = _$createElement("text");
+        _$setProp(_el$81, "truncate", true);
+        _$setProp(_el$81, "wrapMode", "none");
+        _$insert(_el$81, () => formatHistoryRow(record));
+        _$effect(_$p => _$setProp(_el$81, "fg", props.api.theme.current.text, _$p));
+        return _el$81;
       })());
     })());
     _$effect(_p$ => {
-      var _v$27 = props.api.theme.current.background,
-        _v$28 = props.api.theme.current.backgroundElement,
-        _v$29 = props.api.theme.current.textMuted,
-        _v$30 = props.api.theme.current.background;
-      _v$27 !== _p$.e && (_p$.e = _$setProp(_el$46, "backgroundColor", _v$27, _p$.e));
-      _v$28 !== _p$.t && (_p$.t = _$setProp(_el$47, "backgroundColor", _v$28, _p$.t));
-      _v$29 !== _p$.a && (_p$.a = _$setProp(_el$48, "fg", _v$29, _p$.a));
-      _v$30 !== _p$.o && (_p$.o = _$setProp(_el$50, "backgroundColor", _v$30, _p$.o));
+      var _v$43 = props.api.theme.current.background,
+        _v$44 = props.api.theme.current.backgroundElement,
+        _v$45 = props.api.theme.current.textMuted,
+        _v$46 = props.api.theme.current.background;
+      _v$43 !== _p$.e && (_p$.e = _$setProp(_el$74, "backgroundColor", _v$43, _p$.e));
+      _v$44 !== _p$.t && (_p$.t = _$setProp(_el$75, "backgroundColor", _v$44, _p$.t));
+      _v$45 !== _p$.a && (_p$.a = _$setProp(_el$76, "fg", _v$45, _p$.a));
+      _v$46 !== _p$.o && (_p$.o = _$setProp(_el$78, "backgroundColor", _v$46, _p$.o));
       return _p$;
     }, {
       e: undefined,
@@ -3123,7 +3405,7 @@ function HistoryView(props) {
       a: undefined,
       o: undefined
     });
-    return _el$46;
+    return _el$74;
   })();
 }
 function PromptRight(props) {
@@ -3133,12 +3415,12 @@ function PromptRight(props) {
     return liveLabel(props.store, props.sessionID, props.options.bytesPerToken, Math.max(1, props.api.renderer.width), Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
   });
   return (() => {
-    var _el$54 = _$createElement("text");
-    _$setProp(_el$54, "truncate", true);
-    _$setProp(_el$54, "wrapMode", "none");
-    _$insert(_el$54, label);
-    _$effect(_$p => _$setProp(_el$54, "fg", props.api.theme.current.accent, _$p));
-    return _el$54;
+    var _el$82 = _$createElement("text");
+    _$setProp(_el$82, "truncate", true);
+    _$setProp(_el$82, "wrapMode", "none");
+    _$insert(_el$82, label);
+    _$effect(_$p => _$setProp(_el$82, "fg", props.api.theme.current.accent, _$p));
+    return _el$82;
   })();
 }
 function knownToolWaiting(api, store, sessionID) {
@@ -3225,103 +3507,114 @@ function BottomContent(props) {
     togglePulse(props.store);
   };
   return (() => {
-    var _el$55 = _$createElement("box"),
-      _el$56 = _$createElement("box"),
-      _el$57 = _$createElement("text"),
-      _el$58 = _$createElement("box"),
-      _el$59 = _$createElement("text"),
-      _el$60 = _$createElement("text"),
-      _el$61 = _$createElement("text");
-    _$insertNode(_el$55, _el$56);
-    _$insertNode(_el$55, _el$58);
-    _$insertNode(_el$55, _el$61);
-    _$setProp(_el$55, "flexDirection", "column");
-    _$setProp(_el$55, "width", "100%");
-    _$setProp(_el$55, "paddingTop", 1);
-    _$setProp(_el$55, "paddingX", 1);
-    _$setProp(_el$55, "overflow", "hidden");
-    _$setProp(_el$55, "flexShrink", 0);
-    _$insertNode(_el$56, _el$57);
-    _$setProp(_el$56, "focusable", true);
-    _$setProp(_el$56, "width", "100%");
-    _$setProp(_el$56, "height", 1);
-    _$setProp(_el$56, "paddingX", 1);
-    _$setProp(_el$56, "onMouseDown", onPulseMouseDown);
-    _$setProp(_el$57, "truncate", true);
-    _$setProp(_el$57, "wrapMode", "none");
-    _$insert(_el$57, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
-    _$insertNode(_el$58, _el$59);
-    _$insertNode(_el$58, _el$60);
-    _$setProp(_el$58, "flexDirection", "column");
-    _$setProp(_el$58, "width", "100%");
-    _$setProp(_el$58, "paddingX", 1);
-    _$setProp(_el$58, "flexShrink", 0);
-    _$setProp(_el$59, "wrapMode", "word");
-    _$setProp(_el$59, "flexShrink", 0);
-    _$insert(_el$59, () => average().label);
-    _$setProp(_el$60, "wrapMode", "word");
-    _$setProp(_el$60, "flexShrink", 0);
-    _$insert(_el$60, () => average().value);
-    _$insert(_el$58, (() => {
-      var _c$3 = _$memo(() => !!average().coverage);
-      return () => _c$3() && (() => {
-        var _el$62 = _$createElement("text");
-        _$setProp(_el$62, "wrapMode", "word");
-        _$setProp(_el$62, "flexShrink", 0);
-        _$insert(_el$62, () => average().coverage);
-        _$effect(_$p => _$setProp(_el$62, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$62;
-      })();
-    })(), null);
-    _$setProp(_el$61, "width", "100%");
-    _$setProp(_el$61, "paddingX", 1);
-    _$setProp(_el$61, "truncate", true);
-    _$setProp(_el$61, "wrapMode", "none");
-    _$insert(_el$61, metricLabel);
-    _$insert(_el$55, (() => {
-      var _c$4 = _$memo(() => !!expanded());
-      return () => _c$4() && (!sessionID() ? (() => {
-        var _el$63 = _$createElement("text");
-        _$insertNode(_el$63, _$createTextNode(`No active session`));
-        _$setProp(_el$63, "paddingTop", 1);
-        _$setProp(_el$63, "truncate", true);
-        _$setProp(_el$63, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$63, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$63;
+    var _el$83 = _$createElement("box"),
+      _el$84 = _$createElement("box"),
+      _el$85 = _$createElement("text"),
+      _el$86 = _$createElement("text");
+    _$insertNode(_el$83, _el$84);
+    _$insertNode(_el$83, _el$86);
+    _$setProp(_el$83, "flexDirection", "column");
+    _$setProp(_el$83, "width", "100%");
+    _$setProp(_el$83, "paddingTop", 1);
+    _$setProp(_el$83, "paddingX", 1);
+    _$setProp(_el$83, "overflow", "hidden");
+    _$setProp(_el$83, "flexShrink", 0);
+    _$insertNode(_el$84, _el$85);
+    _$setProp(_el$84, "focusable", true);
+    _$setProp(_el$84, "width", "100%");
+    _$setProp(_el$84, "height", 1);
+    _$setProp(_el$84, "paddingX", 1);
+    _$setProp(_el$84, "onMouseDown", onPulseMouseDown);
+    _$setProp(_el$85, "truncate", true);
+    _$setProp(_el$85, "wrapMode", "none");
+    _$insert(_el$85, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
+    _$setProp(_el$86, "width", "100%");
+    _$setProp(_el$86, "paddingX", 1);
+    _$setProp(_el$86, "truncate", true);
+    _$setProp(_el$86, "wrapMode", "none");
+    _$insert(_el$86, metricLabel);
+    _$insert(_el$83, (() => {
+      var _c$7 = _$memo(() => !!expanded());
+      return () => _c$7() && (!sessionID() ? (() => {
+        var _el$87 = _$createElement("text");
+        _$insertNode(_el$87, _$createTextNode(`No active session`));
+        _$setProp(_el$87, "paddingTop", 1);
+        _$setProp(_el$87, "truncate", true);
+        _$setProp(_el$87, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$87, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$87;
       })() : [(() => {
-        var _el$65 = _$createElement("text"),
-          _el$66 = _$createTextNode(`session `);
-        _$insertNode(_el$65, _el$66);
-        _$setProp(_el$65, "paddingTop", 1);
-        _$setProp(_el$65, "truncate", true);
-        _$setProp(_el$65, "wrapMode", "none");
-        _$insert(_el$65, () => shortTail(sessionID(), 18), null);
-        _$effect(_$p => _$setProp(_el$65, "fg", props.api.theme.current.secondary, _$p));
-        return _el$65;
-      })(), _$memo(() => sections().map(section => _$createComponent(PulseSection, {
+        var _el$89 = _$createElement("text"),
+          _el$90 = _$createTextNode(`session `);
+        _$insertNode(_el$89, _el$90);
+        _$setProp(_el$89, "paddingTop", 1);
+        _$setProp(_el$89, "truncate", true);
+        _$setProp(_el$89, "wrapMode", "none");
+        _$insert(_el$89, () => shortTail(sessionID(), 18), null);
+        _$effect(_$p => _$setProp(_el$89, "fg", props.api.theme.current.secondary, _$p));
+        return _el$89;
+      })(), _$memo(() => sections().map((section, index) => [_$createComponent(PulseSection, {
         get theme() {
           return props.api.theme;
         },
         section: section
-      }))), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
-        var _el$70 = _$createElement("text");
-        _$insertNode(_el$70, _$createTextNode(`No completed responses yet`));
-        _$setProp(_el$70, "paddingTop", 1);
-        _$setProp(_el$70, "truncate", true);
-        _$setProp(_el$70, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$70, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$70;
+      }), index === 0 && (() => {
+        var _el$94 = _$createElement("box"),
+          _el$95 = _$createElement("text"),
+          _el$96 = _$createElement("text");
+        _$insertNode(_el$94, _el$95);
+        _$insertNode(_el$94, _el$96);
+        _$setProp(_el$94, "flexDirection", "column");
+        _$setProp(_el$94, "width", "100%");
+        _$setProp(_el$94, "paddingX", 1);
+        _$setProp(_el$94, "flexShrink", 0);
+        _$setProp(_el$95, "wrapMode", "word");
+        _$setProp(_el$95, "flexShrink", 0);
+        _$insert(_el$95, () => average().label);
+        _$setProp(_el$96, "wrapMode", "word");
+        _$setProp(_el$96, "flexShrink", 0);
+        _$insert(_el$96, () => average().value);
+        _$insert(_el$94, (() => {
+          var _c$8 = _$memo(() => !!average().coverage);
+          return () => _c$8() && (() => {
+            var _el$97 = _$createElement("text");
+            _$setProp(_el$97, "wrapMode", "word");
+            _$setProp(_el$97, "flexShrink", 0);
+            _$insert(_el$97, () => average().coverage);
+            _$effect(_$p => _$setProp(_el$97, "fg", props.api.theme.current.textMuted, _$p));
+            return _el$97;
+          })();
+        })(), null);
+        _$effect(_p$ => {
+          var _v$50 = props.api.theme.current.textMuted,
+            _v$51 = props.api.theme.current.accent;
+          _v$50 !== _p$.e && (_p$.e = _$setProp(_el$95, "fg", _v$50, _p$.e));
+          _v$51 !== _p$.t && (_p$.t = _$setProp(_el$96, "fg", _v$51, _p$.t));
+          return _p$;
+        }, {
+          e: undefined,
+          t: undefined
+        });
+        return _el$94;
+      })()])), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
+        var _el$98 = _$createElement("text");
+        _$insertNode(_el$98, _$createTextNode(`No completed responses yet`));
+        _$setProp(_el$98, "paddingTop", 1);
+        _$setProp(_el$98, "truncate", true);
+        _$setProp(_el$98, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$98, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$98;
       })()), (() => {
-        var _el$67 = _$createElement("box"),
-          _el$68 = _$createElement("text");
-        _$insertNode(_el$67, _el$68);
-        _$setProp(_el$67, "flexDirection", "column");
-        _$setProp(_el$67, "width", "100%");
-        _$setProp(_el$67, "paddingTop", 1);
-        _$insertNode(_el$68, _$createTextNode(`SESSION RUN`));
-        _$setProp(_el$68, "truncate", true);
-        _$setProp(_el$68, "wrapMode", "none");
-        _$insert(_el$67, _$createComponent(PulseMetricGrid, {
+        var _el$91 = _$createElement("box"),
+          _el$92 = _$createElement("text");
+        _$insertNode(_el$91, _el$92);
+        _$setProp(_el$91, "flexDirection", "column");
+        _$setProp(_el$91, "width", "100%");
+        _$setProp(_el$91, "paddingTop", 1);
+        _$insertNode(_el$92, _$createTextNode(`SESSION RUN`));
+        _$setProp(_el$92, "truncate", true);
+        _$setProp(_el$92, "wrapMode", "none");
+        _$insert(_el$91, _$createComponent(PulseMetricGrid, {
           get theme() {
             return props.api.theme;
           },
@@ -3332,8 +3625,8 @@ function BottomContent(props) {
             }]];
           }
         }), null);
-        _$effect(_$p => _$setProp(_el$68, "fg", props.api.theme.current.accent, _$p));
-        return _el$67;
+        _$effect(_$p => _$setProp(_el$92, "fg", props.api.theme.current.accent, _$p));
+        return _el$91;
       })(), _$memo(() => _$memo(() => rows().length > 0)() && _$createComponent(ChildAgentRows, {
         get theme() {
           return props.api.theme;
@@ -3344,25 +3637,19 @@ function BottomContent(props) {
       }))]);
     })(), null);
     _$effect(_p$ => {
-      var _v$31 = props.api.theme.current.backgroundElement,
-        _v$32 = props.api.theme.current.primary,
-        _v$33 = props.api.theme.current.textMuted,
-        _v$34 = props.api.theme.current.accent,
-        _v$35 = props.api.theme.current.textMuted;
-      _v$31 !== _p$.e && (_p$.e = _$setProp(_el$56, "backgroundColor", _v$31, _p$.e));
-      _v$32 !== _p$.t && (_p$.t = _$setProp(_el$57, "fg", _v$32, _p$.t));
-      _v$33 !== _p$.a && (_p$.a = _$setProp(_el$59, "fg", _v$33, _p$.a));
-      _v$34 !== _p$.o && (_p$.o = _$setProp(_el$60, "fg", _v$34, _p$.o));
-      _v$35 !== _p$.i && (_p$.i = _$setProp(_el$61, "fg", _v$35, _p$.i));
+      var _v$47 = props.api.theme.current.backgroundElement,
+        _v$48 = props.api.theme.current.primary,
+        _v$49 = props.api.theme.current.textMuted;
+      _v$47 !== _p$.e && (_p$.e = _$setProp(_el$84, "backgroundColor", _v$47, _p$.e));
+      _v$48 !== _p$.t && (_p$.t = _$setProp(_el$85, "fg", _v$48, _p$.t));
+      _v$49 !== _p$.a && (_p$.a = _$setProp(_el$86, "fg", _v$49, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
-      a: undefined,
-      o: undefined,
-      i: undefined
+      a: undefined
     });
-    return _el$55;
+    return _el$83;
   })();
 }
 export function createTuiSlotPlugin(api, store, options) {
