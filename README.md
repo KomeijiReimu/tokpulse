@@ -14,14 +14,18 @@ It requires **OpenCode 1.18 or later**.
   TTFT, and elapsed time.
 - Session totals in the sidebar Token Pulse block, including recursive
   child-agent sessions.
+- Additional weighted average TPS for the current session's own agent,
+  excluding child agents.
 - Completion records with TTFT, duration, avg/max/min speed, input, output,
   reasoning, cache read/write, and cost.
 - Persistent session run time across turns and OpenCode restarts.
 - History view via `/tps` or `Ctrl+Shift+T`.
+- Session speed details via `/tps-details`, **Token Pulse details** in the
+  command palette, or `Ctrl+Shift+Y`.
 
 Streaming token counts are estimated from UTF-8 bytes at **5.5 bytes/token**
-by default (`bytesPerToken`). Exact OpenCode usage replaces those estimates
-when a response completes.
+by default (`bytesPerToken`). When OpenCode provides usage at completion, those
+values replace the corresponding token estimates.
 
 ## Install
 
@@ -75,9 +79,54 @@ absolute path with your checkout.
 The server keeps recording even if the TUI is not running. The TUI reads the
 same JSONL files for live and completed data.
 
-If you install the npm package, put `@komeijireimu/tokpulse` in both config
-files. OpenCode picks `./server` and `./tui` from the package exports; do not
-append `/server` or `/tui` to the package name.
+For the published npm package, use `@komeijireimu/tokpulse/server` in
+`opencode.json` and `@komeijireimu/tokpulse/tui` in `tui.json` in place of the
+file URLs above.
+
+## Speed and session details
+
+The session-only averages use **total generated tokens / total measured seconds**
+across covered completed responses. Generated tokens include output and reasoning;
+child-agent responses are excluded. The accumulated token and time sums persist
+in `totals.json` beside the history file and survive history trimming.
+
+- **Generation average** estimates throughput over measured generation intervals.
+- **Response average** uses the full response duration, including TTFT and
+  possibly tool wait time.
+
+Coverage shows the responses and tokens with measurements. Older data may lack
+the timing needed for one or both averages, so historical coverage can be partial.
+An average is unavailable when there is no usable measurement.
+
+Live speed estimates token arrivals. It needs at least **1 second** and **two
+distinct observation timestamps**; until then, the display shows `WARMUP`.
+
+Open details with `/tps-details`, **Token Pulse details** in the command palette,
+or the default `Ctrl+Shift+Y`. The view captures the current session's scope when
+opened. Press `Esc` or `Ctrl+C` to close. `/tps` and `Ctrl+Shift+T` open history.
+
+Customize the details shortcut in the TUI plugin's tuple options:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    [
+      "@komeijireimu/tokpulse/tui",
+      {
+        "keybinds": {
+          "oc-tps.details": "ctrl+shift+y,<leader>y"
+        }
+      }
+    ]
+  ]
+}
+```
+
+OpenCode parses `ctrl+shift+y,<leader>y` as configured. Set `oc-tps.details` to
+`"none"` or `false` to disable the shortcut; the slash command and palette entry
+remain available. Keep this setting inside the plugin options, not the top-level
+`keybinds` object.
 
 ## History and options
 

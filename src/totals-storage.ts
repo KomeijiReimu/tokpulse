@@ -8,6 +8,7 @@ import {
   emptyTokenCounts,
   normalizeTokenCounts,
 } from "./core.js";
+import { type CompletionUpdate, type MeasuredHistoryRecord, type SessionSpeedTotals, type SpeedContribution, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 
 export const TOTALS_VERSION = 1 as const;
 export const DEFAULT_TOTALS_FILENAME = "totals.json";
@@ -23,6 +24,7 @@ export interface SessionDirectTotals {
   tokens: TokenCounts;
   cost: number;
   responseCount: number;
+  speed?: SessionSpeedTotals;
 }
 
 export interface OpenContribution {
@@ -30,6 +32,8 @@ export interface OpenContribution {
   quality: HistoryRecordQuality;
   tokens: TokenCounts;
   cost: number;
+  speed?: SpeedContribution;
+  update?: CompletionUpdate;
 }
 
 export interface TotalsLedger {
@@ -198,11 +202,15 @@ function applyOpenRecord(ledger: TotalsLedger, record: HistoryRecord): void {
   const messageID = requireMessageID(record);
   const contribution = contributionFromRecord(record);
   const previous = ledger.open[messageID];
+  if (previous?.quality === "exact" && contribution.quality === "provisional") {
+    return;
+  }
 
   if (!previous) {
     const frozen = ledger.settled[messageID];
     if (frozen === true) return;
     if (frozen) {
+      if (frozen.quality === "exact" && contribution.quality === "provisional") return;
       if (sameContribution(frozen, contribution)) return;
       replaceContribution(ledger, frozen, contribution);
       delete ledger.settled[messageID];
@@ -252,6 +260,8 @@ function contributionFromRecord(record: HistoryRecord): OpenContribution {
     quality,
     tokens: normalizeTokenCounts(record.tokens),
     cost: nonNegativeCost(record.cost),
+    ...(coerceSpeedContribution(record.speed) ? { speed: coerceSpeedContribution(record.speed) } : {}),
+    ...(coerceCompletionUpdate((record as MeasuredHistoryRecord).update) ? { update: coerceCompletionUpdate((record as MeasuredHistoryRecord).update) } : {}),
   };
 }
 
@@ -266,12 +276,14 @@ function addContribution(session: SessionDirectTotals, contribution: OpenContrib
   session.tokens = clampTokenCounts(addTokenCounts(session.tokens, contribution.tokens));
   session.cost = clampNonNegative(session.cost + contribution.cost);
   session.responseCount = clampNonNegative(session.responseCount + 1);
+  session.speed = updateSpeedTotals(session.speed, contribution.speed, 1);
 }
 
 function subtractContribution(session: SessionDirectTotals, contribution: OpenContribution): void {
   session.tokens = subtractTokens(session.tokens, contribution.tokens);
   session.cost = clampNonNegative(session.cost - contribution.cost);
   session.responseCount = clampNonNegative(session.responseCount - 1);
+  session.speed = updateSpeedTotals(session.speed, contribution.speed, -1);
 }
 
 function applyDelta(
@@ -285,6 +297,7 @@ function applyDelta(
   }
   session.tokens = tokens;
   session.cost = clampNonNegative(session.cost + next.cost - previous.cost);
+  session.speed = updateSpeedTotals(updateSpeedTotals(session.speed, previous.speed, -1), next.speed, 1);
 }
 
 function freezeExact(ledger: TotalsLedger, retained: ReadonlySet<string>): void {
@@ -318,6 +331,8 @@ function sameContribution(left: OpenContribution, right: OpenContribution): bool
   return left.sessionID === right.sessionID
     && left.quality === right.quality
     && left.cost === right.cost
+    && sameSpeedContribution(left.speed, right.speed)
+    && JSON.stringify(left.update) === JSON.stringify(right.update)
     && TOKEN_FIELDS.every((field) => left.tokens[field] === right.tokens[field]);
 }
 
@@ -380,6 +395,7 @@ function cloneSession(session: SessionDirectTotals): SessionDirectTotals {
     tokens: { ...session.tokens },
     cost: session.cost,
     responseCount: session.responseCount,
+    ...(session.speed ? { speed: coerceSpeedTotals(session.speed) } : {}),
   };
 }
 
@@ -389,6 +405,8 @@ function cloneContribution(contribution: OpenContribution): OpenContribution {
     quality: contribution.quality,
     tokens: { ...contribution.tokens },
     cost: contribution.cost,
+    ...(contribution.speed ? { speed: coerceSpeedContribution(contribution.speed) } : {}),
+    ...(contribution.update ? { update: coerceCompletionUpdate(contribution.update) } : {}),
   };
 }
 
@@ -448,6 +466,7 @@ function coerceSession(value: unknown): SessionDirectTotals {
     tokens: coerceTokens(value.tokens),
     cost: requireNonNegative(value.cost),
     responseCount: requireNonNegative(value.responseCount),
+    ...(value.speed !== undefined ? { speed: requireSpeedTotals(value.speed) } : {}),
   };
 }
 
@@ -464,6 +483,8 @@ function coerceContribution(value: unknown): OpenContribution {
     quality: value.quality,
     tokens: coerceTokens(value.tokens),
     cost: requireNonNegative(value.cost),
+    ...(value.speed !== undefined ? { speed: requireSpeedContribution(value.speed) } : {}),
+    ...(value.update !== undefined ? { update: requireCompletionUpdate(value.update) } : {}),
   };
 }
 
@@ -483,6 +504,22 @@ function requireNonNegative(value: unknown): number {
     throw new TypeError("Invalid totals ledger");
   }
   return value;
+}
+
+function requireSpeedTotals(value: unknown): SessionSpeedTotals {
+  const speed = coerceSpeedTotals(value);
+  if (!speed) throw new TypeError("Invalid totals ledger");
+  return speed;
+}
+function requireSpeedContribution(value: unknown): SpeedContribution {
+  const speed = coerceSpeedContribution(value);
+  if (!speed) throw new TypeError("Invalid totals ledger");
+  return speed;
+}
+function requireCompletionUpdate(value: unknown): CompletionUpdate {
+  const update = coerceCompletionUpdate(value);
+  if (!update) throw new TypeError("Invalid totals ledger");
+  return update;
 }
 
 function nonNegativeCost(value: unknown): number {

@@ -6,6 +6,7 @@ import {
   SpeedSample,
   TokenCounts,
 } from "./core.js";
+import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, type MeasuredHistoryRecord } from './statistics.js';
 
 export const DEFAULT_MAX_RECORDS = 1000;
 
@@ -235,6 +236,8 @@ export function normalizeHistoryRecord(value: unknown): HistoryRecord | undefine
     time,
     samples,
     ...(quality ? { quality } : {}),
+    ...(coerceSpeedContribution(value.speed) ? { speed: coerceSpeedContribution(value.speed) } : {}),
+    ...(coerceCompletionUpdate(value.update) ? { update: coerceCompletionUpdate(value.update) } : {}),
   };
 }
 
@@ -251,6 +254,13 @@ function upsertRecord(records: readonly HistoryRecord[], record: HistoryRecord):
 function isPreferredRecord(candidate: HistoryRecord, existing: HistoryRecord): boolean {
   const candidateQuality = candidate.quality ?? "exact";
   const existingQuality = existing.quality ?? "exact";
+  const nextUpdate = (candidate as MeasuredHistoryRecord).update;
+  const priorUpdate = (existing as MeasuredHistoryRecord).update;
+  if (nextUpdate) {
+    if (!isNewerCompletionUpdate(nextUpdate, priorUpdate)) return false;
+    return candidateQuality === "exact" || existingQuality !== "exact";
+  }
+  if (priorUpdate && candidateQuality === existingQuality) return false;
   if (candidateQuality !== existingQuality) return candidateQuality === "exact";
   const candidateCompleteness = recordCompleteness(candidate);
   const existingCompleteness = recordCompleteness(existing);

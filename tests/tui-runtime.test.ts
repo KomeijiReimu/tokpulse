@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
+import { createTestKeymap } from "@opentui/keymap/testing";
 import { aggregateSession } from "../src/core.js";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import { replayActivity } from "../src/activity.js";
@@ -45,7 +46,15 @@ import {
   togglePulse,
   transitionTaskWallRun,
   transitionSessionRuntime,
+  DETAILS_COMMAND_NAME,
+  liveLabel,
+  registerTokenPulseCommands,
+  resolveOptions,
+  sessionAverageDisplay,
+  sessionUsageSummary,
+  tokenPulseBindings,
 } from "../src/tui.js";
+import { emptySpeedTotals, updateSpeedTotals } from "../src/statistics.js";
 
 function tokens(output: number, reasoning = 0): TokenCounts {
   return {
@@ -254,15 +263,15 @@ test("cache field parsing preserves explicit cache counts and raw SDK shapes", (
   });
 });
 
-test("fallback cache counts survive a later explicit zero", () => {
+test("final explicit cache zero supersedes fallback counts", () => {
   const state = createActiveState("m", "s", 0);
   state.fallbackTokens = { cacheRead: 12, cacheWrite: 4 };
   assert.deepEqual(makeTokens({ cacheRead: 0, cacheWrite: 0 }, state, 4), {
     input: 0,
     output: 0,
     reasoning: 0,
-    cacheRead: 12,
-    cacheWrite: 4,
+    cacheRead: 0,
+    cacheWrite: 0,
   });
 });
 
@@ -446,6 +455,24 @@ test("aggregate speed is generated-weighted instead of response-average", () => 
   assert.equal(aggregateSpeed([fast, slow]), expected);
   assert.equal(recordSpeedSummary(fast).avg, 10);
   assert.equal(recordSpeedSummary(slow).avg, 100);
+});
+
+test("projected direct speed replaces time-only changes without overlay/disk double counting", () => {
+  const original = record("speed", "root", 100, 0, { speed: { response: { generatedTokens: 100, durationMs: 1000, estimated: true } } });
+  const ledger = { sessions: { root: { tokens: original.tokens, cost: original.cost, responseCount: 1,
+    speed: { generation: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0 },
+      response: { generatedTokens: 100, durationMs: 1000, responseCount: 1, estimatedResponseCount: 1 } } } },
+    open: { speed: { sessionID: "root", quality: "exact" as const, tokens: original.tokens, cost: original.cost, speed: original.speed } }, settled: {} };
+  const corrected = { ...original, speed: { response: { generatedTokens: 100, durationMs: 2000, estimated: false } } };
+  assert.equal(historyRecordsEquivalent(original, corrected), false);
+  const projected = projectSessionTotals(ledger, [corrected, corrected], new Map(), "root");
+  assert.equal(projected.direct.responseCount, 1);
+  assert.equal(projected.direct.speed?.response.durationMs, 2000);
+  assert.equal(projected.direct.speed?.response.estimatedResponseCount, 0);
+  const disk = { ...ledger, sessions: { root: projected.direct }, open: { speed: { ...ledger.open.speed, speed: corrected.speed } } };
+  assert.deepEqual(projectSessionTotals(disk, [corrected], new Map(), "root").direct, projected.direct);
+  const legacy = { ...ledger, open: {}, settled: { speed: true as const } };
+  assert.equal(projectSessionTotals(legacy, [corrected], new Map(), "root").direct.speed?.response.durationMs, 1000);
 });
 
 test("single-response average prefers generation duration over high sample bursts", () => {
@@ -1178,4 +1205,219 @@ test("activity reload uses the sidecar path and only reads it", async () => {
   assert.match(source, /readActivityFile/);
   assert.match(source, /resolveRunsPath\(historyPath, options\.runsPath\)/);
   assert.doesNotMatch(source, /activity\.(append|rewrite|compact)\(/);
+});
+
+test("main average uses cumulative direct speed, excluding children and the detail window", () => {
+  const store = createRuntimeStore(1);
+  const speed = updateSpeedTotals(emptySpeedTotals(), {
+    generation: { generatedTokens: 120, durationMs: 2000, estimated: false },
+    response: { generatedTokens: 120, durationMs: 4000, estimated: false },
+  }, 1)!;
+  const childSpeed = updateSpeedTotals(emptySpeedTotals(), {
+    generation: { generatedTokens: 9000, durationMs: 1000, estimated: false },
+    response: { generatedTokens: 9000, durationMs: 2000, estimated: false },
+  }, 1)!;
+  store.totalsLedger.sessions = {
+    root: { tokens: tokens(100, 20), cost: 1, responseCount: 1, speed },
+    child: { tokens: tokens(9000, 0), cost: 2, responseCount: 1, speed: childSpeed },
+  };
+  store.sessionParents.set("child", "root");
+  rememberVisibleSession(store, "child");
+  const summary = sessionUsageSummary(store, displayedSessionID(store, "root"));
+  assert.equal(summary.generation.rate, 60);
+  assert.equal(summary.response.rate, 30);
+  assert.equal(summary.totalGeneratedTokens, 120);
+  assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "60 tok/s" });
+  assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "child"), true).label, "Session avg TPS");
+  // Reload with the same ledger and no detail records: average stays cumulative.
+  const reloaded = createRuntimeStore(1);
+  reloaded.totalsLedger = structuredClone(store.totalsLedger);
+  reloaded.sessionParents = new Map(store.sessionParents);
+  assert.equal(sessionUsageSummary(reloaded, "root").generation.rate, 60);
+  store.disposeSignals();
+  reloaded.disposeSignals();
+});
+
+test("main average uses ratio of cumulative sums and identifies partial estimated timing", () => {
+  const store = createRuntimeStore(1);
+  let speed = updateSpeedTotals(emptySpeedTotals(), { generation: { generatedTokens: 1, durationMs: 100, estimated: false } }, 1);
+  speed = updateSpeedTotals(speed, { generation: { generatedTokens: 100, durationMs: 1000, estimated: true } }, 1);
+  store.totalsLedger.sessions.root = { tokens: tokens(150, 0), cost: 0, responseCount: 3, speed };
+  const summary = sessionUsageSummary(store, "root");
+  assert.equal(summary.generation.rate, 101000 / 1100);
+  assert.notEqual(summary.generation.rate, (10 + 100) / 2);
+  assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "~92 tok/s", coverage: "Measured 2/3 calls" });
+  const response = updateSpeedTotals(emptySpeedTotals(), { response: { generatedTokens: 150, durationMs: 3000, estimated: true } }, 1);
+  store.totalsLedger.sessions.root = { tokens: tokens(150, 0), cost: 0, responseCount: 1, speed: response };
+  assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "root")).value, "~50 tok/s (response)");
+  assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "missing")).value, "--");
+  store.disposeSignals();
+});
+
+test("prompt warms up without fake LIVE zero, becomes ready, and respects known tool waits", () => {
+  const store = createRuntimeStore(10);
+  const active = createActiveState("m", "root", 0);
+  active.selectedSource = "legacy";
+  active.legacy.hasData = true;
+  active.legacy.samples = [{ timestamp: 0, tokens: 10 }];
+  store.active.set("m", active);
+  assert.equal(liveLabel(store, "root", 5.5, 20, 500), "WARMUP --");
+  active.legacy.samples.push({ timestamp: 1000, tokens: 20 });
+  assert.equal(liveLabel(store, "root", 5.5, 20, 1000), "LIVE ~20 tok/s");
+  assert.equal(liveLabel(store, "root", 5.5, 20, 1000, true), "WAIT --");
+  assert.equal(liveLabel(store, "root", 5.5, 20, 11000), "WAIT --");
+  assert.equal(liveLabel(store, "other", 5.5, 20, 1000), "IDLE");
+  store.active.clear();
+  store.lastCompletedBySession.set("root", makeLastCompletedSnapshot(record("done", "root", 10, 0)));
+  active.sessionID = "child";
+  store.active.set("child", active);
+  assert.match(liveLabel(store, "root", 5.5, 20, 1000), /^LAST /);
+  store.disposeSignals();
+});
+
+test("plugin options preserve native key strings and explicit disabled shortcuts", () => {
+  const bindings = (value?: unknown) => tokenPulseBindings(resolveOptions(value === undefined ? {} : { keybinds: { [DETAILS_COMMAND_NAME]: value } }));
+  assert.equal(bindings().find((item) => item.cmd === DETAILS_COMMAND_NAME)?.key, "ctrl+shift+y");
+  for (const value of [false, "none", []]) assert.equal(bindings(value).some((item) => item.cmd === DETAILS_COMMAND_NAME), false);
+  for (const value of ["ctrl+alt+y", "ctrl+x,ctrl+y", "<leader>y"]) {
+    assert.equal(bindings(value).find((item) => item.cmd === DETAILS_COMMAND_NAME)?.key, value);
+  }
+  assert.equal(bindings(["ctrl+alt+y", "<leader>y"]).filter((item) => item.cmd === DETAILS_COMMAND_NAME).length, 2);
+  for (const value of [true, 42, null, { key: 3 }, [false]]) {
+    assert.equal(bindings(value).find((item) => item.cmd === DETAILS_COMMAND_NAME)?.key, "ctrl+shift+y");
+  }
+  const historyDisabled = tokenPulseBindings(resolveOptions({ keybinds: { "oc-tps.history": false } }));
+  assert.equal(historyDisabled.some((item) => item.cmd === "oc-tps.history"), false);
+});
+
+test("native details command snapshots the route session, protects other dialogs, and closes without recursive clear", () => {
+  const store = createRuntimeStore(10);
+  let route: TuiPluginApi["route"]["current"] = { name: "session", params: { sessionID: "root" } };
+  let dialogOpen = false;
+  let replaces = 0;
+  let clears = 0;
+  let onClose: (() => void) | undefined;
+  type RegisteredLayer = Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0];
+  const registered: RegisteredLayer[] = [];
+  const order: string[] = [];
+  const notices: string[] = [];
+  const disposeCallbacks: (() => void)[] = [];
+  let unregisters = 0;
+  let historyRuns = 0;
+  const api = {
+    route: { get current() { return route; } },
+    ui: {
+      toast: (input: { message: string }) => notices.push(input.message),
+      Dialog: () => { throw new Error("Do not nest a second host overlay"); },
+      dialog: {
+        get open() { return dialogOpen; },
+        replace: (_render: () => unknown, close: () => void) => { replaces++; dialogOpen = true; onClose = close; order.push("replace"); },
+        setSize: (size: string) => { order.push(size); },
+        clear: () => { clears++; },
+      },
+    },
+    keymap: { registerLayer: (layer: RegisteredLayer) => { registered.push(layer); return () => { unregisters++; }; } },
+    lifecycle: { onDispose: (dispose: () => void) => disposeCallbacks.push(dispose) },
+  } as unknown as TuiPluginApi;
+  const details = registerTokenPulseCommands(api, store, resolveOptions({}), () => { historyRuns++; });
+  assert.equal(registered.length, 2);
+  assert.equal(registered[0].mode, undefined);
+  assert.equal(registered[0].bindings, undefined);
+  assert.equal(registered[1].mode, "base");
+  assert.equal(registered[1].commands, undefined);
+  const commands = registered[0].commands as { name: string; title: string; desc: string; namespace: string; slashName: string; run: () => void }[];
+  const command = commands.find((item) => item.name === DETAILS_COMMAND_NAME)!;
+  assert.equal(command.title, "Token Pulse details");
+  assert.equal(command.slashName, "tps-details");
+  assert.equal(command.namespace, "palette");
+  assert.equal(typeof command.desc, "string");
+  assert.equal("description" in command, false);
+  command.run();
+  assert.equal(details.owned, true);
+  assert.equal(details.sessionID, "root");
+  assert.deepEqual(order, ["replace", "large"]);
+  route = { name: "session", params: { sessionID: "child" } };
+  command.run();
+  assert.equal(replaces, 1);
+  assert.equal(details.sessionID, "root");
+  onClose!();
+  dialogOpen = false;
+  assert.equal(details.owned, false);
+  assert.equal(details.sessionID, undefined);
+  assert.equal(clears, 0);
+  command.run();
+  assert.equal(details.sessionID, "child");
+  onClose!();
+  dialogOpen = true; // An unrelated host modal owns the stack now.
+  command.run();
+  assert.equal(replaces, 2);
+  assert.equal(details.owned, false);
+  dialogOpen = false;
+  route = { name: "home" };
+  command.run();
+  assert.equal(replaces, 2);
+  assert.match(notices[0], /Open a session/);
+  const history = commands.find((item) => item.name === "oc-tps.history")!;
+  assert.equal(history.slashName, "tps");
+  history.run();
+  assert.equal(historyRuns, 1);
+  assert.equal(registered[1].bindings?.find((item) => item.cmd === "oc-tps.history")?.key, "ctrl+shift+t");
+  assert.equal(registered[1].bindings?.some((item) => item.key === "escape" || item.key === "ctrl+c"), false);
+  disposeCallbacks.forEach((dispose) => dispose());
+  assert.equal(unregisters, 2);
+  store.disposed = true;
+  route = { name: "session", params: { sessionID: "root" } };
+  command.run();
+  assert.equal(replaces, 2);
+  store.disposeSignals();
+});
+
+test("real keymap keeps palette and slash commands reachable in modal/autocomplete but shortcuts only in base", () => {
+  for (const configured of [undefined, "ctrl+alt+y", false, "none", []]) {
+    const harness = createTestKeymap({ defaultKeys: true });
+    const store = createRuntimeStore(10);
+    const modeStack = ["base"];
+    // The host's mode field uses the current mode as an activation predicate.
+    // Exercise real reachability, matching and dispatch with that predicate.
+    harness.keymap.registerLayerFields({ mode(value, ctx) { ctx.activeWhen(() => value === modeStack.at(-1)); } });
+    const disposers: (() => void)[] = [];
+    let opens = 0;
+    let dialogOpen = false;
+    const api = {
+      route: { current: { name: "session", params: { sessionID: "root" } } },
+      keymap: harness.keymap,
+      lifecycle: { onDispose: (fn: () => void) => { disposers.push(fn); } },
+      ui: { dialog: { get open() { return dialogOpen; }, replace: () => { opens++; dialogOpen = true; }, setSize: () => {} } },
+    } as unknown as TuiPluginApi;
+    try {
+      registerTokenPulseCommands(api, store, resolveOptions(configured === undefined ? {} : { keybinds: { [DETAILS_COMMAND_NAME]: configured } }), () => {});
+      assert.equal(disposers.length, 2);
+      const enabled = configured === undefined || typeof configured === "string" && configured !== "none";
+      const custom = configured === "ctrl+alt+y";
+      for (const mode of ["base", "modal", "autocomplete", "oc-tps.history"]) {
+        if (mode !== "base") modeStack.push(mode);
+        const entries = harness.keymap.getCommandEntries({ visibility: "reachable", namespace: "palette" });
+        assert.deepEqual(entries.map((entry) => entry.command.name).sort(), ["oc-tps.details", "oc-tps.history"]);
+        assert.equal(entries.find((entry) => entry.command.name === DETAILS_COMMAND_NAME)?.command.slashName, "tps-details");
+        const before = opens;
+        dialogOpen = false; // Do not let the dialog guard hide an active global shortcut.
+        harness.host.press("y", custom ? { ctrl: true, meta: true } : { ctrl: true, shift: true });
+        assert.equal(opens - before, mode === "base" && enabled ? 1 : 0, `${mode}: shortcut must stay base-only`);
+        dialogOpen = false;
+        harness.keymap.dispatchCommand(DETAILS_COMMAND_NAME);
+        assert.equal(opens, before + (mode === "base" && enabled ? 1 : 0) + 1, `${mode}: command must remain reachable`);
+        if (mode !== "base") modeStack.pop();
+      }
+      disposers.forEach((dispose) => dispose());
+      assert.equal(harness.keymap.getCommandEntries({ visibility: "registered", namespace: "palette" }).length, 0);
+      dialogOpen = false;
+      const before = opens;
+      harness.host.press("y", { ctrl: true, shift: true });
+      assert.equal(opens, before);
+      assert.deepEqual(harness.diagnostics.errors, []);
+    } finally {
+      harness.cleanup();
+      store.disposeSignals();
+    }
+  }
 });

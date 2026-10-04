@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord } from "../src/core.js";
+import type { MeasuredHistoryRecord } from "../src/statistics.js";
 import {
   createHistoryStorage,
   mergeHistoryRecords,
@@ -120,6 +121,23 @@ test("legacy records without quality remain readable", () => {
   const parsed = parseHistoryJsonl(`${legacy}\n`);
   assert.equal(parsed[0]?.quality, undefined);
   assert.equal(parsed[0]?.messageID, "legacy");
+});
+
+test("explicit live update order outranks nonzero completeness; unversioned recovery does not", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createHistoryStorage(join(directory, "authority.jsonl"));
+  const live = (sequence: number, output: number): MeasuredHistoryRecord => ({ ...historyRecord("m", { quality: "exact",
+    tokens: { input: 1, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 } }), update: {
+      source: "live", instanceID: "server", sequence, receivedAt: sequence, fingerprint: String(sequence), seenFingerprints: Array.from({ length: sequence }, (_, i) => String(i + 1)),
+    } });
+  await storage.upsert(live(1, 10));
+  await storage.upsert(live(2, 0));
+  assert.equal((await storage.read())[0].tokens.output, 0);
+  await storage.upsert(live(1, 10));
+  assert.equal((await storage.read())[0].tokens.output, 0);
+  const merged = mergeHistoryRecords(await storage.read(), [historyRecord("m", { quality: "exact" })]);
+  assert.equal(merged[0].tokens.output, 0);
+  assert.equal((merged[0] as MeasuredHistoryRecord).update?.sequence, 2);
 });
 
 async function makeTestDirectory(context: { after: (callback: () => Promise<void>) => void }): Promise<string> {

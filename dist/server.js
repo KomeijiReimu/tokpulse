@@ -1,13 +1,27 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { HISTORY_VERSION, bytesToTokens, calibrateResponseSamples, emptyTokenCounts, normalizeTokenCounts, utf8ByteLength } from "./core.js";
 import { ACTIVITY_VERSION, isActiveState, normalizeActivityEvent, replayActivity } from "./activity.js";
 import { createActivityLedger } from "./runs-storage.js";
+import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, parseModelDelta } from './statistics.js';
 import { createHistoryStorage } from "./storage.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
 const PARENT_LOOKUP_TIMEOUT_MS = 200;
 const activityInitializationQueues = new Map();
+const contentMetadataByRuntime = new WeakMap();
+function runtimeContentMetadata(active) {
+  let metadata = contentMetadataByRuntime.get(active);
+  if (!metadata) {
+    metadata = createContentMetadataCache();
+    contentMetadataByRuntime.set(active, metadata);
+  }
+  return metadata;
+}
+/** Snapshot-only entry point: cache type/end facts without creating activity. */
+export function recordPartMetadata(active, properties) {
+  cachePartSnapshot(runtimeContentMetadata(active), properties);
+}
 export const server = async (input, pluginOptions) => {
   const options = resolveOptions(pluginOptions ?? input.options ?? input.config);
   const baseDirectory = resolveProjectDirectory(input);
@@ -39,10 +53,23 @@ export const server = async (input, pluginOptions) => {
   const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map();
   const completedMessageIDs = new Set();
+  const metadata = runtimeContentMetadata(active);
+  const persisted = await totals.read().catch(() => undefined);
+  for (const [id, contribution] of Object.entries(persisted?.open ?? {})) {
+    if (contribution.quality === "exact") {
+      completedMessageIDs.add(id);
+      metadata.completed.add(id);
+    }
+  }
+  for (const id of Object.keys(persisted?.settled ?? {})) {
+    completedMessageIDs.add(id);
+    metadata.completed.add(id);
+  }
   const parentSessionCache = new Map();
   const event = payload => {
     const rawEvent = payload?.event;
-    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken)).catch(error => {
+    const receivedAt = Date.now();
+    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt)).catch(error => {
       warn("event handling failed", error);
     });
     eventQueue = next;
@@ -178,12 +205,12 @@ function needsActivityIdentity(type, properties, event) {
   const info = eventInfo(properties, event);
   return info?.role === "assistant" && isCompleted(info, properties, event);
 }
-function runtimeEventTimestamp(runtime, rawKey, event, properties) {
+function runtimeEventTimestamp(runtime, rawKey, event, properties, receivedAt = Date.now()) {
   const explicit = explicitEventTimestamp(event, properties);
   if (explicit !== undefined) return explicit;
   const previous = runtime.rawTimestamps.get(rawKey);
   if (previous !== undefined) return previous;
-  const timestamp = Date.now();
+  const timestamp = receivedAt;
   runtime.rawTimestamps.set(rawKey, timestamp);
   return timestamp;
 }
@@ -433,7 +460,7 @@ function unwrapIncomingEvent(value) {
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
-async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken) {
+async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt) {
   try {
     const event = unwrapIncomingEvent(rawEvent);
     if (!event) return;
@@ -441,22 +468,26 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
     const properties = asRecord(event.properties) ?? asRecord(event.data) ?? {};
     const explicitTimestamp = explicitEventTimestamp(event, properties);
     const rawKey = explicitTimestamp === undefined && needsActivityIdentity(type, properties, event) ? rawEventKey(type, event) : undefined;
-    const timestamp = explicitTimestamp ?? (rawKey === undefined ? Date.now() : runtimeEventTimestamp(activity, rawKey, event, properties));
+    const timestamp = explicitTimestamp ?? (rawKey === undefined ? receivedAt : runtimeEventTimestamp(activity, rawKey, event, properties, receivedAt));
     try {
       await captureActivityForEvent(activity, type, properties, event, timestamp);
     } catch (error) {
       warn("activity event handling failed", error);
     }
+    if (type === "message.part.updated") {
+      recordPartMetadata(active, properties);
+      return;
+    }
     if (type === "message.part.delta") {
       recordDelta(active, properties, event, timestamp, "legacy", bytesPerToken);
       return;
     }
-    if (type === "session.next.text.delta" || type === "session.next.reasoning.delta") {
+    if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
       recordDelta(active, properties, event, timestamp, "v2", bytesPerToken, type.endsWith("reasoning.delta") ? "reasoning" : "output");
       return;
     }
     if (type === "message.updated") {
-      await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken);
+      await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt);
       return;
     }
     if (type === "session.next.step.ended") {
@@ -474,14 +505,22 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
   const sessionID = readSessionIDFromEvent("message.part.delta", properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
+  const metadata = runtimeContentMetadata(active);
+  if (messageID && (metadata.completed.has(messageID) || metadata.roles.has(messageID) && metadata.roles.get(messageID) !== "assistant")) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
-  const kind = explicitKind ?? inferKind(properties, event);
   const key = messageID ?? pendingKey(sessionID);
+  const existing = active.get(messageID ?? key) ?? active.get(pendingKey(sessionID));
+  const progress = existing?.progress ?? cachedContentProgress(metadata, messageID ?? key);
+  const parsed = parseModelDelta(progress, properties, event, stream, delta);
+  if (!parsed) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   if (state.sessionID !== sessionID) return;
+  state.progress = mergeContentProgress(state.progress, progress);
+  metadata.progress.set(messageID ?? key, state.progress);
+  const kind = parsed.kind;
   if (timestamp < state.startedAt) state.startedAt = timestamp;
-  if (state.firstTokenAt === undefined) state.firstTokenAt = timestamp;
+  state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
   const bytes = utf8ByteLength(delta);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample = {
@@ -502,20 +541,63 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   if (messageID && completedMessageIDs.has(messageID)) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
+  state.progress ??= cachedContentProgress(runtimeContentMetadata(active), messageID ?? pendingKey(sessionID));
+  state.progress.stepEnds ??= new Set();
+  state.progress.stepEnds.add(timestamp);
   const tokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
   state.fallbackTokens = mergeFallbackTokens(state.fallbackTokens, tokens);
   state.model = state.model ?? modelName(info);
   if (state.cost === undefined) state.cost = numberOrUndefined(info?.cost ?? properties.cost);
   active.set(messageID ?? pendingKey(sessionID), state);
 }
-async function handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken) {
+async function handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt) {
   const info = eventInfo(properties, event);
-  if (!info || info.role !== "assistant" || !isCompleted(info, properties, event)) return;
+  if (!info) return;
   const messageID = readMessageID(properties, info);
   const sessionID = readSessionIDFromEvent("message.updated", properties, event);
   if (!messageID || !sessionID) return;
-  if (completedMessageIDs.has(messageID)) {
+  const metadata = runtimeContentMetadata(active);
+  if (typeof info.role === "string") metadata.roles.set(messageID, info.role);
+  if (info.role !== "assistant") {
     active.delete(messageID);
+    return;
+  }
+  if (!isCompleted(info, properties, event)) return;
+  if (event.replay === true || properties.replay === true || event.source === "snapshot") return;
+  const previous = (await storage.read()).find(record => record.messageID === messageID);
+  const ledger = await totals.read().catch(() => undefined);
+  const snapshot = ledger?.open[messageID] ?? ledger?.settled[messageID];
+  if (snapshot === true) {
+    // No reversible contribution survives. Do not reconstruct a history slot
+    // or manufacture speed coverage from an already-accounted old response.
+    completedMessageIDs.add(messageID);
+    metadata.completed.add(messageID);
+    active.delete(messageID);
+    return;
+  }
+  const prior = previous ?? snapshot;
+  const priorUpdate = coerceCompletionUpdate(prior?.update);
+  const fingerprint = createHash("sha256").update(stableSerialize(info)).digest("hex");
+  const update = {
+    source: "live",
+    instanceID: activity.instanceID,
+    sequence: metadata.nextSequence++,
+    receivedAt,
+    ...(numberOrUndefined(event.revision ?? properties.revision) !== undefined ? {
+      revision: numberOrUndefined(event.revision ?? properties.revision)
+    } : {}),
+    fingerprint,
+    seenFingerprints: [...new Set([...(priorUpdate?.seenFingerprints ?? []), ...(priorUpdate ? [priorUpdate.fingerprint] : []), fingerprint])]
+  };
+  if (!isNewerCompletionUpdate(update, priorUpdate)) {
+    // A history write may have succeeded while its totals write failed. Replay
+    // repairs that single-writer projection rather than dropping the retry.
+    const repaired = previous ? await safeUpsert(storage, totals, previous) : snapshot !== undefined;
+    if (repaired) {
+      completedMessageIDs.add(messageID);
+      metadata.completed.add(messageID);
+      active.delete(messageID);
+    }
     return;
   }
   const state = takeState(active, messageID, sessionID, timestamp);
@@ -529,7 +611,15 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     cacheRead: cacheOrFallback(exactTokens.cacheRead, fallback.cacheRead),
     cacheWrite: cacheOrFallback(exactTokens.cacheWrite, fallback.cacheWrite)
   };
-  const candidateSamples = chooseSamples(state);
+  const quality = exactTokens.output !== undefined && exactTokens.input !== undefined && (exactTokens.reasoning !== undefined || tokens.reasoning === 0) ? "exact" : "provisional";
+  if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") {
+    // A trimmed exact response is still authoritative in the ledger. Reject
+    // partial completion facts before they can reclaim a history window slot.
+    completedMessageIDs.add(messageID);
+    metadata.completed.add(messageID);
+    return;
+  }
+  const candidateSamples = state ? chooseSamples(state) : previous?.samples ?? [];
   const samples = calibrateResponseSamples(candidateSamples, {
     output: tokens.output,
     reasoning: tokens.reasoning
@@ -547,9 +637,21 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     state,
     info,
     completedAt: timestamp,
-    quality: "exact"
+    quality
   });
-  if (await safeUpsert(storage, totals, record)) completedMessageIDs.add(messageID);else if (state) active.set(messageID, state);
+  if (previous) {
+    const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstToken, record.time.firstToken);
+    if (firstToken !== undefined) {
+      record.time.firstToken = firstToken;
+      record.time.ttft = firstToken - record.time.start;
+    }
+  }
+  record.speed = mergeRecordSpeed(record, prior, state && chooseSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
+  record.update = update;
+  if (await safeUpsert(storage, totals, record)) {
+    completedMessageIDs.add(messageID);
+    metadata.completed.add(messageID);
+  } else if (state) active.set(messageID, state);
 }
 async function flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
@@ -557,6 +659,7 @@ async function flushIdleStates(input, storage, totals, activity, active, complet
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
     active.delete(key);
+    if (!state.legacy.hasData && !state.v2.hasData && Object.keys(state.fallbackTokens).length === 0) continue;
     if (state.messageID.startsWith("__pending__:")) continue;
     if (completedMessageIDs.has(state.messageID)) continue;
     const estimate = estimateStateTokens(state, bytesPerToken);
@@ -592,11 +695,11 @@ async function flushIdleStates(input, storage, totals, activity, active, complet
 function makeHistoryRecord(input) {
   const infoTime = asRecord(input.info?.time) ?? {};
   const start = numberOrUndefined(infoTime.start) ?? numberOrUndefined(infoTime.created) ?? input.state?.startedAt ?? input.completedAt;
-  const firstToken = numberOrUndefined(infoTime.firstToken) ?? numberOrUndefined(infoTime.firstTokenAt) ?? input.state?.firstTokenAt;
   const completed = numberOrUndefined(infoTime.end) ?? numberOrUndefined(infoTime.completed) ?? input.completedAt;
+  const firstToken = earliestFirstOutput(start, completed, numberOrUndefined(infoTime.firstToken), numberOrUndefined(infoTime.firstTokenAt), input.state?.firstTokenAt);
   const ttft = firstToken === undefined ? undefined : Math.max(0, firstToken - start);
   const duration = Math.max(0, completed - start);
-  return {
+  const record = {
     version: HISTORY_VERSION,
     messageID: input.messageID,
     sessionID: input.sessionID,
@@ -622,6 +725,8 @@ function makeHistoryRecord(input) {
     samples: input.samples,
     quality: input.quality
   };
+  record.speed = measureRecordSpeed(record, contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt, input.quality === "exact", numberOrUndefined(infoTime.start ?? infoTime.created) !== undefined && numberOrUndefined(infoTime.end ?? infoTime.completed) !== undefined, tokenFields(input.info?.tokens).reasoning !== undefined));
+  return record;
 }
 function chooseSamples(state) {
   if (!state) return [];
@@ -676,6 +781,7 @@ function getOrCreateState(active, messageID, sessionID, timestamp) {
   return state;
 }
 function mergeStates(target, source) {
+  target.progress = mergeContentProgress(target.progress, source.progress);
   target.startedAt = Math.min(target.startedAt, source.startedAt);
   if (target.firstTokenAt === undefined || source.firstTokenAt !== undefined && source.firstTokenAt < target.firstTokenAt) {
     target.firstTokenAt = source.firstTokenAt;
@@ -745,9 +851,7 @@ function exactOrFallback(exact, fallback, estimate) {
   return exact ?? fallback ?? Math.max(0, Math.round(estimate));
 }
 function cacheOrFallback(exact, fallback) {
-  if (exact === undefined) return fallback ?? 0;
-  if (exact === 0 && fallback !== undefined && fallback > 0) return fallback;
-  return exact;
+  return exact ?? fallback ?? 0;
 }
 function isCompleted(info, properties, event) {
   const values = [info.completed, properties.completed, event.completed];
@@ -829,7 +933,7 @@ async function safeUpsert(storage, totals, record) {
         retainedMessageIDs
       });
     } else {
-      await totals.applyMany([], {
+      await totals.apply(record, {
         retainedMessageIDs
       });
     }

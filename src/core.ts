@@ -1,5 +1,8 @@
+import type { SpeedContribution } from "./statistics.js";
+
 export const DEFAULT_BYTES_PER_TOKEN = 5.5;
 export const DEFAULT_ROLLING_WINDOW_MS = 10_000;
+export const MIN_ROLLING_OBSERVATION_MS = 1_000;
 export const HISTORY_VERSION = 1;
 export type HistoryRecordQuality = "provisional" | "exact";
 
@@ -21,6 +24,16 @@ export interface SpeedSample {
   kind?: SampleKind;
 }
 
+export interface RollingRateMeasurement {
+  status: "warming" | "ready" | "inactive";
+  /** Estimated event-arrival tokens/second; zero unless ready. */
+  rate: number;
+  elapsedMs: number;
+  observedTokens: number;
+  /** Distinct timestamps in the observation window, including the baseline. */
+  observationCount: number;
+}
+
 export interface ResponseTiming {
   start: number;
   firstToken?: number;
@@ -40,6 +53,7 @@ export interface HistoryRecord {
   time: ResponseTiming;
   samples: SpeedSample[];
   quality?: HistoryRecordQuality;
+  speed?: SpeedContribution;
 }
 
 export interface RateStats {
@@ -223,23 +237,60 @@ export function appendSpeedSample(
   return next.filter((entry) => entry.timestamp >= cutoff);
 }
 
+/**
+ * Measures token arrivals, not the model's precise generation speed. The first
+ * retained timestamp is a cumulative-count baseline: its entire batch is
+ * excluded because its generation interval is unknown. All later batches are
+ * counted over the same baseline-to-now interval (including recent silence).
+ * No interpolation is made at the window's left edge: the first observation
+ * at or after that edge becomes the baseline. Equal timestamps are merged.
+ */
+export function measureRollingTokenRate(
+  samples: readonly SpeedSample[],
+  now?: number,
+  windowMs = DEFAULT_ROLLING_WINDOW_MS,
+): RollingRateMeasurement {
+  const empty: RollingRateMeasurement = {
+    status: "warming", rate: 0, elapsedMs: 0, observedTokens: 0, observationCount: 0,
+  };
+  const ordered = samples.filter((sample) => Number.isFinite(sample.timestamp))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const referenceNow = now ?? ordered.at(-1)?.timestamp;
+  if (referenceNow === undefined || !Number.isFinite(referenceNow)
+    || !Number.isFinite(windowMs) || windowMs < 0) return empty;
+  const cutoff = referenceNow - windowMs;
+  const points: { timestamp: number; tokens: number }[] = [];
+  let latestObservationAt: number | undefined;
+  let latestTokenAt: number | undefined;
+  for (const sample of ordered) {
+    if (sample.timestamp > referenceNow) break;
+    latestObservationAt = sample.timestamp;
+    const tokens = nonNegativeNumber(sample.tokens);
+    if (tokens > 0) latestTokenAt = sample.timestamp;
+    if (sample.timestamp < cutoff) continue;
+    const previous = points.at(-1);
+    if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;
+    else points.push({ timestamp: sample.timestamp, tokens });
+  }
+  const elapsedMs = points.length > 0 ? referenceNow - points[0].timestamp : 0;
+  const observedTokens = points.slice(1).reduce((sum, point) => sum + point.tokens, 0);
+  const measurement = { ...empty, elapsedMs, observedTokens, observationCount: points.length };
+  const lastActivityAt = latestTokenAt ?? latestObservationAt;
+  if (lastActivityAt !== undefined && referenceNow - lastActivityAt >= windowMs) {
+    return { ...measurement, status: "inactive" };
+  }
+  if (points.length < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) return measurement;
+  const rate = (observedTokens / elapsedMs) * 1000;
+  if (!Number.isFinite(elapsedMs) || !Number.isFinite(rate)) return measurement;
+  return { ...measurement, status: "ready", rate };
+}
+
 export function rollingTokenRate(
   samples: readonly SpeedSample[],
   now?: number,
   windowMs = DEFAULT_ROLLING_WINDOW_MS,
 ): number {
-  if (samples.length === 0) return 0;
-  const ordered = [...samples].sort((left, right) => left.timestamp - right.timestamp);
-  const referenceNow = now ?? ordered[ordered.length - 1].timestamp;
-  if (!Number.isFinite(referenceNow) || !Number.isFinite(windowMs) || windowMs < 0) return 0;
-  const cutoff = referenceNow - windowMs;
-  const selected = ordered.filter((sample) => sample.timestamp >= cutoff && sample.timestamp <= referenceNow);
-  if (selected.length === 0) return 0;
-  const totalTokens = selected.reduce((sum, sample) => sum + nonNegativeNumber(sample.tokens), 0);
-  const first = selected[0].timestamp;
-  const elapsed = referenceNow - first;
-  if (elapsed <= 0) return 0;
-  return (totalTokens * 1000) / elapsed;
+  return measureRollingTokenRate(samples, now, windowMs).rate;
 }
 
 export const calculateRollingRate = rollingTokenRate;

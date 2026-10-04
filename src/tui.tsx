@@ -1,10 +1,12 @@
 /** @jsxImportSource @opentui/solid */
 
 import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join } from "node:path";
-import { createMemo, createRoot, createSignal, onCleanup } from "solid-js";
+import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import type { MouseEvent } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
+import { createBindingLookup, type BindingConfig, type BindingValue } from "@opencode-ai/plugin/tui";
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -32,7 +34,7 @@ import {
   formatDuration,
   formatNumber,
   normalizeTokenCounts,
-  rollingTokenRate,
+  measureRollingTokenRate,
   timeToFirstToken,
   utf8ByteLength,
 } from "./core.js";
@@ -41,6 +43,8 @@ import {
   resolveRootSessionID,
 } from "./activity.js";
 import type { ActivityEvent, ActivityReplay } from "./activity.js";
+import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, type SpeedContribution, cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, parseModelDelta, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { getSessionAverageSummary, type AverageRateSummary, type SessionAverageSummary } from "./statistics.js";
 import {
   DEFAULT_MAX_RECORDS,
   readHistoryFile,
@@ -59,6 +63,7 @@ const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
 const COMMAND_NAME = "oc-tps.history";
+export const DETAILS_COMMAND_NAME = "oc-tps.details";
 const SPARK_CHARS = ".:-=+#";
 
 type ObjectRecord = Record<string, unknown>;
@@ -66,8 +71,48 @@ export type StreamName = "legacy" | "v2";
 type SampleKind = "output" | "reasoning";
 export type RecordQuality = HistoryRecordQuality;
 const recordQualityByObject = new WeakMap<object, RecordQuality>();
+const observationRuntimes = new WeakMap<RuntimeStore, { instanceID: string; metadata: ContentMetadataCache }>();
+function observationRuntime(store: RuntimeStore) {
+  let runtime = observationRuntimes.get(store);
+  if (!runtime) {
+    runtime = { instanceID: randomUUID(), metadata: createContentMetadataCache() };
+    observationRuntimes.set(store, runtime);
+  }
+  return runtime;
+}
+function knownCompletedMessage(store: RuntimeStore, messageID: string): boolean {
+  return store.completedMessageIDs.has(messageID) || observationRuntime(store).metadata.completed.has(messageID)
+    || store.totalsLedger.settled[messageID] !== undefined || store.totalsLedger.open[messageID]?.quality === "exact";
+}
+function knownNonAssistant(store: RuntimeStore, messageID: string): boolean {
+  const role = observationRuntime(store).metadata.roles.get(messageID);
+  return role !== undefined && role !== "assistant";
+}
+export function recordTuiPartMetadata(store: RuntimeStore, properties: ObjectRecord): void {
+  cachePartSnapshot(observationRuntime(store).metadata, properties);
+}
+
+// Same canonical payload fingerprint as the server, for cross-process replay
+// confirmation. Timing/usage magnitudes are facts, not update versions.
+function serializeCompletionFact(value: unknown, seen = new Set<unknown>()): string {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "bigint") return `${value}n`;
+  if (typeof value !== "object") return JSON.stringify(String(value));
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  const result = Array.isArray(value)
+    ? `[${value.map((entry) => serializeCompletionFact(entry, seen)).join(",")}]`
+    : `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${serializeCompletionFact((value as ObjectRecord)[key], seen)}`).join(",")}}`;
+  seen.delete(value);
+  return result;
+}
 type CompatibleEventType =
   | "message.part.delta"
+  | "message.part.updated"
+  | "session.next.tool.input.delta"
   | "session.next.text.delta"
   | "session.next.reasoning.delta"
   | "message.updated"
@@ -112,6 +157,7 @@ export interface ActiveState {
   sessionID: string;
   startedAt: number;
   firstTokenAt?: number;
+  progress?: ContentProgress;
   model?: string;
   cost?: number;
   fallbackTokens: Partial<TokenCounts>;
@@ -338,6 +384,7 @@ export interface TuiOptions {
   maxRecords: number;
   bytesPerToken: number;
   enabled: boolean;
+  keybinds?: BindingConfig;
 }
 
 export interface RuntimeStore {
@@ -384,6 +431,8 @@ interface ChildRow {
 
 export interface RecordSpeedSummary extends RateStats {
   generated: number;
+  estimated: boolean;
+  basis: "generation" | "response";
 }
 
 function isRecord(value: unknown): value is ObjectRecord {
@@ -1236,10 +1285,9 @@ function makeHistoryRecord(input: {
   const start = infoTimeValue(input.info, ["start", "created"])
     ?? input.state?.startedAt
     ?? input.completedAt;
-  const firstToken = infoTimeValue(input.info, ["firstToken", "firstTokenAt"])
-    ?? input.state?.firstTokenAt;
   const completed = infoTimeValue(input.info, ["end", "completed"])
     ?? input.completedAt;
+  const firstToken = earliestFirstOutput(start, completed, infoTimeValue(input.info, ["firstToken", "firstTokenAt"]), input.state?.firstTokenAt);
   const ttft = firstToken === undefined ? undefined : Math.max(0, firstToken - start);
   const duration = Math.max(0, completed - start);
   const record: HistoryRecord = {
@@ -1261,6 +1309,9 @@ function makeHistoryRecord(input: {
     quality: input.quality ?? "exact",
   };
   recordQualityByObject.set(record, input.quality ?? "exact");
+  record.speed = measureRecordSpeed(record, contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt,
+    input.quality === "exact", infoTimeValue(input.info, ["start", "created"]) !== undefined && infoTimeValue(input.info, ["end", "completed"]) !== undefined,
+    tokenFields(input.info?.tokens).reasoning !== undefined));
   return record;
 }
 
@@ -1272,16 +1323,8 @@ export function makeTokens(
   const exact = tokenFields(info);
   const fallback = state?.fallbackTokens ?? {};
   const estimate = estimateActiveTokens(state, bytesPerToken);
-  const cacheRead = exact.cacheRead === undefined
-    ? fallback.cacheRead ?? 0
-    : exact.cacheRead === 0 && (fallback.cacheRead ?? 0) > 0
-      ? fallback.cacheRead!
-      : exact.cacheRead;
-  const cacheWrite = exact.cacheWrite === undefined
-    ? fallback.cacheWrite ?? 0
-    : exact.cacheWrite === 0 && (fallback.cacheWrite ?? 0) > 0
-      ? fallback.cacheWrite!
-      : exact.cacheWrite;
+  const cacheRead = exact.cacheRead ?? fallback.cacheRead ?? 0;
+  const cacheWrite = exact.cacheWrite ?? fallback.cacheWrite ?? 0;
   return {
     input: exactOrFallback(exact.input, fallback.input, estimate.input),
     output: exactOrFallback(exact.output, fallback.output, estimate.output),
@@ -1337,6 +1380,11 @@ function preferredHistoryRecord(
   candidateQuality: RecordQuality,
   existingQuality: RecordQuality,
 ): HistoryRecord {
+  const authoritative = preferredUpdateLayer(
+    { record: candidate, quality: candidateQuality, source: "incoming", order: 1 },
+    { record: existing, quality: existingQuality, source: "optimistic", order: 0 },
+  );
+  if (authoritative) return authoritative.record;
   if (candidateQuality !== existingQuality) {
     return candidateQuality === "exact" ? candidate : existing;
   }
@@ -1470,7 +1518,7 @@ function commitRecord(
   record: HistoryRecord,
   markCompleted: boolean,
 ): void {
-  const quality: RecordQuality = markCompleted ? "exact" : "provisional";
+  const quality: RecordQuality = record.quality ?? (markCompleted ? "exact" : "provisional");
   if (!markCompleted && store.completedMessageIDs.has(record.messageID)) return;
   if (
     markCompleted
@@ -1494,7 +1542,7 @@ function commitRecord(
     && runtime.contributions.get(record.messageID)?.record !== effectiveRecord
     && runtime.completedContributions.get(record.messageID)?.record !== effectiveRecord
   ) return;
-  runtime.status = effectiveQuality === "exact" ? runtime.status : "busy";
+  runtime.status = markCompleted || effectiveQuality === "exact" ? runtime.status : "busy";
   if (runtime.activeMessageID === record.messageID) runtime.activeMessageID = undefined;
   if (markCompleted || effectiveQuality === "exact") store.completedMessageIDs.add(record.messageID);
   if (selected.source === "incoming") addOptimisticRecord(store, effectiveRecord, effectiveQuality);
@@ -2116,12 +2164,12 @@ export function noteTaskRecord(
   if (summary) store.bump();
 }
 
-function recordDelta(
+export function recordDelta(
   store: RuntimeStore,
   properties: ObjectRecord,
   event: CompatibleEvent,
   stream: StreamName,
-  explicitKind: SampleKind | undefined,
+  _explicitKind: SampleKind | undefined,
   bytesPerToken: number,
 ): void {
   const sessionID = readSessionID(properties, event);
@@ -2129,12 +2177,21 @@ function recordDelta(
   const parentID = sessionParentFromEvent("message.part.delta", properties, event);
   if (parentID) rememberSessionParent(store, sessionID, parentID);
   const messageID = readMessageID(properties);
+  if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
   const timestamp = eventTimestamp(event, properties);
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
   const existingState = (messageID ? store.active.get(messageID) : undefined)
     ?? store.active.get(pendingKey(sessionID));
+  const progress = existingState?.progress ?? cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
+  const parsed = parseModelDelta(progress, properties, event, stream, delta);
+  if (!parsed) return;
+  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const state = existingState ?? getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
+  state.progress = progress;
+  observationRuntime(store).metadata.progress.set(messageID ?? pendingKey(sessionID), progress);
+  state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
+  runtime.runFirstTokenAt = Math.min(runtime.runFirstTokenAt ?? timestamp, timestamp);
   const bytes = utf8ByteLength(delta);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample: SpeedSample = {
@@ -2142,7 +2199,7 @@ function recordDelta(
     tokens: estimatedTokens,
     estimatedTokens,
     bytes,
-    kind: explicitKind ?? inferKind(properties, event),
+    kind: parsed.kind,
   };
   if (existingState?.selectedSource !== undefined && existingState.selectedSource !== stream) {
     existingState[stream].hasData = true;
@@ -2152,11 +2209,10 @@ function recordDelta(
     store.bump();
     return;
   }
-  const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   if (state.sessionID !== sessionID) return;
   state.selectedSource = lockStreamSource(state.selectedSource, stream);
   state.startedAt = Math.min(state.startedAt, timestamp);
-  state.firstTokenAt = state.firstTokenAt ?? timestamp;
+  state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
   runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined
     ? timestamp
     : Math.min(runtime.runFirstTokenAt, timestamp);
@@ -2168,7 +2224,7 @@ function recordDelta(
   store.bump();
 }
 
-function recordStepStarted(
+export function recordStepStarted(
   store: RuntimeStore,
   properties: ObjectRecord,
   event: CompatibleEvent,
@@ -2176,6 +2232,7 @@ function recordStepStarted(
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
+  if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const timestamp = eventTimestamp(event, properties);
   const runtime = ensureSessionRun(store, sessionID, timestamp);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
@@ -2194,6 +2251,7 @@ function recordStepFallback(
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
+  if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const timestamp = eventTimestamp(event, properties);
   const runtime = ensureSessionRun(store, sessionID, timestamp);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
@@ -2201,6 +2259,9 @@ function recordStepFallback(
     state.fallbackTokens,
     tokenFields(properties.tokens ?? properties),
   );
+  state.progress ??= cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
+  state.progress.stepEnds ??= new Set();
+  state.progress.stepEnds.add(timestamp);
   state.model = state.model ?? modelName(properties);
   state.cost = state.cost ?? readNumber(properties.cost);
   if (messageID) runtime.activeMessageID = messageID;
@@ -2215,6 +2276,27 @@ interface HistoryLayerCandidate {
   order: number;
 }
 
+function preferredUpdateLayer(candidate: HistoryLayerCandidate, existing: HistoryLayerCandidate): HistoryLayerCandidate | undefined {
+  const next = coerceCompletionUpdate((candidate.record as MeasuredHistoryRecord).update);
+  const previous = coerceCompletionUpdate((existing.record as MeasuredHistoryRecord).update);
+  if (!next && !previous) return undefined;
+  const nextQuality = candidate.quality ?? "exact";
+  const previousQuality = existing.quality ?? "exact";
+  if (next && previous) {
+    // The same provider fact written by the server confirms the overlay. Its
+    // canonical samples/timing may differ from local arrival observations.
+    if (next.fingerprint === previous.fingerprint && next.revision === previous.revision) {
+      if (candidate.source === "disk") return candidate;
+      if (existing.source === "disk") return existing;
+      return existing;
+    }
+    if (!isNewerCompletionUpdate(next, previous)) return existing;
+    return nextQuality === "exact" || previousQuality !== "exact" ? candidate : existing;
+  }
+  if (nextQuality !== previousQuality) return nextQuality === "exact" ? candidate : existing;
+  return next ? candidate : existing;
+}
+
 function baseHistoryRecords(store: RuntimeStore): HistoryRecord[] {
   if (store.diskRecords.length > 0 || store.records.length === 0) return store.diskRecords;
   const optimisticIDs = new Set(store.optimistic.keys());
@@ -2225,6 +2307,8 @@ function preferredHistoryLayer(
   candidate: HistoryLayerCandidate,
   existing: HistoryLayerCandidate,
 ): HistoryLayerCandidate {
+  const authoritative = preferredUpdateLayer(candidate, existing);
+  if (authoritative) return authoritative;
   const candidateQuality = candidate.quality ?? "exact";
   const existingQuality = existing.quality ?? "exact";
   const candidateCompleteness = recordCompleteness(candidate.record);
@@ -2345,15 +2429,16 @@ function selectCommitRecord(
   );
 }
 
-function handleMessageUpdated(
+export function handleMessageUpdated(
   store: RuntimeStore,
   api: TuiPluginApi,
   properties: ObjectRecord,
   event: CompatibleEvent,
   bytesPerToken: number,
+  receivedAt = Date.now(),
 ): boolean {
   const info = eventInfo(properties, event);
-  if (!info || info.role !== "assistant") return false;
+  if (!info) return false;
   const messageID = readMessageID(properties, info);
   const sessionID = readStringFrom([info, properties, event], [
     "sessionID",
@@ -2361,9 +2446,16 @@ function handleMessageUpdated(
     "session.id",
   ]);
   if (!messageID || !sessionID) return false;
+  const observations = observationRuntime(store);
+  if (typeof info.role === "string") observations.metadata.roles.set(messageID, info.role);
+  if (info.role !== "assistant") {
+    if (typeof info.role === "string") store.active.delete(messageID);
+    return false;
+  }
   const timestamp = eventTimestamp(event, properties);
 
   if (!isCompleted(info, properties, event)) {
+    if (knownCompletedMessage(store, messageID) || event.replay === true || properties.replay === true || event.source === "snapshot") return false;
     const runtime = ensureSessionRun(store, sessionID, timestamp);
     const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
     state.startedAt = Math.min(
@@ -2379,6 +2471,36 @@ function handleMessageUpdated(
     return false;
   }
 
+  if (event.replay === true || properties.replay === true || event.source === "snapshot") return false;
+  const previous = previousTuiRecord(store, messageID);
+  const openSnapshot = store.totalsLedger.open[messageID] as OpenContribution | undefined;
+  const snapshot = openSnapshot ?? store.totalsLedger.settled[messageID];
+  if (snapshot === true) {
+    store.completedMessageIDs.add(messageID); observations.metadata.completed.add(messageID);
+    store.active.delete(messageID);
+    return false;
+  }
+  let prior: HistoryRecord | OpenContribution | undefined = previous ?? snapshot;
+  const snapshotUpdate = coerceCompletionUpdate(snapshot?.update);
+  const previousUpdate = coerceCompletionUpdate((previous as MeasuredHistoryRecord | undefined)?.update);
+  if (snapshot && snapshotUpdate && (!previousUpdate || isNewerCompletionUpdate(snapshotUpdate, previousUpdate))) prior = snapshot;
+  const priorUpdate = coerceCompletionUpdate((prior as MeasuredHistoryRecord | undefined)?.update);
+  const fingerprint = createHash("sha256").update(serializeCompletionFact(info)).digest("hex");
+  const revision = readNumber(event.revision ?? properties.revision);
+  const update: CompletionUpdate = { source: "live", instanceID: observations.instanceID, sequence: observations.metadata.nextSequence++, receivedAt,
+    ...(revision !== undefined ? { revision } : {}), fingerprint,
+    seenFingerprints: [...new Set([...(priorUpdate?.seenFingerprints ?? []), ...(priorUpdate ? [priorUpdate.fingerprint] : []), fingerprint])] };
+  if (!isNewerCompletionUpdate(update, priorUpdate)) {
+    store.completedMessageIDs.add(messageID); observations.metadata.completed.add(messageID);
+    store.active.delete(messageID);
+    return false;
+  }
+  const pendingState = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
+  const candidateTokens = makeTokens(info, pendingState, bytesPerToken);
+  const exactFields = tokenFields(info.tokens);
+  const quality: RecordQuality = exactFields.output !== undefined && exactFields.input !== undefined
+    && (exactFields.reasoning !== undefined || candidateTokens.reasoning === 0) ? "exact" : "provisional";
+  if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") return false;
   const state = takeActiveState(store.active, messageID, sessionID);
   const tokens = makeTokens(info, state, bytesPerToken);
   const record = makeHistoryRecord({
@@ -2388,18 +2510,47 @@ function handleMessageUpdated(
     model: modelName(info) ?? state?.model,
     cost: readNumber(info.cost) ?? state?.cost ?? 0,
     tokens,
-    samples: calibrateResponseSamples(finalSamples(state), {
+    samples: calibrateResponseSamples(state ? finalSamples(state) : previous?.samples ?? [], {
       output: tokens.output,
       reasoning: tokens.reasoning,
     }),
     state,
     info,
     completedAt: timestamp,
-    quality: "exact",
+    quality,
   });
+  if (previous) {
+    const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstToken, record.time.firstToken);
+    if (firstToken !== undefined) {
+      record.time.firstToken = firstToken;
+      record.time.ttft = firstToken - record.time.start;
+    }
+  }
+  record.speed = mergeRecordSpeed(record, prior, state && finalSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
+  (record as MeasuredHistoryRecord).update = update;
   commitRecord(store, record, true);
+  observations.metadata.completed.add(messageID);
   noteTaskRecord(store, api, record);
   return true;
+}
+
+function previousTuiRecord(store: RuntimeStore, messageID: string): HistoryRecord | undefined {
+  let selected: HistoryLayerCandidate | undefined;
+  const consider = (record: HistoryRecord | undefined, source: HistoryLayerCandidate["source"]) => {
+    if (!record) return;
+    const candidate = { record, quality: record.quality ?? recordQuality(record), source,
+      order: source === "disk" ? 0 : store.optimisticOrder.get(messageID) ?? 0 };
+    selected = selected ? preferredHistoryLayer(candidate, selected) : candidate;
+  };
+  consider(store.records.find((record) => record.messageID === messageID), "disk");
+  consider(store.diskRecords.find((record) => record.messageID === messageID), "disk");
+  consider(store.optimistic.get(messageID), "optimistic");
+  if (!selected) {
+    for (const runtime of store.sessionRuntime.values()) {
+      consider((runtime.contributions.get(messageID) ?? runtime.completedContributions.get(messageID))?.record, "optimistic");
+    }
+  }
+  return selected?.record;
 }
 
 function flushIdleStates(
@@ -2413,6 +2564,7 @@ function flushIdleStates(
   const entries = [...store.active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
     store.active.delete(key);
+    if (!state.legacy.hasData && !state.v2.hasData && Object.keys(state.fallbackTokens).length === 0) continue;
     if (state.messageID.startsWith("__pending__:")) continue;
     const tokens = makeTokens(undefined, state, bytesPerToken);
     const record = makeHistoryRecord({
@@ -2622,7 +2774,9 @@ export function historyRecordsEquivalent(
     && left.time.completed === right.time.completed
     && left.time.ttft === right.time.ttft
     && left.time.duration === right.time.duration
-    && (left.quality ?? "exact") === (right.quality ?? "exact");
+    && (left.quality ?? "exact") === (right.quality ?? "exact")
+    && sameSpeedContribution(left.speed, right.speed)
+    && JSON.stringify(coerceCompletionUpdate((left as MeasuredHistoryRecord).update)) === JSON.stringify(coerceCompletionUpdate((right as MeasuredHistoryRecord).update));
 }
 
 function recordCompletedAt(record: HistoryRecord): number {
@@ -2651,7 +2805,7 @@ function removeOptimisticRecord(store: RuntimeStore, messageID: string): void {
   store.optimisticOrder.delete(messageID);
 }
 
-function hydrateHistoryState(
+export function hydrateHistoryState(
   store: RuntimeStore,
   diskRecords: readonly HistoryRecord[],
 ): void {
@@ -2712,7 +2866,7 @@ function hydrateHistoryState(
   }
 }
 
-async function reloadHistory(
+export async function reloadHistory(
   store: RuntimeStore,
   api: TuiPluginApi,
   path: string,
@@ -2788,7 +2942,7 @@ async function reloadActivity(
   }
 }
 
-function resolveOptions(value: unknown): TuiOptions {
+export function resolveOptions(value: unknown): TuiOptions {
   const options = asRecord(value);
   const maxRecordsValue = readNumber(options?.maxRecords);
   const bytesPerTokenValue = readNumber(options?.bytesPerToken);
@@ -2803,7 +2957,39 @@ function resolveOptions(value: unknown): TuiOptions {
       ? bytesPerTokenValue
       : DEFAULT_BYTES_PER_TOKEN,
     enabled: options?.enabled !== false,
+    keybinds: resolvePluginKeybinds(options?.keybinds),
   };
+}
+
+// Keep native key strings (commas and <leader> included) intact for the host.
+function isKeybindValue(value: unknown): value is BindingValue {
+  if (value === false || typeof value === "string") return true;
+  if (Array.isArray(value)) return value.every((item) => !Array.isArray(item) && item !== false && isKeybindValue(item));
+  const item = asRecord(value);
+  if (!item) return false;
+  if (typeof item.name === "string") {
+    return ["ctrl", "shift", "meta", "super", "hyper"].every((flag) => item[flag] === undefined || typeof item[flag] === "boolean");
+  }
+  return typeof item.key === "string" || (isRecord(item.key) && typeof item.key.name === "string" && isKeybindValue(item.key));
+}
+
+function resolvePluginKeybinds(value: unknown): BindingConfig | undefined {
+  const input = asRecord(value);
+  if (!input) return undefined;
+  const result: Record<string, BindingValue> = {};
+  for (const name of [COMMAND_NAME, DETAILS_COMMAND_NAME]) {
+    if (isKeybindValue(input[name])) result[name] = input[name];
+  }
+  return result;
+}
+
+export function tokenPulseBindings(options: TuiOptions) {
+  const keys = createBindingLookup({
+    [COMMAND_NAME]: "ctrl+shift+t",
+    [DETAILS_COMMAND_NAME]: "ctrl+shift+y",
+    ...options.keybinds,
+  });
+  return keys.gather("token-pulse", [COMMAND_NAME, DETAILS_COMMAND_NAME]);
 }
 
 function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefined): string {
@@ -2971,17 +3157,7 @@ function formatOptionalDuration(value: number | undefined): string {
 }
 
 export function generationElapsed(record: HistoryRecord): number | undefined {
-  const completed = record.time.completed;
-  const firstToken = record.time.firstToken;
-  if (
-    typeof completed === "number"
-    && Number.isFinite(completed)
-    && typeof firstToken === "number"
-    && Number.isFinite(firstToken)
-  ) {
-    return Math.max(0, completed - firstToken);
-  }
-  return durationOf(record);
+  return record.speed?.generation?.durationMs ?? record.speed?.response?.durationMs ?? durationOf(record);
 }
 
 function stableGeneratedRate(record: HistoryRecord): number {
@@ -2994,14 +3170,17 @@ export function recordSpeedSummary(record: HistoryRecord): RecordSpeedSummary {
   const generated = generatedTokens(record.tokens);
   const sampleStats = calculateSpeedStats(record.samples);
   const stableRate = stableGeneratedRate(record);
+  const metadata = { estimated: (record.speed?.generation ?? record.speed?.response)?.estimated ?? true,
+    basis: record.speed?.generation ? "generation" as const : "response" as const };
   if (record.samples.length >= 2 && sampleStats.avg > 0) {
-    return { ...sampleStats, avg: stableRate > 0 ? stableRate : sampleStats.avg, generated };
+    return { ...sampleStats, avg: stableRate > 0 ? stableRate : sampleStats.avg, generated, ...metadata };
   }
   return {
     avg: stableRate,
     max: stableRate,
     min: stableRate,
     generated,
+    ...metadata,
   };
 }
 
@@ -3009,7 +3188,9 @@ export function aggregateSpeed(records: readonly HistoryRecord[]): number {
   let generated = 0;
   let elapsed = 0;
   for (const record of records) {
-    const generationTime = generationElapsed(record);
+    // Window/LAST aggregate uses a single response basis; never mix generation
+    // and response durations when only a subset has generation coverage.
+    const generationTime = record.speed?.response?.durationMs ?? durationOf(record);
     if (generationTime === undefined || generationTime <= 0) continue;
     generated += generatedTokens(record.tokens);
     elapsed += generationTime;
@@ -3286,7 +3467,127 @@ export function projectSessionTotals(
 
 function totalsForSession(store: RuntimeStore, sessionID: string | undefined): TotalsRollup | undefined {
   if (!sessionID) return undefined;
-  return projectSessionTotals(store.totalsLedger, store.records, store.sessionParents, sessionID);
+  // Detail-window trimming must not discard unconfirmed direct contributions.
+  const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER,
+    store.optimisticQuality, store.optimisticOrder);
+  return projectSessionTotals(store.totalsLedger, contributions, store.sessionParents, sessionID);
+}
+
+export function sessionUsageSummary(store: RuntimeStore, sessionID: string): SessionAverageSummary {
+  return getSessionAverageSummary(totalsForSession(store, sessionID)?.direct ?? zeroDirectTotals());
+}
+
+export function formatAverageRate(summary: AverageRateSummary): string {
+  if (!summary.available || summary.rate === undefined) return "--";
+  return `${summary.estimated ? "~" : ""}${formatCompactRate(summary.rate)}`;
+}
+
+export function sessionAverageDisplay(summary: SessionAverageSummary, isChild = false): {
+  label: string; value: string; coverage?: string;
+} {
+  const basis = summary.generation.available ? "generation" : "response";
+  const measured = summary[basis];
+  const partial = measured.available && (measured.coveredResponseCount < summary.totalResponseCount
+    || measured.coveredGeneratedTokens < summary.totalGeneratedTokens);
+  return {
+    label: isChild ? "Session avg TPS" : "Main avg TPS",
+    value: `${formatAverageRate(measured)}${measured.available && basis === "response" ? " (response)" : ""}`,
+    ...(partial ? { coverage: `Measured ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls` } : {}),
+  };
+}
+
+function averageCoverage(summary: AverageRateSummary, total: SessionAverageSummary): string {
+  return `${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured · ${formatCompactNumber(summary.estimatedResponseCount)} estimated calls`;
+}
+
+export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStore; sessionID: string }): JSX.Element {
+  const [dimensions, setDimensions] = createSignal({ width: props.api.renderer.width, height: props.api.renderer.height });
+  const onResize = (width: number, height: number) => setDimensions({ width, height });
+  if (typeof props.api.renderer.on === "function") {
+    props.api.renderer.on("resize", onResize);
+    onCleanup(() => props.api.renderer.off("resize", onResize));
+  }
+  // Host Dialog starts at height / 4 and adds one top-padding row. Reserve
+  // another bottom row rather than budgeting against the whole terminal.
+  const contentHeight = () => Math.max(1, dimensions().height - Math.ceil(dimensions().height / 4) - 2);
+  const compact = () => dimensions().height < 24;
+  const details = createMemo(() => {
+    props.store.revision();
+    const direct = totalsForSession(props.store, props.sessionID)?.direct ?? zeroDirectTotals();
+    const average = getSessionAverageSummary(direct);
+    const last = props.store.lastCompletedBySession.get(props.sessionID);
+    return { direct, average, last };
+  });
+  const theme = props.api.theme.current;
+  return (
+    <box flexDirection="column" paddingX={dimensions().width < 50 ? 1 : 2} paddingY={compact() ? 0 : 1} width="100%" height={contentHeight()} flexShrink={0} overflow="hidden">
+      <text fg={theme.primary} flexShrink={0}>Token Pulse details</text>
+      <text fg={theme.textMuted} flexShrink={0} wrapMode="word">{`Session ${props.sessionID} · this session only; no subagents`}</text>
+      <scrollbox flexGrow={1} flexShrink={1} minHeight={0} paddingTop={1} focusable scrollY scrollX={false} viewportOptions={{ minHeight: 0, overflow: "hidden" }} contentOptions={{ flexDirection: "column", flexShrink: 0 }} ref={(scroll) => onMount(() => scroll.focus())}>
+        <box flexDirection="column" flexShrink={0} width="100%">
+        <text fg={theme.accent}>SESSION AVERAGES</text>
+        <text fg={theme.text} wrapMode="word">{`Generation avg TPS  ${formatAverageRate(details().average.generation)}`}</text>
+        <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.generation, details().average)}</text>
+        <text fg={theme.text} wrapMode="word">{`Response avg TPS  ${formatAverageRate(details().average.response)}`}</text>
+        <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.response, details().average)}</text>
+        <text fg={theme.textMuted} wrapMode="word">Response time includes TTFT and may include tool waits. Generation time needs observed start and end boundaries.</text>
+        <text fg={theme.accent} paddingTop={1}>SESSION USAGE</text>
+        <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map((metric) => [metric])} />
+        <text fg={theme.accent} paddingTop={1}>LAST RESPONSE</text>
+        <text fg={theme.text} wrapMode="word">{details().last
+          ? `${details().last!.estimated ? "~" : ""}${formatCompactRate(details().last!.rate)} (${details().last!.record.speed?.generation ? "generation" : "response"}) · TTFT ${formatOptionalDuration(details().last!.ttft)} · elapsed ${formatDuration(details().last!.elapsed)}`
+          : "No completed response in the loaded history"}</text>
+        <text fg={theme.textMuted} paddingTop={1} wrapMode="word">Average = measured generated tokens / measured time, not an average of call speeds. Generated tokens include output and reasoning; input and cache are excluded.</text>
+        <text fg={theme.textMuted} wrapMode="word">~ means estimated. Coverage shows which calls have usable timing; older calls may have none. Live speed uses observed stream samples, not exact model usage.</text>
+        </box>
+      </scrollbox>
+      <text fg={theme.textMuted} paddingTop={compact() ? 0 : 1} flexShrink={0}>esc / ctrl+c to close</text>
+    </box>
+  );
+}
+
+export function createDetailsController(api: TuiPluginApi, store: RuntimeStore) {
+  let owned = false;
+  let openedSessionID: string | undefined;
+  return {
+    get owned() { return owned; },
+    get sessionID() { return openedSessionID; },
+    open(): string | undefined {
+      if (store.disposed || api.ui.dialog.open) return undefined;
+      const sessionID = currentSessionID(api);
+      if (!sessionID) {
+        api.ui.toast({ variant: "info", message: "Open a session to view Token Pulse details", duration: 3000 });
+        return undefined;
+      }
+      api.ui.dialog.replace(() => <TokenPulseDetails api={api} store={store} sessionID={sessionID} />, () => {
+        owned = false;
+        openedSessionID = undefined;
+      });
+      owned = true;
+      openedSessionID = sessionID;
+      api.ui.dialog.setSize("large");
+      return sessionID;
+    },
+  };
+}
+
+export function registerTokenPulseCommands(api: TuiPluginApi, store: RuntimeStore, options: TuiOptions, openHistory: () => void) {
+  const details = createDetailsController(api, store);
+  // Palette and slash lookup happens in modal/autocomplete modes. Keep
+  // definitions reachable there, without enabling shortcuts in those modes.
+  const commands = api.keymap.registerLayer({
+    commands: [
+      { name: COMMAND_NAME, title: "Open token history", desc: "Open recent token speed history for the current session", category: "Plugin", namespace: "palette", slashName: "tps", run: openHistory },
+      { name: DETAILS_COMMAND_NAME, title: "Token Pulse details", desc: "Session averages, usage and timing coverage", category: "Plugin", namespace: "palette", slashName: "tps-details", run: () => { details.open(); } },
+    ],
+  });
+  api.lifecycle.onDispose(commands);
+  const bindings = api.keymap.registerLayer({
+    mode: "base",
+    bindings: tokenPulseBindings(options),
+  });
+  api.lifecycle.onDispose(bindings);
+  return details;
 }
 
 interface ProjectedTotals {
@@ -3299,7 +3600,7 @@ function projectTotals(
   records: readonly HistoryRecord[],
   parentBySessionID: ReadonlyMap<string, string>,
 ): ProjectedTotals {
-  const unique = dedupeHistoryRecords(records);
+  const unique = mergeHistoryLayers(records, new Map(), Number.MAX_SAFE_INTEGER);
   return {
     sessions: applyWindowAdjustments(ledger, unique),
     parents: projectionParents(parentBySessionID, unique),
@@ -3324,11 +3625,20 @@ function applyWindowAdjustments(
     if (!next) continue;
     const previous = settledValue ?? open[record.messageID];
     if (previous) {
+      if (previous.quality === "exact" && record.quality === "provisional") continue;
+      const priorUpdate = coerceCompletionUpdate(previous.update);
+      const nextUpdate = coerceCompletionUpdate((record as MeasuredHistoryRecord).update);
+      if (priorUpdate) {
+        if (!nextUpdate) continue;
+        // Disk ledger confirms this provider fact; use its canonical speed.
+        if (nextUpdate.fingerprint === priorUpdate.fingerprint && nextUpdate.revision === priorUpdate.revision) continue;
+        if (!isNewerCompletionUpdate(nextUpdate, priorUpdate)) continue;
+      }
       const prior = openNumbers(previous);
       if (!prior || sameContributionNumbers(prior, next)) continue;
       if (prior.sessionID !== next.sessionID) {
-        subtractDirect(ensureDirect(sessions, prior.sessionID), prior.tokens, prior.cost);
-        addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost);
+        subtractDirect(ensureDirect(sessions, prior.sessionID), prior.tokens, prior.cost, prior.speed);
+        addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost, next.speed);
       } else {
         applyDirectDelta(
           ensureDirect(sessions, next.sessionID),
@@ -3336,11 +3646,13 @@ function applyWindowAdjustments(
           prior.cost,
           next.tokens,
           next.cost,
+          prior.speed,
+          next.speed,
         );
       }
       continue;
     }
-    addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost);
+    addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost, next.speed);
   }
   return sessions;
 }
@@ -3349,6 +3661,7 @@ interface ContributionNumbers {
   sessionID: string;
   tokens: TokenCounts;
   cost: number;
+  speed?: SpeedContribution;
 }
 
 function contributionNumbers(record: HistoryRecord): ContributionNumbers | undefined {
@@ -3357,6 +3670,7 @@ function contributionNumbers(record: HistoryRecord): ContributionNumbers | undef
     sessionID: record.sessionID,
     tokens: normalizeTokenCounts(record.tokens),
     cost: nonNegativeMetric(record.cost),
+    speed: coerceSpeedContribution(record.speed),
   };
 }
 
@@ -3366,12 +3680,14 @@ function openNumbers(contribution: OpenContribution): ContributionNumbers | unde
     sessionID: contribution.sessionID,
     tokens: normalizeTokenCounts(contribution.tokens),
     cost: nonNegativeMetric(contribution.cost),
+    speed: coerceSpeedContribution(contribution.speed),
   };
 }
 
 function sameContributionNumbers(left: ContributionNumbers, right: ContributionNumbers): boolean {
   return left.sessionID === right.sessionID
     && left.cost === right.cost
+    && sameSpeedContribution(left.speed, right.speed)
     && TOTALS_TOKEN_FIELDS.every((field) => left.tokens[field] === right.tokens[field]);
 }
 
@@ -3406,6 +3722,7 @@ function cloneDirectTotals(session: SessionDirectTotals): SessionDirectTotals {
     tokens: normalizeTokenCounts(session.tokens),
     cost: nonNegativeMetric(session.cost),
     responseCount: nonNegativeMetric(session.responseCount),
+    ...(session.speed ? { speed: coerceSpeedTotals(session.speed) } : {}),
   };
 }
 
@@ -3428,16 +3745,20 @@ function ensureDirect(
   return created;
 }
 
-function addDirect(session: SessionDirectTotals, tokens: TokenCounts, cost: number): void {
+function addDirect(session: SessionDirectTotals, tokens: TokenCounts, cost: number, speed?: SpeedContribution): void {
   session.tokens = clampTokenCounts(addTokenCounts(session.tokens, tokens));
   session.cost = clampNonNegative(session.cost + cost);
   session.responseCount = clampNonNegative(session.responseCount + 1);
+  const updated = updateSpeedTotals(session.speed, speed, 1);
+  if (updated) session.speed = updated;
 }
 
-function subtractDirect(session: SessionDirectTotals, tokens: TokenCounts, cost: number): void {
+function subtractDirect(session: SessionDirectTotals, tokens: TokenCounts, cost: number, speed?: SpeedContribution): void {
   session.tokens = subtractTokenCounts(session.tokens, tokens);
   session.cost = clampNonNegative(session.cost - cost);
   session.responseCount = clampNonNegative(session.responseCount - 1);
+  const updated = updateSpeedTotals(session.speed, speed, -1);
+  if (updated) session.speed = updated;
 }
 
 function applyDirectDelta(
@@ -3446,6 +3767,8 @@ function applyDirectDelta(
   previousCost: number,
   nextTokens: TokenCounts,
   nextCost: number,
+  previousSpeed?: SpeedContribution,
+  nextSpeed?: SpeedContribution,
 ): void {
   const tokens = emptyTokenCounts();
   for (const field of TOTALS_TOKEN_FIELDS) {
@@ -3453,6 +3776,8 @@ function applyDirectDelta(
   }
   session.tokens = tokens;
   session.cost = clampNonNegative(session.cost + nextCost - previousCost);
+  const updated = updateSpeedTotals(updateSpeedTotals(session.speed, previousSpeed, -1), nextSpeed, 1);
+  if (updated) session.speed = updated;
 }
 
 function subtractTokenCounts(left: TokenCounts, right: TokenCounts): TokenCounts {
@@ -3554,15 +3879,19 @@ function coerceSettled(value: unknown): Record<string, OpenContribution | true> 
 
 function coerceDirectTotals(value: unknown): SessionDirectTotals {
   if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
+  if (value.speed !== undefined && !coerceSpeedTotals(value.speed)) throw new TypeError("Invalid totals ledger");
   return {
     tokens: coerceTotalsTokens(value.tokens),
     cost: requireNonNegative(value.cost),
     responseCount: requireNonNegative(value.responseCount),
+    ...(value.speed !== undefined ? { speed: coerceSpeedTotals(value.speed) } : {}),
   };
 }
 
 function coerceOpenContribution(value: unknown): OpenContribution {
   if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
+  if (value.speed !== undefined && !coerceSpeedContribution(value.speed)) throw new TypeError("Invalid totals ledger");
+  if (value.update !== undefined && !coerceCompletionUpdate(value.update)) throw new TypeError("Invalid totals ledger");
   const sessionID = value.sessionID;
   if (typeof sessionID !== "string" || sessionID.length === 0) {
     throw new TypeError("Invalid totals ledger");
@@ -3576,6 +3905,8 @@ function coerceOpenContribution(value: unknown): OpenContribution {
     quality,
     tokens: coerceTotalsTokens(value.tokens),
     cost: requireNonNegative(value.cost),
+    ...(value.speed !== undefined ? { speed: coerceSpeedContribution(value.speed) } : {}),
+    ...(value.update !== undefined ? { update: coerceCompletionUpdate(value.update) } : {}),
   };
 }
 
@@ -3646,14 +3977,17 @@ function activeStats(
   bytesPerToken: number,
 ): {
   rate: number;
+  status: "warming" | "ready" | "inactive";
   generated: number;
   ttft?: number;
   elapsed: number;
 } {
-  if (!state) return { rate: 0, generated: 0, elapsed: 0 };
+  if (!state) return { rate: 0, status: "inactive", generated: 0, elapsed: 0 };
   const tokens = estimateActiveTokens(state, bytesPerToken);
+  const measured = measureRollingTokenRate(selectedSamples(state), now, DEFAULT_ROLLING_WINDOW_MS);
   return {
-    rate: rollingTokenRate(selectedSamples(state), now, DEFAULT_ROLLING_WINDOW_MS),
+    rate: measured.rate,
+    status: measured.status,
     generated: generatedTokens(tokens),
     ...(state.firstTokenAt !== undefined
       ? { ttft: Math.max(0, state.firstTokenAt - state.startedAt) }
@@ -3677,18 +4011,21 @@ function latestActive(
       .sort((left, right) => right.startedAt - left.startedAt)[0];
 }
 
-function liveLabel(
+export function liveLabel(
   store: RuntimeStore,
   sessionID: string,
   bytesPerToken: number,
   width: number,
+  now = Date.now(),
+  toolWaiting = false,
 ): string {
   const runtime = store.sessionRuntime.get(sessionID);
   const state = latestActive(store.active, sessionID, runtime?.activeMessageID);
-  const stats = activeStats(state, Date.now(), bytesPerToken);
+  const stats = activeStats(state, now, bytesPerToken);
   const runGenerated = runtime ? generatedTokens(runtime.runTotals) : 0;
   if (state) {
-    const rate = `LIVE ~${formatCompactRate(stats.rate)}`;
+    const rate = toolWaiting || stats.status === "inactive" ? "WAIT --"
+      : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
     if (width < 34) return rate;
     if (width < 58) {
       return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)}`;
@@ -3844,9 +4181,23 @@ function PromptRight(props: {
       props.sessionID,
       props.options.bytesPerToken,
       Math.max(1, props.api.renderer.width),
+      Date.now(),
+      knownToolWaiting(props.api, props.store, props.sessionID),
     );
   });
   return <text fg={props.api.theme.current.accent} truncate wrapMode="none">{label()}</text>;
+}
+
+function knownToolWaiting(api: TuiPluginApi, store: RuntimeStore, sessionID: string): boolean {
+  const state = latestActive(store.active, sessionID, store.sessionRuntime.get(sessionID)?.activeMessageID);
+  if (!state) return false;
+  const latest = selectedSamples(state).at(-1)?.timestamp ?? state.startedAt;
+  try {
+    return api.state.part(state.messageID).some((part) => part.type === "tool"
+      && part.state.status === "running" && part.state.time.start >= latest);
+  } catch {
+    return false;
+  }
 }
 
 export function rememberVisibleSession(store: RuntimeStore, sessionID: string | undefined): void {
@@ -3887,6 +4238,11 @@ function BottomContent(props: {
     return taskWallTimeForSession(props.store, sessionID());
   });
   const rows = createMemo(() => childRows(view().records, sessionID(), props.store));
+  const average = createMemo(() => {
+    props.store.revision();
+    return sessionAverageDisplay(sessionUsageSummary(props.store, sessionID()),
+      Boolean(parentSessionID(props.api, sessionID(), undefined, props.store)));
+  });
   const sections = createMemo((): PulseSectionData[] => {
     const totals = view().totals;
     return [
@@ -3937,6 +4293,7 @@ function BottomContent(props: {
       paddingTop={1}
       paddingX={1}
       overflow="hidden"
+      flexShrink={0}
     >
       <box
         focusable
@@ -3949,6 +4306,11 @@ function BottomContent(props: {
         <text fg={props.api.theme.current.primary} truncate wrapMode="none">
           {expanded() ? "- Token Pulse" : "+ Token Pulse"}
         </text>
+      </box>
+      <box flexDirection="column" width="100%" paddingX={1} flexShrink={0}>
+        <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().label}</text>
+        <text fg={props.api.theme.current.accent} wrapMode="word" flexShrink={0}>{average().value}</text>
+        {average().coverage && <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().coverage}</text>}
       </box>
       <text fg={props.api.theme.current.textMuted} width="100%" paddingX={1} truncate wrapMode="none">
         {metricLabel()}
@@ -4007,7 +4369,7 @@ export function createTuiSlotPlugin(
   };
 }
 
-function registerLegacyCommand(api: TuiPluginApi, openHistory: () => void): void {
+function registerLegacyCommand(api: TuiPluginApi, openHistory: () => void, openDetails: () => void, options: TuiOptions): void {
   if (!api.command) return;
   try {
     const dispose = once(api.command.register(() => [
@@ -4016,15 +4378,30 @@ function registerLegacyCommand(api: TuiPluginApi, openHistory: () => void): void
         value: COMMAND_NAME,
         description: "Open recent token speed history for the current session",
         category: "Plugin",
-        keybind: "ctrl+shift+t",
+        keybind: legacyBinding(options, COMMAND_NAME, "ctrl+shift+t"),
         slash: { name: "tps" },
         onSelect: openHistory,
+      },
+      {
+        title: "Token Pulse details",
+        value: DETAILS_COMMAND_NAME,
+        description: "Session averages, usage and timing coverage",
+        category: "Plugin",
+        keybind: legacyBinding(options, DETAILS_COMMAND_NAME, "ctrl+shift+y"),
+        slash: { name: "tps-details" },
+        onSelect: openDetails,
       },
     ]));
     api.lifecycle.onDispose(dispose);
   } catch (error) {
     warnWithToast(api, "legacy command registration failed", error);
   }
+}
+
+function legacyBinding(options: TuiOptions, name: string, fallback: string): string | undefined {
+  if (!options.keybinds || !Object.hasOwn(options.keybinds, name)) return fallback;
+  const value = options.keybinds[name];
+  return typeof value === "string" && value !== "none" ? value : undefined;
 }
 
 const tui: TuiPlugin = async (api, rawOptions) => {
@@ -4113,27 +4490,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       },
     ]);
 
-    api.keymap.registerLayer({
-      mode: "base",
-      commands: [
-        {
-          name: COMMAND_NAME,
-          title: "Open token history",
-          description: "Open recent token speed history for the current session",
-          category: "Plugin",
-          namespace: "palette",
-          slashName: "tps",
-          run: openHistory,
-        },
-      ],
-      bindings: [
-        {
-          key: "ctrl+shift+t",
-          cmd: COMMAND_NAME,
-          desc: "Open token history",
-        },
-      ],
-    });
+    registerTokenPulseCommands(api, store, options, openHistory);
     api.keymap.registerLayer({
       mode: HISTORY_MODE,
       priority: 100,
@@ -4141,7 +4498,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         {
           name: "oc-tps.history.back",
           title: "Return from token history",
-          description: "Return to the current session or home",
+          desc: "Return to the current session or home",
           category: "Plugin",
           run: () => leaveHistory(api),
         },
@@ -4156,7 +4513,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     });
   } catch (error) {
     warnWithToast(api, "keymap registration failed; using legacy command API", error);
-    registerLegacyCommand(api, openHistory);
+    const details = createDetailsController(api, store);
+    registerLegacyCommand(api, openHistory, () => { details.open(); }, options);
   }
 
   api.slots.register(createTuiSlotPlugin(api, store, options));
@@ -4177,6 +4535,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
 
   const handleEvent = (input: unknown): void => {
     if (disposed) return;
+    const receivedAt = Date.now();
     try {
       const event = normalizeEvent(input);
       if (!event) return;
@@ -4192,11 +4551,15 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         return;
       }
       if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
+      if (type === "message.part.updated") {
+        recordTuiPartMetadata(store, properties);
+        return;
+      }
       if (type === "message.part.delta") {
         recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken);
         return;
       }
-      if (type === "session.next.text.delta" || type === "session.next.reasoning.delta") {
+      if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
         recordDelta(
           store,
           properties,
@@ -4216,7 +4579,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         return;
       }
       if (type === "message.updated") {
-        if (handleMessageUpdated(store, api, properties, event, options.bytesPerToken)) {
+        if (handleMessageUpdated(store, api, properties, event, options.bytesPerToken, receivedAt)) {
           scheduleReload();
         }
         scheduleActivityReload();
@@ -4233,6 +4596,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   };
 
   subscribe("message.part.delta", handleEvent);
+  subscribe("message.part.updated", handleEvent);
+  subscribe("session.next.tool.input.delta", handleEvent);
   subscribe("session.next.text.delta", handleEvent);
   subscribe("session.next.reasoning.delta", handleEvent);
   subscribe("message.updated", handleEvent);

@@ -1,4 +1,5 @@
 import { addTokenCounts, emptyTokenCounts } from "./core.js";
+import { addSpeedTotals, coerceSpeedTotals } from './statistics.js';
 /**
  * Fold caller-supplied direct totals by parent links.
  * `direct` is the session alone. `including` adds every descendant once.
@@ -55,6 +56,8 @@ function sumReachable(sessions, childrenByParent, rootID) {
       totals.tokens = addTokenCounts(totals.tokens, source.tokens);
       totals.cost += source.cost;
       totals.responseCount += source.responseCount;
+      const speed = addSpeedTotals(totals.speed, source.speed);
+      if (speed) totals.speed = speed;
     }
     const children = childrenByParent.get(current);
     if (!children) continue;
@@ -73,7 +76,10 @@ function copyTotals(source) {
   return {
     tokens: addTokenCounts(emptyTokenCounts(), source.tokens),
     cost: source.cost,
-    responseCount: source.responseCount
+    responseCount: source.responseCount,
+    ...(source.speed ? {
+      speed: coerceSpeedTotals(source.speed)
+    } : {})
   };
 }
 function zeroTotals() {

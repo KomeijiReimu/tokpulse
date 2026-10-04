@@ -2,6 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionDirectTotals } from "../src/totals-storage.js";
 import { rollupSessionTotals } from "../src/totals-aggregate.js";
+import { getSessionAverageSummary, updateSpeedTotals } from "../src/statistics.js";
+
+test("direct average excludes child speed while rollup keeps independent sums", () => {
+  const root = usage(1);
+  root.speed = updateSpeedTotals(undefined, { response: { generatedTokens: 10, durationMs: 1000, estimated: false } }, 1);
+  const child = usage(2);
+  child.speed = updateSpeedTotals(undefined, { response: { generatedTokens: 100, durationMs: 100, estimated: true } }, 1);
+  const result = rollupSessionTotals({ root, child }, { child: "root" }, "root");
+  assert.equal(getSessionAverageSummary(result.direct).response.rate, 10);
+  assert.equal(getSessionAverageSummary(result.direct).response.estimated, false);
+  assert.equal(getSessionAverageSummary(result.including).response.rate, 110000 / 1100);
+  assert.equal(getSessionAverageSummary(result.including).response.estimated, true);
+  assert.equal(result.children[0]?.direct.speed?.response.generatedTokens, 100);
+});
 
 test("includes child usage when the parent direct total is zero", () => {
   const child = usage(7);

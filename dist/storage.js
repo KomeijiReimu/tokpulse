@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, basename, join } from "node:path";
 import { HISTORY_VERSION } from "./core.js";
+import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate } from './statistics.js';
 export const DEFAULT_MAX_RECORDS = 1000;
 export function createHistoryStorage(pathOrOptions, options = {}) {
   const settings = typeof pathOrOptions === "string" ? {
@@ -192,6 +193,12 @@ export function normalizeHistoryRecord(value) {
     samples,
     ...(quality ? {
       quality
+    } : {}),
+    ...(coerceSpeedContribution(value.speed) ? {
+      speed: coerceSpeedContribution(value.speed)
+    } : {}),
+    ...(coerceCompletionUpdate(value.update) ? {
+      update: coerceCompletionUpdate(value.update)
     } : {})
   };
 }
@@ -207,6 +214,13 @@ function upsertRecord(records, record) {
 function isPreferredRecord(candidate, existing) {
   const candidateQuality = candidate.quality ?? "exact";
   const existingQuality = existing.quality ?? "exact";
+  const nextUpdate = candidate.update;
+  const priorUpdate = existing.update;
+  if (nextUpdate) {
+    if (!isNewerCompletionUpdate(nextUpdate, priorUpdate)) return false;
+    return candidateQuality === "exact" || existingQuality !== "exact";
+  }
+  if (priorUpdate && candidateQuality === existingQuality) return false;
   if (candidateQuality !== existingQuality) return candidateQuality === "exact";
   const candidateCompleteness = recordCompleteness(candidate);
   const existingCompleteness = recordCompleteness(existing);

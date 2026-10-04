@@ -4,8 +4,9 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { server } from "../src/server.js";
+import { recordPartMetadata, server } from "../src/server.js";
 import { ActivityLedger } from "../src/runs-storage.js";
+import { getSessionAverageSummary } from "../src/statistics.js";
 
 async function readRecords(historyPath: string): Promise<any[]> {
   const content = await readFile(historyPath, "utf8");
@@ -15,6 +16,206 @@ async function readRecords(historyPath: string): Promise<any[]> {
 async function readTotals(historyPath: string): Promise<any> {
   return JSON.parse(await readFile(join(dirname(historyPath), "totals.json"), "utf8"));
 }
+
+async function backendCase(run: (context: { path: string; send: (event: any) => Promise<void>; restart: () => Promise<(event: any) => Promise<void>> }) => Promise<void>, maxRecords = 1000): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-backend-p1-"));
+  const path = join(directory, "history.jsonl");
+  const input = { directory, worktree: directory } as unknown as PluginInput;
+  const restart = async () => {
+    const hooks = await server(input, { historyPath: path, maxRecords });
+    return async (event: any) => { await hooks.event!({ event }); };
+  };
+  try { await run({ path, send: await restart(), restart }); }
+  finally { await rm(directory, { recursive: true, force: true }); }
+}
+function completionFact(id: string, output: number, reasoning: number, start: number, end: number) {
+  return { type: "message.updated", timestamp: end, properties: { info: {
+    id, sessionID: "s", role: "assistant", tokens: { input: 1, output, reasoning }, cost: output,
+    time: { created: start, completed: end },
+  } } };
+}
+function snapshotFact(id: string, messageID: string, type: string, end?: number) {
+  return { type: "message.part.updated", timestamp: end ?? 10, properties: { part: {
+    id, messageID, sessionID: "s", type, text: "", ...(end !== undefined ? { time: { end } } : {}),
+  } } };
+}
+async function textGeneration(send: (event: any) => Promise<void>, messageID: string) {
+  await send(snapshotFact(`${messageID}-p`, messageID, "text"));
+  await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID, partID: `${messageID}-p`, field: "text", delta: "hello" } });
+  await send(snapshotFact(`${messageID}-p`, messageID, "text", 200));
+  await send(completionFact(messageID, 10, 0, 0, 300));
+}
+
+test("authoritative corrections accept zero, smaller usage and shorter duration; known replay cannot revert", async () => {
+  await backendCase(async ({ path, send, restart }) => {
+    const original = completionFact("m", 10, 0, 0, 100);
+    await send(original);
+    await send(completionFact("m", 0, 0, 0, 200));
+    assert.equal((await readRecords(path))[0].tokens.output, 0);
+    assert.equal((await readTotals(path)).sessions.s.tokens.output, 0);
+    await send(completionFact("m", 8, 0, 0, 300));
+    await send(completionFact("m", 2, 0, 250, 300));
+    assert.equal((await readRecords(path))[0].time.duration, 50);
+    await send(original);
+    await (await restart())(original);
+    const [record] = await readRecords(path);
+    const totals = await readTotals(path);
+    assert.equal(record.tokens.output, 2);
+    assert.equal(totals.sessions.s.tokens.output, 2);
+    assert.equal(totals.sessions.s.speed.response.durationMs, 50);
+    assert.equal(totals.sessions.s.responseCount, 1);
+  });
+});
+test("trimmed completion replay and restart preserve settled generation evidence", async () => {
+  await backendCase(async ({ path, send, restart }) => {
+    await textGeneration(send, "m");
+    await send(completionFact("new", 0, 0, 300, 400));
+    const before = await readTotals(path);
+    assert.equal(before.settled.m.speed.generation.durationMs, 100);
+    assert.equal(before.settled.m.speed.generationEvidence.start, 100);
+    await send(completionFact("m", 10, 0, 0, 300));
+    await (await restart())(completionFact("m", 10, 0, 0, 300));
+    assert.deepEqual(await readTotals(path), before);
+    assert.equal((await readRecords(path))[0].messageID, "new");
+  }, 1);
+});
+
+for (const trimmed of [false, true]) {
+  test(`${trimmed ? "settled" : "retained"} exact completion rejects partial live usage before and after restart, but accepts exact zero`, async () => {
+    await backendCase(async ({ path, send, restart }) => {
+      await textGeneration(send, "m");
+      if (trimmed) await send(completionFact("new", 20, 0, 300, 400));
+      const before = await readTotals(path);
+      const historyBefore = await readRecords(path);
+      const coverageBefore = getSessionAverageSummary(before.sessions.s);
+      const expectedCount = trimmed ? 2 : 1;
+      assert.equal(before.sessions.s.tokens.output, trimmed ? 30 : 10);
+      assert.equal(before.sessions.s.responseCount, expectedCount);
+      assert.equal(coverageBefore.generation.coveredResponseCount, 1);
+      assert.equal(coverageBefore.response.coveredResponseCount, expectedCount);
+      assert.equal((trimmed ? before.settled.m : before.open.m).quality, "exact");
+
+      await send(assistantCompleted("m", { input: 1 }, 500, 0, "s"));
+      assert.deepEqual(await readRecords(path), historyBefore);
+      assert.deepEqual(await readTotals(path), before);
+      const restarted = await restart();
+      await restarted(assistantCompleted("m", { input: 1 }, 600, 0, "s"));
+      const after = await readTotals(path);
+      assert.deepEqual(await readRecords(path), historyBefore);
+      assert.deepEqual(after, before);
+      assert.deepEqual(after.sessions.s.tokens, before.sessions.s.tokens);
+      assert.deepEqual(after.sessions.s.speed, before.sessions.s.speed);
+      assert.equal(after.sessions.s.responseCount, expectedCount);
+      assert.deepEqual(getSessionAverageSummary(after.sessions.s), coverageBefore);
+
+      // Explicit complete zero usage is an authoritative correction, not partial data.
+      await restarted(completionFact("m", 0, 0, 0, 700));
+      const corrected = await readTotals(path);
+      assert.equal(corrected.sessions.s.tokens.output, trimmed ? 20 : 0);
+      assert.equal(corrected.sessions.s.tokens.reasoning, 0);
+      assert.equal(corrected.sessions.s.responseCount, expectedCount);
+      assert.equal(corrected.sessions.s.speed.generation.generatedTokens, 0);
+      assert.equal(corrected.sessions.s.speed.generation.durationMs, 100);
+      assert.equal(corrected.sessions.s.speed.generation.responseCount, 1);
+      assert.equal(corrected.sessions.s.speed.response.generatedTokens, trimmed ? 20 : 0);
+      assert.equal(corrected.sessions.s.speed.response.durationMs, trimmed ? 800 : 700);
+      assert.equal(corrected.sessions.s.speed.response.responseCount, expectedCount);
+      const records = await readRecords(path);
+      assert.equal(records.length, 1);
+      assert.equal(records[0].messageID, "m");
+      assert.equal(records[0].quality, "exact");
+      assert.equal(records[0].tokens.output, 0);
+    }, 1);
+  });
+}
+
+test("hidden reasoning correction and incompatible response times invalidate old generation", async () => {
+  await backendCase(async ({ path, send }) => {
+    await textGeneration(send, "hidden");
+    await textGeneration(send, "timing");
+    assert.equal((await readTotals(path)).sessions.s.speed.generation.responseCount, 2);
+    await send(completionFact("hidden", 10, 100, 0, 300));
+    await send(completionFact("timing", 10, 0, 150, 180));
+    assert.ok((await readRecords(path)).every((r) => r.speed.generation === undefined));
+    const totals = await readTotals(path);
+    assert.equal(totals.sessions.s.speed.generation.responseCount, 0);
+    assert.equal(totals.sessions.s.speed.response.generatedTokens, 120);
+    assert.equal(totals.sessions.s.responseCount, 2);
+  });
+});
+test("real legacy reasoning metadata classifies field:text without kind and calibrates final usage", async () => {
+  await backendCase(async ({ path, send }) => {
+    await send(snapshotFact("p", "m", "reasoning"));
+    await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "think" } });
+    await send(snapshotFact("p", "m", "reasoning", 200));
+    await send(completionFact("m", 0, 100, 0, 300));
+    const [record] = await readRecords(path);
+    assert.equal(record.samples[0].kind, "reasoning");
+    assert.equal(record.samples.reduce((sum: number, sample: any) => sum + sample.tokens, 0), 100);
+    assert.equal(record.time.firstToken, 100);
+    assert.equal(record.speed.generation.durationMs, 100);
+  });
+});
+test("snapshot-only entry point never rebuilds active and known user deltas cannot generate", async () => {
+  const active = new Map();
+  recordPartMetadata(active, snapshotFact("p", "completed", "text", 200).properties);
+  recordPartMetadata(active, { part: { id: "tool", messageID: "completed", sessionID: "s", type: "tool", state: { status: "completed", time: { end: 1000 } } } });
+  recordPartMetadata(active, snapshotFact("user-p", "user", "text").properties);
+  assert.equal(active.size, 0);
+  await backendCase(async ({ path, send }) => {
+    await send(completionFact("completed", 10, 0, 0, 300));
+    const before = await readTotals(path);
+    await send(snapshotFact("p", "completed", "text", 200));
+    await send({ type: "message.part.updated", properties: { part: { id: "tool", messageID: "completed", sessionID: "s", type: "tool", state: { status: "completed", time: { end: 1000 } } } } });
+    await send({ type: "message.updated", properties: { info: { id: "user", sessionID: "s", role: "user" } } });
+    await send(snapshotFact("user-p", "user", "text"));
+    await send({ type: "message.part.delta", timestamp: 400, properties: { sessionID: "s", messageID: "user", partID: "user-p", field: "text", delta: "user text" } });
+    await send({ type: "session.idle", timestamp: 1000, properties: { sessionID: "s" } });
+    assert.deepEqual(await readTotals(path), before);
+    assert.equal((await readRecords(path)).length, 1);
+  });
+});
+test("real v2 textID reasoningID and callID associate content with end metadata", async () => {
+  await backendCase(async ({ path, send }) => {
+    await send({ type: "session.next.text.delta", timestamp: 100, properties: { sessionID: "s", assistantMessageID: "m", textID: "text", delta: "hello" } });
+    await send({ type: "session.next.reasoning.delta", timestamp: 150, properties: { sessionID: "s", assistantMessageID: "m", reasoningID: "reason", delta: "think" } });
+    await send({ type: "session.next.tool.input.delta", timestamp: 200, properties: { sessionID: "s", assistantMessageID: "m", callID: "call", delta: "{}" } });
+    await send(snapshotFact("text", "m", "text", 190));
+    await send(snapshotFact("reason", "m", "reasoning", 180));
+    await send({ type: "message.part.updated", timestamp: 250, properties: { part: { id: "tool-part", callID: "call", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 250 } } } } });
+    await send(completionFact("m", 10, 5, 0, 1000));
+    const [record] = await readRecords(path);
+    assert.equal(record.samples.length, 3);
+    assert.equal(record.samples.filter((s: any) => s.kind === "reasoning").reduce((sum: number, s: any) => sum + s.tokens, 0), 5);
+    assert.equal(record.speed.generation.durationMs, 150);
+    assert.equal(record.speed.generationEvidence.reasoningObserved, true);
+  });
+});
+test("explicit envelope revisions reject stale updates and permit a genuinely newer return to old facts", async () => {
+  await backendCase(async ({ path, send }) => {
+    await send({ ...completionFact("m", 10, 0, 0, 100), revision: 1 });
+    await send({ ...completionFact("m", 0, 0, 0, 200), revision: 3 });
+    await send({ ...completionFact("m", 5, 0, 0, 300), revision: 2 });
+    assert.equal((await readTotals(path)).sessions.s.tokens.output, 0);
+    await send({ ...completionFact("m", 10, 0, 0, 100), revision: 4 });
+    assert.equal((await readRecords(path))[0].tokens.output, 10);
+    assert.equal((await readTotals(path)).sessions.s.tokens.output, 10);
+    assert.equal((await readTotals(path)).sessions.s.responseCount, 1);
+  });
+});
+test("server restart replay cannot backfill or double-add a legacy settled true marker", async () => {
+  await backendCase(async ({ path, send, restart }) => {
+    await textGeneration(send, "m");
+    await send(completionFact("new", 0, 0, 300, 400));
+    const ledger = await readTotals(path);
+    ledger.settled.m = true;
+    await writeFile(join(dirname(path), "totals.json"), JSON.stringify(ledger));
+    const restarted = await restart();
+    await restarted(completionFact("m", 100, 0, 0, 300));
+    await restarted(completionFact("m", 100, 0, 0, 300));
+    assert.deepEqual(await readTotals(path), ledger);
+  }, 1);
+});
 
 function assistantCompleted(
   messageID: string,
@@ -39,11 +240,96 @@ function assistantCompleted(
   };
 }
 
+test("trusted content timing spans reasoning/tool input, snapshots do not sample and tools output is ignored", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-content-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    const send = async (type: string, timestamp: number, properties: any) => hooks.event!({ event: { type, timestamp, properties } as never });
+    await send("message.part.updated", 10, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "old snapshot" } });
+    await send("session.next.text.delta", 300, { sessionID: "s", assistantMessageID: "m", partID: "text", delta: "hi" });
+    await send("message.part.delta", 100, { sessionID: "s", messageID: "m", partID: "reason", kind: "reasoning", field: "text", delta: "think" });
+    await send("session.next.tool.input.delta", 400, { sessionID: "s", assistantMessageID: "m", partID: "tool", delta: "{}" });
+    await send("message.part.updated", 500, { part: { id: "reason", messageID: "m", sessionID: "s", type: "reasoning", text: "think", time: { end: 200 } } });
+    await send("message.part.updated", 510, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "hi", time: { end: 350 } } });
+    await send("message.part.updated", 520, { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 450 } } } });
+    await send("message.part.delta", 600, { sessionID: "s", messageID: "m", partID: "tool", field: "output", delta: "tool result must not count" });
+    await send("message.part.updated", 950, { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 450, end: 900 } } } });
+    const info = { id: "m", sessionID: "s", role: "assistant", tokens: { input: 10, output: 20, reasoning: 5 }, time: { created: 0, firstToken: 300, completed: 1000 } };
+    await send("message.updated", 1000, { info });
+    let records = await readRecords(historyPath);
+    assert.equal(records[0].time.firstToken, 100);
+    assert.equal(records[0].time.ttft, 100);
+    assert.equal(records[0].samples.length, 2); // v2 final priority, no snapshot/result duplication
+    assert.equal(records[0].speed.generation.durationMs, 350);
+    assert.equal(records[0].speed.generation.estimated, true);
+    assert.equal(records[0].speed.response.durationMs, 1000);
+    await send("message.updated", 1200, { info: { ...info, time: { created: 0, firstToken: 300, completed: 1200 } } });
+    records = await readRecords(historyPath);
+    assert.equal(records[0].time.firstToken, 100);
+    assert.equal(records[0].speed.response.durationMs, 1200);
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.s.responseCount, 1);
+    assert.equal(totals.sessions.s.speed.response.durationMs, 1200);
+    assert.equal(totals.sessions.s.speed.generation.durationMs, 350);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("unknown multistep usage is not summed and missing final usage is provisional", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-steps-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    for (const output of [10, 20]) await hooks.event!({ event: { type: "session.next.step.ended", timestamp: output,
+      properties: { sessionID: "s", assistantMessageID: "m", tokens: { input: 5, output, reasoning: 0 } } } as never });
+    await hooks.event!({ event: { type: "message.updated", timestamp: 100, properties: { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 0, completed: 100 } } } } as never });
+    const [record] = await readRecords(historyPath);
+    assert.equal(record.tokens.output, 20);
+    assert.equal(record.quality, "provisional");
+    assert.equal(record.speed.response.estimated, true);
+    assert.equal(record.speed.generation, undefined);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("cumulative direct speed outlives the retained history window", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-speed-window-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath, maxRecords: 1 });
+    await hooks.event!({ event: assistantCompleted("old", { input: 1, output: 10, reasoning: 0 }, 100) as never });
+    await hooks.event!({ event: assistantCompleted("new", { input: 1, output: 30, reasoning: 0 }, 200) as never });
+    assert.equal((await readRecords(historyPath)).length, 1);
+    const totals = await readTotals(historyPath);
+    assert.equal(totals.sessions.session.speed.response.generatedTokens, 40);
+    assert.equal(totals.sessions.session.speed.response.durationMs, 100);
+    assert.equal(totals.sessions.session.speed.response.responseCount, 2);
+    assert.equal(totals.settled.old.speed.response.generatedTokens, 10);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("tool-only snapshots have no invented first output or generation interval", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-tool-only-"));
+  const historyPath = join(directory, "history.jsonl");
+  try {
+    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
+    await hooks.event!({ event: { type: "message.part.updated", timestamp: 100, properties: { part: {
+      id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", input: { command: "echo hi" }, time: { start: 100 } },
+    } } } as never });
+    await hooks.event!({ event: { type: "session.next.tool.result", timestamp: 800, properties: { sessionID: "s", assistantMessageID: "m", delta: "result" } } as never });
+    await hooks.event!({ event: assistantCompleted("m", { input: 1, output: 10, reasoning: 0 }, 1000, 0, "s") as never });
+    const [record] = await readRecords(historyPath);
+    assert.equal(record.time.firstToken, undefined);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed.generation, undefined);
+    assert.equal(record.speed.response.durationMs, 50);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 async function readRunEvents(runsPath: string): Promise<any[]> {
   return new ActivityLedger(runsPath).read({ dedupe: false });
 }
 
-test("completion keeps fallback cache counts, preserves output zero, and deduplicates", async () => {
+test("final usage supersedes fallback cache counts, preserves output zero, and deduplicates", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
   const historyPath = join(directory, "history.jsonl");
   try {
@@ -109,8 +395,8 @@ test("completion keeps fallback cache counts, preserves output zero, and dedupli
       input: 0,
       output: 0,
       reasoning: 0,
-      cacheRead: 9,
-      cacheWrite: 11,
+      cacheRead: 0,
+      cacheWrite: 0,
     });
     assert.equal(records[0].quality, "exact");
   } finally {

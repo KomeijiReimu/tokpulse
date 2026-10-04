@@ -1,4 +1,5 @@
 import { addTokenCounts, emptyTokenCounts } from "./core.js";
+import { addSpeedTotals, coerceSpeedTotals } from './statistics.js';
 import type { SessionDirectTotals } from "./totals-storage.js";
 
 export interface TotalsRollupChild {
@@ -91,6 +92,8 @@ function sumReachable(
       totals.tokens = addTokenCounts(totals.tokens, source.tokens);
       totals.cost += source.cost;
       totals.responseCount += source.responseCount;
+      const speed = addSpeedTotals(totals.speed, source.speed);
+      if (speed) totals.speed = speed;
     }
 
     const children = childrenByParent.get(current);
@@ -117,6 +120,7 @@ function copyTotals(source: SessionDirectTotals | undefined): SessionDirectTotal
     tokens: addTokenCounts(emptyTokenCounts(), source.tokens),
     cost: source.cost,
     responseCount: source.responseCount,
+    ...(source.speed ? { speed: coerceSpeedTotals(source.speed) } : {}),
   };
 }
 
