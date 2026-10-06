@@ -14,6 +14,7 @@ import {
   cacheHitRate,
   classifyTokenFields,
   cacheSessionParentFromEvent,
+  childRows,
   createActiveState,
   createRuntimeStore,
   createSessionRuntime,
@@ -27,6 +28,7 @@ import {
   formatHistoryRow,
   formatResponseTimingDetails,
   formatArrivalPeaks,
+  formatResponseThroughput,
   formatPulseMetrics,
   formatPulseSummary,
   projectSessionTotals,
@@ -59,7 +61,19 @@ import {
   buildSessionDetailsTree,
   selectSessionDetails,
 } from "../src/tui.js";
-import { emptySpeedTotals, updateSpeedTotals } from "../src/statistics.js";
+import { emptySpeedTotals, updateSpeedTotals, type SpeedContribution } from "../src/statistics.js";
+
+function v3Generation(output: number, reasoning = 0, durationMs = 1000, start = 0): SpeedContribution {
+  return {
+    generation: { generatedTokens: (output + reasoning) / 2, coverageGeneratedTokens: output + reasoning, durationMs, estimated: true },
+    generationEvidence: { version: 3, coverage: "complete", start, end: start + durationMs,
+      firstReceiveMono: 0, lastReceiveMono: durationMs, observationCount: 2,
+      timeSource: "receive-monotonic", fromCurrentStart: true, selectedStream: "legacy", stepID: "step",
+      outputObserved: output > 0, reasoningObserved: reasoning > 0,
+      bytes: { output: { total: output > 0 ? 2 : 0, firstBatch: output > 0 ? 1 : 0 },
+        reasoning: { total: reasoning > 0 ? 2 : 0, firstBatch: reasoning > 0 ? 1 : 0 } }, usage: { output, reasoning } },
+  };
+}
 
 function tokens(output: number, reasoning = 0): TokenCounts {
   return {
@@ -151,17 +165,17 @@ test("duplicate completion does not add twice or consume another pending respons
   assert.equal(active.has("__pending__:s"), true);
 });
 
-test("completed snapshot remains available with stable generated rate", () => {
+test("completed snapshot remains available with a qualified estimated interval rate", () => {
   const snapshot = makeLastCompletedSnapshot(record("done", "s", 20, 5, {
-    speed: { response: { generatedTokens: 25, durationMs: 1100, estimated: true } },
+    speed: { ...v3Generation(20, 5, 1000, 100), response: { generatedTokens: 25, durationMs: 1100, estimated: true } },
   }), 3);
   assert.equal(snapshot.generated, 25);
-  assert.equal(snapshot.elapsed, 1_100);
-  assert.equal(snapshot.rate, 25000 / 1100);
+  assert.equal(snapshot.elapsed, 1_000);
+  assert.equal(snapshot.rate, 12.5);
   assert.equal(snapshot.ttft, 100);
   assert.equal(snapshot.runEpoch, 3);
   assert.equal(snapshot.estimated, true);
-  assert.equal(snapshot.basis, "response");
+  assert.equal(snapshot.basis, "generation");
 });
 
 test("busy and retry continue the same epoch, while idle is idempotent", () => {
@@ -446,10 +460,13 @@ test("total token count includes cache writes and collapsed pulse shows speed", 
   assert.equal(cacheHitRate(mixed), 2 / 12);
   assert.equal(cacheHitRate({ ...mixed, cacheWrite: 900 }), 2 / 912);
   assert.equal(formatCacheHitRate(cacheHitRate(mixed)), "17%");
-  assert.equal(formatPulseMetrics(counts, 293), "937 total · 293 tok/s · cache 0%");
-  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "900 total · cache 0%");
-  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  937 total · 293 tok/s · cache 0%");
-  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  900 total · cache 0%");
+  assert.equal(formatPulseMetrics(counts, 293), "incl TPS ~293 · 937 total · cache 0%");
+  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, undefined), "incl TPS -- · 900 total · cache 0%");
+  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  incl TPS ~293 · 937 total · cache 0%");
+  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  incl TPS ~0 · 900 total · cache 0%");
+  assert.equal(formatPulseMetrics(counts, 293, 14), "incl TPS ~293");
+  assert.equal(formatPulseMetrics(counts, 57500, 14), "incl ~57.5k/s");
+  assert.equal(formatPulseMetrics(counts, undefined, 14), "incl TPS --");
 });
 
 test("aggregate speed is generated-weighted instead of response-average", () => {
@@ -463,8 +480,9 @@ test("aggregate speed is generated-weighted instead of response-average", () => 
   });
   const expected = (101 * 1000) / 1_100;
   assert.equal(aggregateSpeed([fast, slow]), expected);
-  assert.equal(recordSpeedSummary(fast).avg, 10);
-  assert.equal(recordSpeedSummary(slow).avg, 100);
+  assert.equal(recordSpeedSummary(fast).available, false);
+  assert.equal(recordSpeedSummary(slow).available, false);
+  assert.equal(formatResponseThroughput(slow), "Response throughput ~100 tok/s");
 });
 
 test("projected direct speed accepts a newer authoritative time-only correction without double counting", () => {
@@ -496,8 +514,9 @@ test("single-response average keeps its selected basis and insufficient arrival 
     ],
   });
   const summary = recordSpeedSummary(response);
-  assert.equal(summary.avg, 10);
-  assert.equal(summary.basis, "response");
+  assert.equal(summary.available, false);
+  assert.equal(summary.avg, 0);
+  assert.equal(summary.basis, undefined);
   assert.equal(summary.extremaAvailable, false);
   assert.equal(summary.max, 0);
   assert.equal(summary.min, 0);
@@ -509,8 +528,7 @@ test("LAST history and details select the same qualified generation and estimate
       firstResponseSource: "thinking", firstResponseTimeSource: "part-start", firstResponseEstimated: false,
       ttft: 100, completed: 5000 },
     speed: {
-      generation: { generatedTokens: 1000, durationMs: 100, estimated: true },
-      generationEvidence: { version: 2, coverage: "complete", start: 1000, end: 1100, outputObserved: true, reasoningObserved: false },
+      ...v3Generation(1000, 0, 1000, 1000),
       response: { generatedTokens: 1000, durationMs: 5000, estimated: false },
     },
   });
@@ -520,30 +538,32 @@ test("LAST history and details select the same qualified generation and estimate
   try {
     store.lastCompletedBySession.set("s", last);
     const details = selectSessionDetails(buildSessionDetailsTree(store, "s"), "s", store.lastCompletedBySession);
-    assert.equal(last.rate, 10000);
-    assert.equal(last.elapsed, 100);
+    assert.equal(last.rate, 500);
+    assert.equal(last.elapsed, 1000);
     assert.equal(last.ttft, 100);
     assert.equal(last.rate, history.avg);
     assert.equal(last.basis, history.basis);
     assert.equal(last.estimated, history.estimated);
     assert.equal(last.estimated, true);
     assert.deepEqual(details.lastSpeed, history);
-    assert.match(liveLabel(store, "s", 5.5, 28), /^LAST ~10k tok\/s generation$/);
-    assert.match(formatHistoryRow(response), /~10k\s+generation\s+--\s+--/);
+    assert.match(liveLabel(store, "s", 5.5, 28), /^LAST ~500 tok\/s generation$/);
+    assert.match(formatHistoryRow(response), /~500\s+generation\s+--\s+--/);
+    assert.equal(formatResponseThroughput(response), "Response throughput 200 tok/s");
     assert.match(formatResponseTimingDetails(response), /First content TTFT 1s.*thinking · part start/);
     assert.match(formatResponseTimingDetails(response), /not an exact provider request time/);
     assert.match(formatArrivalPeaks(response), /--.*insufficient/);
   } finally { store.disposeSignals(); }
 });
 
-test("legacy boolean generation evidence cannot override response; missing measurements never fall back to samples", () => {
+test("legacy generation evidence cannot become primary TPS; response and samples never fill it", () => {
   const response = record("legacy", "s", 100, 0, { speed: {
     generation: { generatedTokens: 100, durationMs: 100, estimated: false },
     generationEvidence: { start: 100, end: 200, outputObserved: true, reasoningObserved: false },
     response: { generatedTokens: 100, durationMs: 1100, estimated: true },
   } });
-  assert.equal(makeLastCompletedSnapshot(response).basis, "response");
-  assert.equal(recordSpeedSummary(response).avg, 100000 / 1100);
+  assert.equal(makeLastCompletedSnapshot(response).available, false);
+  assert.equal(recordSpeedSummary(response).avg, 0);
+  assert.equal(formatResponseThroughput(response), "Response throughput ~91 tok/s");
   const missing = { ...response, speed: undefined,
     samples: [{ timestamp: 0, tokens: 10 }, { timestamp: 1000, tokens: 20 }] };
   assert.equal(recordSpeedSummary(missing).available, false);
@@ -578,7 +598,7 @@ test("slot registration appends sidebar content without taking the footer or app
   assert.match(source, /focusable[\s\S]*onMouseDown/);
   assert.match(source, /\+ Token Pulse/);
   assert.match(source, /- Token Pulse/);
-  assert.match(source, /formatPulseMetrics\(summary\.tokens, summary\.speed\)/);
+  assert.match(source, /formatPulseMetrics\(summary\.tokens, summary\.speed, metricWidth\(\)\)/);
   assert.match(source, /displayedSessionID\(props\.store, props\.sessionID\)/);
   assert.doesNotMatch(source, /setFocusSession\(store, (sessionID|eventSessionID)\)/);
   assert.doesNotMatch(source, /focusSessionID \?\? props\.sessionID/);
@@ -1280,13 +1300,11 @@ test("activity reload uses the sidecar path and only reads it", async () => {
 test("main average uses cumulative direct speed, excluding children and the detail window", () => {
   const store = createRuntimeStore(1);
   const speed = updateSpeedTotals(emptySpeedTotals(), {
-    generation: { generatedTokens: 120, durationMs: 2000, estimated: false },
-    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 2000, outputObserved: true, reasoningObserved: true },
+    ...v3Generation(100, 20, 2000),
     response: { generatedTokens: 120, durationMs: 4000, estimated: false },
   }, 1)!;
   const childSpeed = updateSpeedTotals(emptySpeedTotals(), {
-    generation: { generatedTokens: 9000, durationMs: 1000, estimated: false },
-    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 1000, outputObserved: true, reasoningObserved: false },
+    ...v3Generation(9000),
     response: { generatedTokens: 9000, durationMs: 2000, estimated: false },
   }, 1)!;
   store.totalsLedger.sessions = {
@@ -1296,18 +1314,48 @@ test("main average uses cumulative direct speed, excluding children and the deta
   store.sessionParents.set("child", "root");
   rememberVisibleSession(store, "child");
   const summary = sessionUsageSummary(store, displayedSessionID(store, "root"));
-  assert.equal(summary.generation.rate, 60);
+  assert.equal(summary.generation.rate, 30);
   assert.equal(summary.response.rate, 30);
   assert.equal(summary.totalGeneratedTokens, 120);
-  assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "60 tok/s" });
+  assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "~30 tok/s", coverage: "Observed 1/1 calls" });
   assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "child"), true).label, "Session avg TPS");
   // Reload with the same ledger and no detail records: average stays cumulative.
   const reloaded = createRuntimeStore(1);
   reloaded.totalsLedger = structuredClone(store.totalsLedger);
   reloaded.sessionParents = new Map(store.sessionParents);
-  assert.equal(sessionUsageSummary(reloaded, "root").generation.rate, 60);
+  assert.equal(sessionUsageSummary(reloaded, "root").generation.rate, 30);
   store.disposeSignals();
   reloaded.disposeSignals();
+});
+
+test("child agent rows use cumulative direct generation, not bounded response history or descendants", () => {
+  const store = createRuntimeStore(1);
+  try {
+    const direct = (output: number, durationMs: number, measured = true) => ({
+      tokens: tokens(output), cost: 1, responseCount: 3,
+      speed: updateSpeedTotals(emptySpeedTotals(), measured ? v3Generation(output, 0, durationMs)
+        : { response: { generatedTokens: output, durationMs: 1, estimated: false } }, 1),
+    });
+    store.totalsLedger.sessions = { child: direct(200, 2000), grand: direct(800, 2000), unavailable: direct(100, 1000, false) };
+    store.sessionParents = new Map([["child", "root"], ["grand", "child"], ["unavailable", "root"]]);
+    const stale = record("old-child", "child", 200, 0, {
+      model: "kept-model", speed: { response: { generatedTokens: 200, durationMs: 1, estimated: false } },
+    });
+    store.totalsLedger.settled[stale.messageID] = true;
+    const rows = childRows([stale], "root", store);
+    assert.deepEqual(rows.map((row) => [row.sessionID, row.depth, row.speed, row.speedAvailable]), [
+      ["child", 0, 50, true], ["grand", 1, 200, true], ["unavailable", 0, 0, false],
+    ]);
+    assert.equal(rows[0].model, "kept-model");
+    assert.equal(rows[0].responseCount, 3);
+    assert.equal(rows[0].generated, 200);
+    assert.equal(childRows([], "root", store)[0].speed, 50); // History trimming cannot change the cumulative rate.
+    store.totalsLedger.sessions.child = { tokens: tokens(0), cost: 0, responseCount: 0, speed: emptySpeedTotals() };
+    const wrapper = childRows([], "root", store).find((row) => row.sessionID === "child")!;
+    assert.deepEqual([wrapper.responseCount, wrapper.generated, wrapper.speedAvailable], [0, 0, false]);
+    delete store.totalsLedger.generationBasisVersion;
+    assert.ok(childRows([stale], "root", store).every((row) => !row.speedAvailable));
+  } finally { store.disposeSignals(); }
 });
 
 test("details tree retains ledger-only child/grandchild and selects their own direct average and last response", () => {
@@ -1315,44 +1363,43 @@ test("details tree retains ledger-only child/grandchild and selects their own di
   const direct = (output: number, reasoning: number, generationMs: number, responseMs: number, cost: number) => ({
     tokens: tokens(output, reasoning), cost, responseCount: 1,
     speed: updateSpeedTotals(emptySpeedTotals(), {
-      generation: { generatedTokens: output + reasoning, durationMs: generationMs, estimated: false },
-      generationEvidence: { version: 2, coverage: "complete", start: 0, end: generationMs, outputObserved: true, reasoningObserved: reasoning > 0 },
+      ...v3Generation(output, reasoning, generationMs),
       response: { generatedTokens: output + reasoning, durationMs: responseMs, estimated: false },
     }, 1),
   });
   store.totalsLedger.sessions = { root: direct(80, 20, 1000, 2000, 1), child: direct(550, 50, 2000, 3000, 2),
-    grand: direct(30, 0, 3000, 6000, 3), unrelated: direct(999, 0, 1, 1, 99) };
+    grand: direct(30, 0, 3000, 6000, 3), unrelated: direct(999, 0, 1000, 2000, 99) };
   store.sessionParents = new Map([["child", "root"], ["grand", "child"]]);
   store.lastCompletedBySession.set("root", makeLastCompletedSnapshot(record("root-last", "root", 80, 20)));
   store.lastCompletedBySession.set("child", makeLastCompletedSnapshot(record("child-last", "child", 550, 50,
     { model: "known-child-model", time: { start: 0, firstToken: 222, completed: 3000 },
-      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false },
-        generationEvidence: { version: 2, coverage: "complete", start: 222, end: 2222, outputObserved: true, reasoningObserved: true } } })));
+      speed: v3Generation(550, 50, 2000, 222) })));
   store.lastCompletedBySession.set("grand", makeLastCompletedSnapshot(record("grand-last", "grand", 30, 0)));
   const before = structuredClone(store.totalsLedger);
   const tree = buildSessionDetailsTree(store, "root");
   assert.deepEqual(tree.nodes.map((node) => [node.sessionID, node.depth]), [["root", 0], ["child", 1], ["grand", 2]]);
   assert.equal(store.records.length, 0); // All three survive an empty trimmed detail window.
-  assert.deepEqual(tree.nodes.map((node) => node.average.generation.rate), [100, 300, 10]);
+  assert.deepEqual(tree.nodes.map((node) => node.average.generation.rate), [50, 150, 5]);
   assert.equal(tree.average.totalGeneratedTokens, 730);
   assert.equal(tree.including.responseCount, 3);
   assert.equal(tree.including.cost, 6);
   assert.equal(tree.including.tokens.input, 30);
   assert.equal(tree.including.tokens.cacheRead, 6);
-  assert.equal(tree.average.generation.rate, 730000 / 6000);
+  assert.equal(tree.average.generation.rate, 365000 / 6000);
+  assert.equal(tree.average.generation.coveredGeneratedTokens, 730);
   assert.equal(tree.average.response.rate, 730000 / 11000);
   assert.notEqual(tree.average.generation.rate, (100 + 300 + 10) / 3);
   const child = selectSessionDetails(tree, "child", store.lastCompletedBySession);
-  assert.equal(child.average.generation.rate, 300);
+  assert.equal(child.average.generation.rate, 150);
   assert.equal(child.average.response.rate, 200);
   assert.equal(child.direct.tokens.output, 550);
   assert.equal(child.direct.tokens.reasoning, 50);
   assert.equal(child.last?.record.messageID, "child-last");
   assert.equal(child.last?.record.model, "known-child-model");
   assert.equal(child.last?.ttft, 222);
-  assert.equal(child.lastSpeed?.avg, 300);
+  assert.equal(child.lastSpeed?.avg, 150);
   assert.equal(child.lastSpeed?.basis, "generation");
-  assert.equal(child.lastSpeed?.estimated, false);
+  assert.equal(child.lastSpeed?.estimated, true);
   assert.equal(selectSessionDetails(tree, "grand", store.lastCompletedBySession).last?.record.messageID, "grand-last");
   assert.equal(selectSessionDetails(tree, "unrelated", store.lastCompletedBySession).sessionID, "root");
   const childScope = buildSessionDetailsTree(store, "child");
@@ -1383,18 +1430,17 @@ test("details tree traverses empty intermediate parents, visits cycles once and 
 
 test("main average uses ratio of cumulative sums and identifies partial estimated timing", () => {
   const store = createRuntimeStore(1);
-  let speed = updateSpeedTotals(emptySpeedTotals(), { generation: { generatedTokens: 1, durationMs: 100, estimated: false },
-    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 100, outputObserved: true, reasoningObserved: false } }, 1);
-  speed = updateSpeedTotals(speed, { generation: { generatedTokens: 100, durationMs: 1000, estimated: true },
-    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 1000, outputObserved: true, reasoningObserved: false } }, 1);
+  let speed = updateSpeedTotals(emptySpeedTotals(), v3Generation(10, 0, 1000), 1);
+  speed = updateSpeedTotals(speed, v3Generation(100, 0, 2000), 1);
   store.totalsLedger.sessions.root = { tokens: tokens(150, 0), cost: 0, responseCount: 3, speed };
   const summary = sessionUsageSummary(store, "root");
-  assert.equal(summary.generation.rate, 101000 / 1100);
-  assert.notEqual(summary.generation.rate, (10 + 100) / 2);
-  assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "~92 tok/s", coverage: "Measured 2/3 calls" });
+  assert.equal(summary.generation.rate, 55000 / 3000);
+  assert.notEqual(summary.generation.rate, (5 + 25) / 2);
+  assert.equal(summary.generation.coveredGeneratedTokens, 110);
+  assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "~18 tok/s", coverage: "Observed 2/3 calls" });
   const response = updateSpeedTotals(emptySpeedTotals(), { response: { generatedTokens: 150, durationMs: 3000, estimated: true } }, 1);
   store.totalsLedger.sessions.root = { tokens: tokens(150, 0), cost: 0, responseCount: 1, speed: response };
-  assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "root")).value, "~50 tok/s (response)");
+  assert.deepEqual(sessionAverageDisplay(sessionUsageSummary(store, "root")), { label: "Main avg TPS", value: "--", coverage: "Observed 0/1 calls" });
   assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "missing")).value, "--");
   store.disposeSignals();
 });

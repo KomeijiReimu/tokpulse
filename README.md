@@ -25,7 +25,8 @@ It requires **OpenCode 1.18 or later**.
 
 Streaming token counts are estimated from UTF-8 bytes at **5.5 bytes/token**
 by default (`bytesPerToken`). When OpenCode provides usage at completion, those
-values replace the corresponding token estimates.
+values replace the corresponding usage estimates. Live and peak/minimum speeds
+remain byte-based arrival estimates.
 
 ## Install
 
@@ -85,20 +86,29 @@ file URLs above.
 
 ## Speed and session details
 
-The session-only averages use **total generated tokens / total measured seconds**
-across covered completed responses. Generated tokens include output and reasoning;
-child-agent responses are excluded. The accumulated token and time sums persist
-in `totals.json` beside the history file and survive history trimming.
+The primary speed is **generation TPS**, including output and observable reasoning.
+`~` marks a host-observed estimate: event arrival timing cannot reveal the
+provider's exact internal generation speed. A completed measurement needs at least
+**1 second** between the first and last nonempty deltas and **two distinct arrival
+batches**, with complete content observations matching the final response.
+Tokens in the first batch are excluded using each category's share of observed
+bytes and its final usage; this interval token count is always an estimate.
+Retry-contaminated, interrupted, or incomplete observations have no generation TPS.
 
-- **Generation average** estimates throughput over measured generation intervals.
-- **Response average** uses the full response duration, including TTFT and
-  possibly tool wait time.
+- **Main average** uses the current session's own cumulative generation measurements,
+  excluding child agents. Expand Token Pulse to see this average and its coverage.
+- **Compact speed** uses cumulative generation measurements including descendant
+  agents, matching the inclusive usage totals.
+- **Response throughput** is separate: it uses the full response duration,
+  including TTFT and possibly tool wait time. It never substitutes for generation
+  TPS; missing generation measurements display `--`.
 
-Coverage shows the responses and tokens with measurements. Older data may lack
-the timing needed for one or both averages, so historical coverage can be partial.
-An average is unavailable when there is no usable measurement.
-
-Expand Token Pulse to see the current agent's average TPS under `SESSION ONLY`.
+Cumulative generation TPS is **total estimated interval tokens / total measured
+seconds**, persisted in `totals.json` beside history and retained after history
+trimming. Coverage reports qualified responses and their **full generated usage**,
+not just the interval token estimates. Speed measurements start fresh with this
+observation basis; existing token, cost, call, and response-throughput totals are
+retained. Older history cannot supply the missing generation observations.
 
 Live speed estimates token arrivals. It needs at least **1 second** and **two
 distinct observation timestamps**; until then, the display shows `WARMUP`.

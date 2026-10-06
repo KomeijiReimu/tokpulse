@@ -17,13 +17,35 @@ async function readTotals(historyPath: string): Promise<any> {
   return JSON.parse(await readFile(join(dirname(historyPath), "totals.json"), "utf8"));
 }
 
+async function receive(hooks: Awaited<ReturnType<typeof server>>, event: any): Promise<void> {
+  const wall = event.receiveWall ?? event.timestamp ?? Date.now();
+  const dateNow = Date.now;
+  const descriptor = Object.getOwnPropertyDescriptor(performance, "now");
+  let pending: ReturnType<NonNullable<typeof hooks.event>>;
+  try {
+    Date.now = () => wall;
+    Object.defineProperty(performance, "now", { configurable: true, value: () => event.receiveMono ?? wall });
+    pending = hooks.event!({ event });
+  } finally {
+    Date.now = dateNow;
+    if (descriptor) Object.defineProperty(performance, "now", descriptor);
+    else delete (performance as any).now;
+  }
+  await pending!;
+}
+
 async function backendCase(run: (context: { path: string; send: (event: any) => Promise<void>; restart: () => Promise<(event: any) => Promise<void>> }) => Promise<void>, maxRecords = 1000): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-backend-p1-"));
   const path = join(directory, "history.jsonl");
   const input = { directory, worktree: directory } as unknown as PluginInput;
   const restart = async () => {
-    const hooks = await server(input, { historyPath: path, maxRecords });
-    return async (event: any) => { await hooks.event!({ event }); };
+    const startupNow = Date.now;
+    let hooks: Awaited<ReturnType<typeof server>>;
+    try {
+      Date.now = () => 0;
+      hooks = await server(input, { historyPath: path, maxRecords });
+    } finally { Date.now = startupNow; }
+    return (event: any) => receive(hooks, event);
   };
   try { await run({ path, send: await restart(), restart }); }
   finally { await rm(directory, { recursive: true, force: true }); }
@@ -41,10 +63,13 @@ function snapshotFact(id: string, messageID: string, type: string, end?: number,
   } } };
 }
 async function textGeneration(send: (event: any) => Promise<void>, messageID: string) {
+  await send({ type: "message.updated", timestamp: 0, properties: { info: { id: messageID, sessionID: "s", role: "assistant", time: { created: 0 } } } });
+  await send({ type: "session.next.step.started", timestamp: 0, properties: { sessionID: "s", messageID, stepID: `${messageID}-step` } });
   await send(snapshotFact(`${messageID}-p`, messageID, "text", undefined, "", 100));
   await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID, partID: `${messageID}-p`, field: "text", delta: "hello" } });
-  await send(snapshotFact(`${messageID}-p`, messageID, "text", 200, "hello", 100));
-  await send(completionFact(messageID, 10, 0, 0, 300));
+  await send({ type: "message.part.delta", timestamp: 1200, properties: { sessionID: "s", messageID, partID: `${messageID}-p`, field: "text", delta: "world" } });
+  await send(snapshotFact(`${messageID}-p`, messageID, "text", 1300, "helloworld", 100));
+  await send(completionFact(messageID, 10, 0, 0, 1500));
 }
 
 test("authoritative corrections accept zero, smaller usage and shorter duration; known replay cannot revert", async () => {
@@ -72,10 +97,11 @@ test("trimmed completion replay and restart preserve settled generation evidence
     await textGeneration(send, "m");
     await send(completionFact("new", 0, 0, 300, 400));
     const before = await readTotals(path);
-    assert.equal(before.settled.m.speed.generation.durationMs, 100);
+    assert.equal(before.settled.m.speed.generation.durationMs, 1100);
+    assert.equal(before.settled.m.speed.generation.generatedTokens, 5);
     assert.equal(before.settled.m.speed.generationEvidence.start, 100);
-    await send(completionFact("m", 10, 0, 0, 300));
-    await (await restart())(completionFact("m", 10, 0, 0, 300));
+    await send(completionFact("m", 10, 0, 0, 1500));
+    await (await restart())(completionFact("m", 10, 0, 0, 1500));
     assert.deepEqual(await readTotals(path), before);
     assert.equal((await readRecords(path))[0].messageID, "new");
   }, 1);
@@ -96,11 +122,11 @@ for (const trimmed of [false, true]) {
       assert.equal(coverageBefore.response.coveredResponseCount, expectedCount);
       assert.equal((trimmed ? before.settled.m : before.open.m).quality, "exact");
 
-      await send(assistantCompleted("m", { input: 1 }, 500, 0, "s"));
+      await send(assistantCompleted("m", { input: 1 }, 1600, 0, "s"));
       assert.deepEqual(await readRecords(path), historyBefore);
       assert.deepEqual(await readTotals(path), before);
       const restarted = await restart();
-      await restarted(assistantCompleted("m", { input: 1 }, 600, 0, "s"));
+      await restarted(assistantCompleted("m", { input: 1 }, 1700, 0, "s"));
       const after = await readTotals(path);
       assert.deepEqual(await readRecords(path), historyBefore);
       assert.deepEqual(after, before);
@@ -110,16 +136,16 @@ for (const trimmed of [false, true]) {
       assert.deepEqual(getSessionAverageSummary(after.sessions.s), coverageBefore);
 
       // Explicit complete zero usage is an authoritative correction, not partial data.
-      await restarted(completionFact("m", 0, 0, 0, 700));
+      await restarted(completionFact("m", 0, 0, 0, 2000));
       const corrected = await readTotals(path);
       assert.equal(corrected.sessions.s.tokens.output, trimmed ? 20 : 0);
       assert.equal(corrected.sessions.s.tokens.reasoning, 0);
       assert.equal(corrected.sessions.s.responseCount, expectedCount);
       assert.equal(corrected.sessions.s.speed.generation.generatedTokens, 0);
-      assert.equal(corrected.sessions.s.speed.generation.durationMs, 100);
+      assert.equal(corrected.sessions.s.speed.generation.durationMs, 1100);
       assert.equal(corrected.sessions.s.speed.generation.responseCount, 1);
       assert.equal(corrected.sessions.s.speed.response.generatedTokens, trimmed ? 20 : 0);
-      assert.equal(corrected.sessions.s.speed.response.durationMs, trimmed ? 800 : 700);
+      assert.equal(corrected.sessions.s.speed.response.durationMs, trimmed ? 2100 : 2000);
       assert.equal(corrected.sessions.s.speed.response.responseCount, expectedCount);
       const records = await readRecords(path);
       assert.equal(records.length, 1);
@@ -130,31 +156,39 @@ for (const trimmed of [false, true]) {
   });
 }
 
-test("hidden reasoning correction and incompatible response times invalidate old generation", async () => {
+test("hidden reasoning invalidates generation, while provider-time corrections preserve receive-monotonic evidence", async () => {
   await backendCase(async ({ path, send }) => {
     await textGeneration(send, "hidden");
     await textGeneration(send, "timing");
     assert.equal((await readTotals(path)).sessions.s.speed.generation.responseCount, 2);
     await send(completionFact("hidden", 10, 100, 0, 300));
     await send(completionFact("timing", 10, 0, 150, 180));
-    assert.ok((await readRecords(path)).every((r) => r.speed.generation === undefined));
+    const records = await readRecords(path);
+    assert.equal(records.find((r) => r.messageID === "hidden").speed.generation, undefined);
+    assert.equal(records.find((r) => r.messageID === "timing").speed.generation.durationMs, 1100);
     const totals = await readTotals(path);
-    assert.equal(totals.sessions.s.speed.generation.responseCount, 0);
+    assert.equal(totals.sessions.s.speed.generation.responseCount, 1);
+    assert.equal(totals.sessions.s.speed.generation.generatedTokens, 5);
     assert.equal(totals.sessions.s.speed.response.generatedTokens, 120);
     assert.equal(totals.sessions.s.responseCount, 2);
   });
 });
 test("real legacy reasoning metadata classifies field:text without kind and calibrates final usage", async () => {
   await backendCase(async ({ path, send }) => {
+    await send({ type: "message.updated", timestamp: 0, properties: { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 0 } } } });
+    await send({ type: "session.next.step.started", timestamp: 0, properties: { sessionID: "s", messageID: "m", stepID: "one" } });
     await send(snapshotFact("p", "m", "reasoning", undefined, "", 100));
     await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "think" } });
-    await send(snapshotFact("p", "m", "reasoning", 200, "think", 100));
-    await send(completionFact("m", 0, 100, 0, 300));
+    await send({ type: "message.part.delta", timestamp: 1200, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "again" } });
+    await send(snapshotFact("p", "m", "reasoning", 1300, "thinkagain", 100));
+    await send(completionFact("m", 0, 100, 0, 1500));
     const [record] = await readRecords(path);
     assert.equal(record.samples[0].kind, "reasoning");
     assert.equal(record.samples.reduce((sum: number, sample: any) => sum + sample.tokens, 0), 100);
     assert.equal(record.time.firstToken, 100);
-    assert.equal(record.speed.generation.durationMs, 100);
+    assert.equal(record.speed.generation.durationMs, 1100);
+    assert.equal(record.speed.generation.generatedTokens, 50);
+    assert.equal(record.speed.generation.coverageGeneratedTokens, 100);
   });
 });
 test("snapshot-only entry point never rebuilds active and known user deltas cannot generate", async () => {
@@ -248,7 +282,7 @@ test("known snapshot gap and uncertain tool input downgrade generation without s
   const historyPath = join(directory, "history.jsonl");
   try {
     const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
-    const send = async (type: string, timestamp: number, properties: any) => hooks.event!({ event: { type, timestamp, properties } as never });
+    const send = (type: string, timestamp: number, properties: any) => receive(hooks, { type, timestamp, properties });
     await send("message.part.updated", 10, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "old snapshot", time: { start: 300 } } });
     await send("session.next.text.delta", 300, { sessionID: "s", assistantMessageID: "m", partID: "text", delta: "hi" });
     await send("message.part.delta", 100, { sessionID: "s", messageID: "m", partID: "reason", kind: "reasoning", field: "text", delta: "think" });

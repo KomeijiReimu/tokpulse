@@ -17,6 +17,40 @@ test("direct average excludes child speed while rollup keeps independent sums", 
   assert.equal(result.children[0]?.direct.speed?.response.generatedTokens, 100);
 });
 
+test("generation rollup sums estimated interval tokens and full coverage independently", () => {
+  const root = usage(1);
+  root.tokens.output = 20;
+  root.tokens.reasoning = 4;
+  root.speed = { generation: { generatedTokens: 17, coverageGeneratedTokens: 24, durationMs: 2000, responseCount: 1, estimatedResponseCount: 1 },
+    response: { generatedTokens: 24, coverageGeneratedTokens: 24, durationMs: 3000, responseCount: 1, estimatedResponseCount: 0 } };
+  const child = usage(2);
+  child.tokens.output = 10;
+  child.tokens.reasoning = 2;
+  child.speed = { generation: { generatedTokens: 8.5, coverageGeneratedTokens: 12, durationMs: 1000, responseCount: 1, estimatedResponseCount: 1 },
+    response: { generatedTokens: 12, coverageGeneratedTokens: 12, durationMs: 1500, responseCount: 1, estimatedResponseCount: 0 } };
+  const result = rollupSessionTotals({ root, child }, { child: "root" }, "root");
+  assert.equal(result.direct.speed?.generation.generatedTokens, 17);
+  assert.equal(result.direct.speed?.generation.coverageGeneratedTokens, 24);
+  assert.equal(result.including.speed?.generation.generatedTokens, 25.5);
+  assert.equal(result.including.speed?.generation.coverageGeneratedTokens, 36);
+  assert.equal(result.including.speed?.generation.durationMs, 3000);
+  assert.equal(getSessionAverageSummary(result.direct).generation.coveredGeneratedTokens, 24);
+  assert.equal(getSessionAverageSummary(result.including).generation.coveredGeneratedTokens, 36);
+  assert.equal(getSessionAverageSummary(result.including).generation.rate, 8.5);
+  result.children[0]!.direct.speed!.generation.coverageGeneratedTokens = 999;
+  assert.equal(child.speed.generation.coverageGeneratedTokens, 12);
+});
+
+test("persisted accumulators missing new coverage never infer it from interval tokens", () => {
+  const root = usage(1);
+  root.speed = { generation: { generatedTokens: 17, durationMs: 2000, responseCount: 1, estimatedResponseCount: 1 },
+    response: { generatedTokens: 24, durationMs: 3000, responseCount: 1, estimatedResponseCount: 0 } };
+  const result = rollupSessionTotals({ root }, {}, "root");
+  assert.equal(result.direct.speed?.generation.coverageGeneratedTokens, 0);
+  assert.equal(result.including.speed?.generation.coverageGeneratedTokens, 0);
+  assert.equal(getSessionAverageSummary(result.including).generation.coveredGeneratedTokens, 0);
+});
+
 test("includes child usage when the parent direct total is zero", () => {
   const child = usage(7);
   const result = rollupSessionTotals(

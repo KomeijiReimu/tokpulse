@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { HistoryRecord } from "../src/core.js";
-import { acceptModelDelta, applyFirstResponseSignal, contentSpeedObservations, createContentProgress, deriveSafeResponseMeasurement, earliestFirstOutput, getSessionAverageSummary, measureRecordSpeed, mergeRecordSpeed, notePartSnapshot, parseModelDelta, recordContentArrival, selectSpeedMeasurement, thinkingFirstResponseSignal, updateSpeedTotals } from "../src/statistics.js";
+import { utf8ByteLength } from "../src/core.js";
+import { acceptModelDelta, addSpeedTotals, applyFirstResponseSignal, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentProgress, deriveSafeResponseMeasurement, earliestFirstOutput, getSessionAverageSummary, isQualifiedGenerationContribution, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, noteContentArrival, notePartSnapshot, noteStepIdentity, parseModelDelta, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal, updateSpeedTotals } from "../src/statistics.js";
 
 function record(output = 100, reasoning = 0): HistoryRecord {
   return { version: 1, messageID: "m", sessionID: "s", tokens: { input: 0, output, reasoning, cacheRead: 0, cacheWrite: 0 }, cost: 0,
     time: { start: 0, firstToken: 100, completed: 2000 }, samples: [], quality: "exact" };
 }
 test("session average is ratio of sums with separate generation/response coverage", () => {
-  let speed = updateSpeedTotals(undefined, measureRecordSpeed(record(10), { usageExact: true, responseTimingExact: true,
-    generation: { start: 100, end: 1100, complete: true, estimated: true, version: 2, coverage: "complete", outputObserved: true, reasoningObserved: false } }), 1);
+  let speed = updateSpeedTotals(undefined, measured(record(10)), 1);
   speed = updateSpeedTotals(speed, measureRecordSpeed({ ...record(100), time: { start: 0, completed: 1000 } }, { usageExact: true, responseTimingExact: true }), 1);
   const summary = getSessionAverageSummary({ tokens: record(999).tokens, responseCount: 3, speed });
   assert.equal(summary.response.rate, 110000 / 3000);
-  assert.equal(summary.generation.rate, 10);
+  assert.equal(summary.generation.rate, 8);
+  assert.equal(summary.generation.coveredGeneratedTokens, 10);
+  assert.equal(speed?.generation.generatedTokens, 8);
   assert.equal(summary.generation.coveredResponseCount, 1);
   assert.equal(summary.response.coveredResponseCount, 2);
   assert.equal(summary.totalResponseCount, 3);
@@ -41,30 +43,30 @@ test("part snapshots are metadata only; equal deltas remain legal; tools output 
   assert.equal(acceptModelDelta(progress, { partID: "text", field: "text" }, { type: "message.part.delta", id: "event" }, "legacy", "same"), true);
   assert.equal(acceptModelDelta(progress, { partID: "text", field: "text" }, { type: "message.part.delta", id: "event" }, "legacy", "same"), false);
 });
-test("generation end excludes tool wait; tool-only and hidden reasoning fall back", () => {
-  const progress = createContentProgress();
-  acceptModelDelta(progress, { partID: "text", field: "text" }, { type: "message.part.delta" }, "legacy", "hello");
-  notePartSnapshot(progress, { part: { id: "text", type: "text", text: "hello", time: { start: 100, end: 500 } } });
+test("tools with uncertain usage invalidate primary generation; response stays an independent diagnostic", () => {
+  const progress = completeProgress();
   notePartSnapshot(progress, { part: { id: "tool", type: "tool", state: { status: "running", time: { start: 800 } } } });
   notePartSnapshot(progress, { part: { id: "tool", type: "tool", state: { status: "completed", time: { start: 800, end: 1900 } } } });
   const speed = measureRecordSpeed(record(), contentSpeedObservations(record(), progress, 100, true, true));
-  assert.equal(speed.generation?.durationMs, 700);
-  assert.equal(speed.generation?.estimated, true);
+  assert.equal(speed.generation, undefined);
   assert.equal(speed.response?.durationMs, 2000);
+  assert.equal(selectSpeedMeasurement({ ...record(), speed }).available, false);
+  assert.equal(selectResponseMeasurement({ ...record(), speed }).rate, 50);
   assert.equal(contentSpeedObservations(record(10, 10), progress, 100, true, true).generation, undefined);
   assert.equal(contentSpeedObservations(record(), progress, undefined, true, true).generation, undefined);
-  progress.stepEnds = new Set([800, 1900]);
+  noteStepIdentity(progress, "second-step");
   assert.equal(contentSpeedObservations(record(), progress, 100, true, true).generation, undefined);
 });
 
 test("speed merge distinguishes no observation, incompatible coverage, invalidation and legacy uncertainty", () => {
   const original = record(10);
-  const prior = { tokens: original.tokens, speed: measureRecordSpeed(original, { usageExact: true, responseTimingExact: true,
-    generation: { start: 100, end: 300, complete: true, estimated: true, outputObserved: true, reasoningObserved: false, version: 2, coverage: "complete" } }) };
+  const prior = { tokens: original.tokens, speed: measured(original) };
   const incoming = { ...original, speed: measureRecordSpeed(original) };
-  assert.equal(mergeRecordSpeed(incoming, prior).generation?.durationMs, 200);
+  assert.equal(mergeRecordSpeed(incoming, prior).generation?.durationMs, 1000);
+  assert.equal(mergeRecordSpeed({ ...incoming, tokens: record(20).tokens }, prior).generation?.generatedTokens, 16);
+  assert.equal(mergeRecordSpeed({ ...incoming, tokens: record(20).tokens }, prior).generation?.coverageGeneratedTokens, 20);
   assert.equal(mergeRecordSpeed({ ...incoming, tokens: record(10, 100).tokens }, prior).generation, undefined);
-  assert.equal(mergeRecordSpeed({ ...incoming, time: { start: 200, completed: 250 } }, prior).generation, undefined);
+  assert.equal(mergeRecordSpeed({ ...incoming, time: { start: 200 } }, prior).generation, undefined);
   assert.equal(mergeRecordSpeed(incoming, prior, "invalidated").generation, undefined);
   assert.equal(mergeRecordSpeed(incoming, { tokens: prior.tokens, speed: { generation: prior.speed.generation } }).generation, undefined);
 });
@@ -143,12 +145,24 @@ test("a later Thinking signal cannot displace legacy earlier content timing", ()
   assert.equal(earlierThinking.firstToken, 100);
 });
 
+function arrival(progress: ReturnType<typeof createContentProgress>, partID: string, delta: string, receivedAt: number, receivedMono = receivedAt, stream: "legacy" | "v2" = "legacy") {
+  const parsed = parseModelDelta(progress, { partID, field: "text" }, { type: "message.part.delta" }, stream, delta);
+  if (parsed) noteContentArrival(progress, { ...parsed, bytes: utf8ByteLength(delta), receivedAt, receivedMono, stream });
+}
+
 function completeProgress(type = "text", delta = "hello") {
-  const progress = createContentProgress();
+  const progress = createContentProgress({ fromCurrentStart: true, selectedStream: "legacy" });
+  noteStepIdentity(progress, "step-1");
   notePartSnapshot(progress, { part: { id: "p", type, text: "", time: { start: 100 } } });
-  parseModelDelta(progress, { partID: "p", field: "text" }, { type: "message.part.delta" }, "legacy", delta);
+  const characters = [...delta];
+  arrival(progress, "p", characters.slice(0, 1).join(""), 100);
+  arrival(progress, "p", characters.slice(1).join(""), 1100);
   notePartSnapshot(progress, { part: { id: "p", type, text: delta, time: { start: 100, end: 1100 } } });
   return progress;
+}
+
+function measured(current = record(), progress = completeProgress()) {
+  return measureRecordSpeed(current, contentSpeedObservations(current, progress, undefined, true, true));
 }
 
 test("versioned generation coverage is separate from category observation and usage calibration", () => {
@@ -161,33 +175,35 @@ test("versioned generation coverage is separate from category observation and us
   assert.equal(observations.generationCoverage?.status, "gap");
   const measured = { ...current, speed: measureRecordSpeed(current, observations) };
   assert.equal(measured.speed.generation, undefined);
-  assert.equal(selectSpeedMeasurement(measured).basis, "response");
-  assert.equal(selectSpeedMeasurement(measured).rate, 505);
+  assert.equal(selectSpeedMeasurement(measured).available, false);
+  assert.equal(selectResponseMeasurement(measured).rate, 505);
   // Even a final all-usage calibration of a tiny captured sample cannot fill the gap.
   measured.samples = [{ timestamp: 1000, tokens: 1010, estimatedTokens: 1, kind: "reasoning" }];
   assert.equal(contentSpeedObservations(measured, progress, 1000, true, true).generation, undefined);
 });
 
-test("complete snapshot evidence covers UTF-8 bytes and includes known earlier part start", () => {
+test("complete snapshot evidence covers UTF-8 bytes and measures receive span, not part start", () => {
   const current = record(0, 100);
   const progress = completeProgress("reasoning", "思考");
   const observations = contentSpeedObservations(current, progress, 1000, true, true);
   assert.equal(progress.parts.get("p")?.deltaBytes, 6);
   assert.equal(observations.generation?.start, 100);
   const speed = measureRecordSpeed(current, observations);
-  assert.equal(speed.generationEvidence?.version, 2);
+  assert.equal(speed.generationEvidence?.version, 3);
   assert.equal(speed.generationEvidence?.coverage, "complete");
+  assert.equal(speed.generation?.generatedTokens, 50);
+  assert.equal(speed.generation?.coverageGeneratedTokens, 100);
   assert.equal(selectSpeedMeasurement({ ...current, speed }).basis, "generation");
   assert.equal(selectSpeedMeasurement({ ...current, speed }).estimated, true);
 });
 
-test("missing snapshots/boundaries, unknown coverage and tool/multistep uncertainty reject generation", () => {
+test("missing snapshots/receive timing, unknown coverage and tool/multistep uncertainty reject generation", () => {
   const current = record();
   const cases = [
     (p: ReturnType<typeof createContentProgress>) => { p.parts.get("p")!.finalSnapshotBytes = undefined; },
-    (p: ReturnType<typeof createContentProgress>) => { p.parts.get("p")!.start = undefined; },
-    (p: ReturnType<typeof createContentProgress>) => { p.parts.get("p")!.end = undefined; },
-    (p: ReturnType<typeof createContentProgress>) => { p.stepEnds = new Set([500, 1100]); },
+    (p: ReturnType<typeof createContentProgress>) => { p.parts.get("p")!.receivedBytes = 0; },
+    (p: ReturnType<typeof createContentProgress>) => { p.receive = undefined; },
+    (p: ReturnType<typeof createContentProgress>) => { noteStepIdentity(p, "step-2"); },
     (p: ReturnType<typeof createContentProgress>) => { parseModelDelta(p, {}, { type: "message.part.delta" }, "legacy", "anonymous"); },
     (p: ReturnType<typeof createContentProgress>) => { notePartSnapshot(p, { part: { id: "tool", type: "tool", state: { status: "running", time: { start: 800 } } } }); },
     (p: ReturnType<typeof createContentProgress>) => { parseModelDelta(p, { callID: "c" }, { type: "session.next.tool.input.delta" }, "v2", "{}"); },
@@ -214,18 +230,18 @@ test("snapshot-first replay and final unequal byte counts cannot claim complete 
   assert.equal(contentSpeedObservations(record(), truncated, 100, true, true).generationCoverage?.status, "gap");
 });
 
-test("measurement selection preserves actual estimates and downgrades legacy boolean evidence", () => {
+test("primary selection always estimates qualified v3 generation and never falls back to response", () => {
   const current = record(100);
   const speed = measureRecordSpeed(current, contentSpeedObservations(current, completeProgress(), 100, true, true));
   const selected = selectSpeedMeasurement({ ...current, speed });
   assert.equal(selected.available, true);
-  assert.equal(selected.rate, 100);
+  assert.equal(selected.rate, 80);
   assert.equal(selected.basis, "generation");
   assert.equal(selected.estimated, true); // exact record quality does not make arrivals exact.
-  assert.deepEqual(selected.coverage, { generation: true, response: true, generatedTokens: 100, durationMs: 1000 });
+  assert.deepEqual(selected.coverage, { generation: true, response: true, generatedTokens: 100, intervalGeneratedTokens: 80, durationMs: 1000 });
   const legacy = { ...speed, generationEvidence: { start: 100, end: 1100, outputObserved: true, reasoningObserved: false } };
-  assert.equal(selectSpeedMeasurement({ ...current, speed: legacy }).basis, "response");
-  assert.equal(selectSpeedMeasurement({ ...current, speed: legacy }).rate, 50);
+  assert.equal(selectSpeedMeasurement({ ...current, speed: legacy }).basis, undefined);
+  assert.equal(selectSpeedMeasurement({ ...current, speed: legacy }).rate, undefined);
   assert.equal(mergeRecordSpeed({ ...current, speed: { response: speed.response } }, { tokens: current.tokens, speed: legacy }).generation, undefined);
   assert.equal(updateSpeedTotals(undefined, legacy, 1)?.generation.responseCount, 0);
   const unavailable = selectSpeedMeasurement({ ...current, speed: { generation: speed.generation } });
@@ -245,11 +261,213 @@ test("safe response derivation explicitly requires raw timing provenance", () =>
   }
 });
 
-test("reversible legacy generation is subtractable but cannot be newly added as complete coverage", () => {
+test("legacy generation is ignored for both signs so migration subtraction cannot erase v3 totals", () => {
   const legacy = { generation: { generatedTokens: 100, durationMs: 1000, estimated: false } };
   const previous = { generation: { generatedTokens: 100, durationMs: 1000, responseCount: 1, estimatedResponseCount: 0 },
     response: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0 } };
   assert.equal(updateSpeedTotals(undefined, legacy, 1)?.generation.responseCount, 0);
-  assert.equal(updateSpeedTotals(previous, legacy, -1)?.generation.responseCount, 0);
-  assert.equal(updateSpeedTotals(previous, legacy, -1)?.generation.generatedTokens, 0);
+  assert.equal(updateSpeedTotals(previous, legacy, -1)?.generation.responseCount, 1);
+  assert.equal(updateSpeedTotals(previous, legacy, -1)?.generation.generatedTokens, 100);
+});
+
+test("v3 excludes the entire global-first batch by per-kind UTF-8 proportions, never arbitrary N-1", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "" } });
+  notePartSnapshot(progress, { part: { id: "o", type: "text", text: "" } });
+  arrival(progress, "r", "r", 100, 50);
+  arrival(progress, "r", "rr", 101, 50);
+  arrival(progress, "o", "oo", 102, 50);
+  arrival(progress, "r", "rrr", 1100, 1050);
+  arrival(progress, "o", "oooooo", 1101, 1050);
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "rrrrrr" }, final: true });
+  notePartSnapshot(progress, { part: { id: "o", type: "text", text: "oooooooo" }, final: true });
+  const speed = measured(record(400, 100), progress);
+  assert.equal(speed.generation?.generatedTokens, 350);
+  assert.equal(speed.generation?.coverageGeneratedTokens, 500);
+  assert.equal(speed.generation?.durationMs, 1000);
+  assert.equal(speed.generation?.estimated, true);
+  assert.deepEqual(speed.generationEvidence?.bytes, { output: { total: 8, firstBatch: 2 }, reasoning: { total: 6, firstBatch: 3 } });
+  assert.equal(speed.generationEvidence?.observationCount, 2);
+  assert.equal(selectSpeedMeasurement({ ...record(400, 100), speed }).rate, 350);
+});
+
+test("a category beginning after the global-first batch does not lose its own first batch", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "" } });
+  notePartSnapshot(progress, { part: { id: "o", type: "text", text: "" } });
+  arrival(progress, "r", "rr", 100);
+  arrival(progress, "r", "rr", 1100);
+  arrival(progress, "o", "output", 1100);
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "rrrr" }, final: true });
+  notePartSnapshot(progress, { part: { id: "o", type: "text", text: "output" }, final: true });
+  const speed = measured(record(100, 100), progress);
+  assert.equal(speed.generation?.generatedTokens, 150);
+  assert.equal(speed.generationEvidence?.bytes?.output.firstBatch, 0);
+});
+
+test("v3 requires two receive-mono batches and at least one second; long part/tool-tail times cannot qualify", () => {
+  for (const span of [0, 1, 999]) {
+    const progress = createContentProgress({ fromCurrentStart: true });
+    noteStepIdentity(progress, "step");
+    arrival(progress, "p", "a", 100, 0);
+    arrival(progress, "p", "b", 100 + span, span);
+    notePartSnapshot(progress, { part: { id: "p", type: "text", text: "ab", time: { start: 0, end: 1_000_000 } } });
+    const current = { ...record(), time: { start: 0, firstResponse: 1, completed: 1_000_000 } };
+    const speed = measured(current, progress);
+    assert.equal(speed.generation, undefined);
+    assert.equal(selectSpeedMeasurement({ ...current, speed }).available, false);
+  }
+  assert.equal(measured(record(), completeProgress()).generation?.durationMs, 1000);
+  const empty = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(empty, "step");
+  assert.equal(parseModelDelta(empty, { partID: "p" }, { type: "message.part.delta", id: "empty" }, "legacy", ""), undefined);
+  noteContentArrival(empty, { kind: "output", bytes: 0, receivedAt: 0, receivedMono: 0, stream: "legacy" });
+  assert.equal(empty.receive, undefined);
+  assert.equal(empty.parts.size, 0);
+  assert.equal(empty.eventIDs.size, 0);
+  assert.equal(measured(record(), empty).generation, undefined);
+  assert.equal(measureRecordSpeed(record(), contentSpeedObservations(record(), completeProgress(), undefined, false, true)).generation, undefined);
+});
+
+test("receive-mono span survives backwards wall clock jumps and ignores part/Thinking/step boundaries", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  arrival(progress, "p", "h", 10_000, 10);
+  arrival(progress, "p", "ello", 500, 1010);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello", time: { start: 0, end: 900_000 } } });
+  progress.stepEnds = new Set([100, 200, 300]); // legacy metadata is not step identity.
+  const current = { ...record(), time: { start: 10_000, firstResponse: 10_001, completed: 1000 } };
+  const speed = measured(current, progress);
+  assert.equal(speed.generation?.durationMs, 1000);
+  assert.equal(speed.generation?.generatedTokens, 80);
+  assert.equal(speed.generationEvidence?.start, 10_000);
+  assert.equal(speed.generationEvidence?.end, 500);
+  assert.equal(selectSpeedMeasurement({ ...current, speed }).rate, 80);
+  assert.equal(coerceSpeedContribution(speed)?.generationEvidence?.version, 3);
+  assert.equal(speed.response, undefined);
+});
+
+test("step identity deduplicates repeats but same-time different steps permanently invalidate", () => {
+  const progress = completeProgress();
+  noteStepIdentity(progress, "step-1");
+  progress.stepEnds = new Set([0, 100, 200]);
+  assert.ok(measured(record(), progress).generation);
+  noteStepIdentity(progress, "step-2");
+  progress.stepIdentities = new Set(["step-1"]); // dropping metadata cannot erase sticky taint.
+  assert.equal(measured(record(), progress).generation, undefined);
+  const unknown = completeProgress();
+  noteStepIdentity(unknown, undefined);
+  assert.equal(measured(record(), unknown).generation, undefined);
+});
+
+test("retry/busy, failure and known recovery/disconnect taints never reset on the same response", () => {
+  for (const reason of ["retry", "failed", "recovery", "disconnect"]) {
+    const progress = completeProgress();
+    taintContentProgress(progress, reason);
+    noteStepIdentity(progress, "step-1"); // repeated busy/start metadata does not reset.
+    notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" }, final: true });
+    assert.equal(measured(record(), progress).generation, undefined);
+    assert.ok(progress.taints?.has(reason));
+    const previous = { tokens: record().tokens, speed: measured() };
+    assert.equal(mergeRecordSpeed({ ...record(), speed: measured(record(), progress) }, previous, "invalidated").generation, undefined);
+  }
+  const unowned = createContentProgress();
+  noteStepIdentity(unowned, "step");
+  arrival(unowned, "p", "h", 100);
+  arrival(unowned, "p", "ello", 1100);
+  unowned.fromCurrentStart = true; // cannot retroactively establish current-start ownership.
+  notePartSnapshot(unowned, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  assert.equal(measured(record(), unowned).generation, undefined);
+});
+
+test("same-byte-length replacement snapshots are rejected and digest mismatch is sticky", () => {
+  const progress = completeProgress();
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "world" }, final: true });
+  assert.equal(progress.parts.get("p")?.deltaBytes, 5);
+  assert.equal(progress.parts.get("p")?.finalSnapshotBytes, 5);
+  assert.equal(measured(record(), progress).generation, undefined);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  assert.equal(measured(record(), progress).generation, undefined);
+  const intermediate = completeProgress();
+  notePartSnapshot(intermediate, { part: { id: "p", type: "text", text: "world" } });
+  notePartSnapshot(intermediate, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  assert.equal(measured(record(), intermediate).generation, undefined);
+});
+
+test("selected-stream mixing, anonymous data, missing timing and duplicate arrivals cannot qualify", () => {
+  const mixed = completeProgress();
+  arrival(mixed, "p", "!", 2100, 2100, "v2");
+  assert.equal(measured(record(), mixed).generation, undefined);
+  const duplicate = completeProgress();
+  noteContentArrival(duplicate, { kind: "output", partID: "p", bytes: 1, receivedAt: 1200, receivedMono: 1200, stream: "legacy" });
+  assert.equal(measured(record(), duplicate).generation, undefined);
+  const backwards = completeProgress();
+  parseModelDelta(backwards, { partID: "p" }, { type: "message.part.delta" }, "legacy", "!");
+  noteContentArrival(backwards, { kind: "output", partID: "p", bytes: 1, receivedAt: 1200, receivedMono: 0, stream: "legacy" });
+  assert.equal(measured(record(), backwards).generation, undefined);
+  const anonymous = completeProgress();
+  parseModelDelta(anonymous, {}, { type: "message.part.delta" }, "legacy", "!");
+  assert.equal(measured(record(), anonymous).generation, undefined);
+  const merged = mergeContentProgress(completeProgress(), completeProgress())!;
+  assert.equal(measured(record(), merged).generation, undefined);
+});
+
+test("usage correction preserves v3 proportions/mono duration and separately recalculates full coverage", () => {
+  const original = record(100);
+  const prior = { tokens: original.tokens, speed: measured(original) };
+  const correctedRecord = { ...record(250), speed: measureRecordSpeed(record(250)) };
+  const corrected = mergeRecordSpeed(correctedRecord, prior);
+  assert.equal(corrected.generation?.generatedTokens, 200);
+  assert.equal(corrected.generation?.coverageGeneratedTokens, 250);
+  assert.equal(corrected.generation?.durationMs, 1000);
+  assert.deepEqual(corrected.generationEvidence?.bytes, prior.speed.generationEvidence?.bytes);
+  assert.equal(corrected.generationEvidence?.usage?.output, 250);
+  assert.equal(isQualifiedGenerationContribution(corrected), true);
+  assert.equal(mergeRecordSpeed({ ...correctedRecord, tokens: record(250, 1).tokens }, prior).generation, undefined);
+  assert.equal(selectSpeedMeasurement({ ...record(250), speed: prior.speed }).available, false); // uncorrected stale numerator.
+  const totals = updateSpeedTotals(updateSpeedTotals(undefined, prior.speed, 1), prior.speed, -1);
+  const updated = updateSpeedTotals(totals, corrected, 1)!;
+  assert.equal(updated.generation.generatedTokens, 200);
+  assert.equal(updated.generation.coverageGeneratedTokens, 250);
+  assert.equal(updated.generation.responseCount, 1);
+});
+
+test("v2 coercion is retained but v3 numerator forgery/short-span/full-usage substitution is never accumulated", () => {
+  const valid = measured();
+  const legacy = { generation: { generatedTokens: 100, durationMs: 1000, estimated: false },
+    generationEvidence: { start: 100, end: 1100, outputObserved: true, reasoningObserved: false, version: 2 as const, coverage: "complete" as const } };
+  assert.equal(coerceSpeedContribution(legacy)?.generationEvidence?.version, 2);
+  assert.equal(isQualifiedGenerationContribution(legacy), false);
+  const baseline = updateSpeedTotals(undefined, valid, 1)!;
+  assert.deepEqual(updateSpeedTotals(baseline, legacy, -1), baseline);
+  const forged = [
+    { ...valid, generation: { ...valid.generation!, generatedTokens: 100 } },
+    { ...valid, generation: { ...valid.generation!, estimated: false } },
+    { ...valid, generation: { ...valid.generation!, coverageGeneratedTokens: 80 } },
+    { ...valid, generationEvidence: { ...valid.generationEvidence!, lastReceiveMono: 101 } },
+  ];
+  for (const speed of forged) {
+    assert.equal(isQualifiedGenerationContribution(speed), false);
+    assert.equal(selectSpeedMeasurement({ ...record(), speed }).available, false);
+    assert.equal(updateSpeedTotals(undefined, speed, 1)?.generation.responseCount, 0);
+    assert.equal(updateSpeedTotals(baseline, speed, -1)?.generation.responseCount, 1);
+  }
+});
+
+test("coverageGeneratedTokens safely defaults to zero and sums independently of interval tokens", () => {
+  const old = { generation: { generatedTokens: 8, durationMs: 1000, responseCount: 1, estimatedResponseCount: 1 },
+    response: { generatedTokens: 10, durationMs: 2000, responseCount: 1, estimatedResponseCount: 0 } };
+  assert.equal(coerceSpeedTotals(old)?.generation.coverageGeneratedTokens, 0);
+  assert.equal(getSessionAverageSummary({ tokens: record().tokens, responseCount: 1, speed: old }).generation.coveredGeneratedTokens, 0);
+  const first = updateSpeedTotals(undefined, measured(record(10)), 1);
+  const second = updateSpeedTotals(undefined, measured(record(20)), 1);
+  const combined = addSpeedTotals(first, second)!;
+  assert.equal(combined.generation.generatedTokens, 24);
+  assert.equal(combined.generation.coverageGeneratedTokens, 30);
+  const summary = getSessionAverageSummary({ tokens: record(30).tokens, responseCount: 2, speed: combined });
+  assert.equal(summary.generation.rate, 12);
+  assert.equal(summary.generation.coveredGeneratedTokens, 30);
+  assert.equal(summary.generation.estimated, true);
 });

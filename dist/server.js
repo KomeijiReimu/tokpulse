@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { HISTORY_VERSION, bytesToTokens, calibrateResponseSamples, emptyTokenCounts, normalizeTokenCounts, timeToFirstToken, utf8ByteLength } from "./core.js";
 import { ACTIVITY_VERSION, isActiveState, normalizeActivityEvent, replayActivity } from "./activity.js";
 import { createActivityLedger } from "./runs-storage.js";
-import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, parseModelDelta } from './statistics.js';
+import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, contentSpeedObservations, createContentMetadataCache, createContentProgress, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, noteContentArrival, noteStepIdentity, parseModelDelta, taintContentProgress } from './statistics.js';
 import { createHistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
@@ -11,6 +11,60 @@ const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
 const PARENT_LOOKUP_TIMEOUT_MS = 200;
 const activityInitializationQueues = new Map();
 const contentMetadataByRuntime = new WeakMap();
+const responsesByRuntime = new WeakMap();
+function responseRuntime(active) {
+  let runtime = responsesByRuntime.get(active);
+  if (!runtime) {
+    runtime = {
+      current: new Map(),
+      pendingTaints: new Map(),
+      tainted: new Set(),
+      connected: false,
+      observedSince: Infinity
+    };
+    responsesByRuntime.set(active, runtime);
+  }
+  return runtime;
+}
+function taintResponse(active, state, reason) {
+  state.progress ??= cachedContentProgress(runtimeContentMetadata(active), state.messageID);
+  taintContentProgress(state.progress, reason);
+  responseRuntime(active).tainted.add(state.messageID);
+}
+function bindPendingTaint(active, state) {
+  if (state.messageID.startsWith("__pending__:")) return;
+  const runtime = responseRuntime(active);
+  for (const reason of runtime.pendingTaints.get(state.sessionID) ?? []) taintResponse(active, state, reason);
+  runtime.pendingTaints.delete(state.sessionID);
+}
+function recordResponseLifecycle(active, type, properties, event, receivedAt) {
+  const runtime = responseRuntime(active);
+  const status = typeof properties.status === "string" ? properties.status : properties.status?.type;
+  const disruption = type === "server.connected" ? runtime.connected : type.startsWith("workspace.") && (type.includes("status") || type.includes("disposed") || type.includes("deleted"));
+  if (type === "server.connected") runtime.connected = true;
+  if (disruption) {
+    runtime.observedSince = Math.max(runtime.observedSince, receivedAt);
+    for (const state of active.values()) taintResponse(active, state, "transport-disruption");
+  }
+  const failure = status === "retry" || type.startsWith("session.next.") && (type.endsWith(".retried") || type.endsWith(".failed")) || type === "session.error" || type.includes("provider.error") || type.includes("provider-error") || eventInfo(properties, event)?.error !== undefined;
+  if (!failure) return;
+  const sessionID = readSessionIDFromEvent(type, properties, event);
+  const current = sessionID ? runtime.current.get(sessionID) : undefined;
+  const info = eventInfo(properties, event);
+  // Lifecycle info.id often names the SESSION, not an assistant response.
+  const explicitMessageID = [properties.messageID, properties.assistantMessageID, properties.part?.messageID, info?.messageID, info?.assistantMessageID, event.messageID, event.assistantMessageID, info?.role === "assistant" ? info.id : undefined].find(id => typeof id === "string" && id.length > 0);
+  const messageID = explicitMessageID ?? (current && active.has(current) ? current : undefined) ?? [...active.values()].find(state => state.sessionID === sessionID && !state.messageID.startsWith("__pending__:"))?.messageID;
+  const reason = status === "retry" || type.includes("retried") ? "retry" : "failed";
+  if (messageID) {
+    runtime.tainted.add(messageID);
+    const state = active.get(messageID);
+    if (state) taintResponse(active, state, reason);
+  } else if (sessionID) {
+    const pending = runtime.pendingTaints.get(sessionID) ?? new Set();
+    pending.add(reason);
+    runtime.pendingTaints.set(sessionID, pending);
+  }
+}
 function runtimeContentMetadata(active) {
   let metadata = contentMetadataByRuntime.get(active);
   if (!metadata) {
@@ -28,6 +82,9 @@ export function recordPartMetadata(active, properties, now, event = {}) {
   const metadata = runtimeContentMetadata(active);
   cachePartSnapshot(metadata, properties);
   const part = asRecord(properties.part);
+  if (part?.type === "step-start") {
+    noteStepIdentity(cachedContentProgress(metadata, part.messageID), part.stepID ?? properties.stepID ?? part.id);
+  }
   if (!part || now === undefined || isSnapshotIngress(event, properties)) return;
   const state = active.get(part.messageID);
   if (!state?.liveAssistant || metadata.completed.has(part.messageID)) return;
@@ -87,10 +144,13 @@ export const server = async (input, pluginOptions) => {
     metadata.completed.add(id);
   }
   const parentSessionCache = new Map();
+  // Establish the epoch when ingress is ready, not before asynchronous startup.
+  responseRuntime(active).observedSince = Date.now();
   const event = payload => {
     const rawEvent = payload?.event;
     const receivedAt = Date.now();
-    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt)).catch(error => {
+    const receivedMonotonic = performance.now();
+    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic)).catch(error => {
       warn("event handling failed", error);
     });
     eventQueue = next;
@@ -483,12 +543,13 @@ function unwrapIncomingEvent(value) {
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
-async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt) {
+async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic) {
   try {
     const event = unwrapIncomingEvent(rawEvent);
     if (!event) return;
     const type = typeof event.type === "string" ? event.type : "";
     const properties = asRecord(event.properties) ?? asRecord(event.data) ?? {};
+    recordResponseLifecycle(active, type, properties, event, receivedAt);
     const explicitTimestamp = explicitEventTimestamp(event, properties);
     const rawKey = explicitTimestamp === undefined && needsActivityIdentity(type, properties, event) ? rawEventKey(type, event) : undefined;
     const timestamp = explicitTimestamp ?? (rawKey === undefined ? receivedAt : runtimeEventTimestamp(activity, rawKey, event, properties, receivedAt));
@@ -502,15 +563,19 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
       return;
     }
     if (type === "message.part.delta") {
-      recordDelta(active, properties, event, timestamp, "legacy", bytesPerToken);
+      recordDelta(active, properties, event, receivedAt, "legacy", bytesPerToken, receivedMonotonic);
       return;
     }
     if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
-      recordDelta(active, properties, event, timestamp, "v2", bytesPerToken, type.endsWith("reasoning.delta") ? "reasoning" : "output");
+      recordDelta(active, properties, event, receivedAt, "v2", bytesPerToken, receivedMonotonic);
       return;
     }
     if (type === "message.updated") {
       await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt);
+      return;
+    }
+    if (type === "session.next.step.started") {
+      recordResponseStep(active, properties, event, timestamp);
       return;
     }
     if (type === "session.next.step.ended") {
@@ -524,11 +589,12 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
     warn("event parsing failed", error);
   }
 }
-function recordDelta(active, properties, event, timestamp, stream, bytesPerToken, explicitKind) {
+function recordDelta(active, properties, event, timestamp, stream, bytesPerToken, receivedMonotonic) {
   const sessionID = readSessionIDFromEvent("message.part.delta", properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
   const metadata = runtimeContentMetadata(active);
+  if (isSnapshotIngress(event, properties)) return;
   if (messageID && (metadata.completed.has(messageID) || metadata.roles.has(messageID) && metadata.roles.get(messageID) !== "assistant")) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
@@ -540,6 +606,9 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   if (state.sessionID !== sessionID) return;
   state.progress = mergeContentProgress(state.progress, progress);
+  bindPendingTaint(active, state);
+  if (!state.observedFromStart || !messageID) taintResponse(active, state, "unobserved-response-start");
+  if (!state.liveAssistant || responseRuntime(active).current.get(sessionID) !== messageID) taintResponse(active, state, "not-current-assistant");
   metadata.progress.set(messageID ?? key, state.progress);
   const kind = parsed.kind;
   if (timestamp < state.startedAt) state.startedAt = timestamp;
@@ -549,6 +618,14 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
     start: state.startedAt
   }, timestamp);
   const bytes = utf8ByteLength(delta);
+  noteContentArrival(state.progress, {
+    kind,
+    bytes,
+    partID: parsed.partID,
+    receivedAt: timestamp,
+    receivedMono: receivedMonotonic,
+    stream
+  });
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample = {
     timestamp,
@@ -561,6 +638,17 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
   state[stream].samples.push(sample);
   active.set(messageID ?? key, state);
 }
+function recordResponseStep(active, properties, event, timestamp) {
+  const sessionID = readSessionIDFromEvent(event.type, properties, event);
+  const messageID = readMessageID(properties);
+  if (!sessionID || messageID && runtimeContentMetadata(active).completed.has(messageID)) return;
+  const state = getOrCreateState(active, messageID, sessionID, timestamp);
+  bindPendingTaint(active, state);
+  const id = properties.stepID ?? properties.stepId ?? properties.step?.id ?? properties.part?.id ?? properties.id;
+  state.progress ??= cachedContentProgress(runtimeContentMetadata(active), messageID ?? pendingKey(sessionID));
+  noteStepIdentity(state.progress, typeof id === "string" ? id : undefined);
+  active.set(messageID ?? pendingKey(sessionID), state);
+}
 function recordStepFallback(active, completedMessageIDs, properties, event, timestamp) {
   const sessionID = readSessionIDFromEvent("session.next.step.ended", properties, event);
   if (!sessionID) return;
@@ -569,12 +657,12 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
   state.progress ??= cachedContentProgress(runtimeContentMetadata(active), messageID ?? pendingKey(sessionID));
-  state.progress.stepEnds ??= new Set();
-  state.progress.stepEnds.add(timestamp);
+  active.set(messageID ?? pendingKey(sessionID), state);
+  recordResponseStep(active, properties, event, timestamp);
   const tokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
   state.fallbackTokens = mergeFallbackTokens(state.fallbackTokens, tokens);
   state.model = state.model ?? modelName(info);
-  if (state.cost === undefined) state.cost = numberOrUndefined(info?.cost ?? properties.cost);
+  state.cost = numberOrUndefined(info?.cost ?? properties.cost) ?? state.cost;
   active.set(messageID ?? pendingKey(sessionID), state);
 }
 async function handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt) {
@@ -600,6 +688,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
       if (candidate.sessionID !== sessionID || candidate.messageID === messageID || !candidate.liveAssistant) continue;
       if (candidate.startedAt > created) return;
       candidate.liveAssistant = false;
+      taintResponse(active, candidate, "superseded-assistant");
     }
     const state = getOrCreateState(active, messageID, sessionID, created);
     if (state.sessionID !== sessionID) return;
@@ -609,7 +698,18 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
       start: state.startedAt
     };
     state.liveAssistant = true;
-    state.progress = mergeContentProgress(state.progress, cachedContentProgress(metadata, messageID));
+    const cached = cachedContentProgress(metadata, messageID);
+    if (state.observedFromStart === undefined) {
+      const reportedUsage = tokenFields(info.tokens);
+      const alreadyGenerating = [info.time?.firstToken, info.time?.firstContent, info.time?.firstResponse].some(hasNumber) || (reportedUsage.output ?? 0) > 0 || (reportedUsage.reasoning ?? 0) > 0 || ["in_progress", "in-progress", "recovering", "recovered"].includes(info.status);
+      state.observedFromStart = created >= receivedAt - 1000 && created <= receivedAt && created >= responseRuntime(active).observedSince && !alreadyGenerating && !state.legacy.hasData && !state.v2.hasData && ![...cached.parts.values()].some(part => part.snapshotBytes > 0 || part.deltaBytes > 0);
+      state.progress = mergeContentProgress(createContentProgress({
+        fromCurrentStart: state.observedFromStart
+      }), state.progress ?? cached);
+      metadata.progress.set(messageID, state.progress);
+    }
+    bindPendingTaint(active, state);
+    responseRuntime(active).current.set(sessionID, messageID);
     active.set(messageID, state);
     return;
   }
@@ -626,6 +726,15 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     return;
   }
   const prior = previous ?? snapshot;
+  const exactTokens = tokenFields(info.tokens);
+  // Missing reasoning is a partial correction, never an authoritative zero.
+  // This applies to both retained history and reversible settled snapshots;
+  // step fallback cannot make an incomplete completion correction authoritative.
+  if (prior && (prior.quality ?? "exact") === "exact" && prior.tokens.reasoning > 0 && exactTokens.reasoning === undefined) {
+    completedMessageIDs.add(messageID);
+    metadata.completed.add(messageID);
+    return;
+  }
   const priorUpdate = coerceCompletionUpdate(prior?.update);
   const fingerprint = createHash("sha256").update(stableSerialize(info)).digest("hex");
   const update = {
@@ -651,7 +760,6 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     return;
   }
   const state = takeState(active, messageID, sessionID, timestamp);
-  const exactTokens = tokenFields(info.tokens);
   const fallback = state?.fallbackTokens ?? {};
   const estimate = estimateStateTokens(state, bytesPerToken);
   const tokens = {
@@ -704,7 +812,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     }
   }
   record.time.ttft = timeToFirstToken(record);
-  record.speed = mergeRecordSpeed(record, prior, state && chooseSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
+  record.speed = mergeRecordSpeed(record, prior, responseRuntime(active).tainted.has(messageID) || state && chooseSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
   record.update = update;
   if (await safeUpsert(storage, totals, record)) {
     completedMessageIDs.add(messageID);
@@ -714,6 +822,8 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
 async function flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
   if (!sessionID) return;
+  responseRuntime(active).pendingTaints.delete(sessionID);
+  responseRuntime(active).current.delete(sessionID);
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
     active.delete(key);
@@ -853,6 +963,7 @@ function mergeStates(target, source) {
   target.progress = mergeContentProgress(target.progress, source.progress);
   target.startedAt = Math.min(target.startedAt, source.startedAt);
   target.liveAssistant ||= source.liveAssistant;
+  target.observedFromStart &&= source.observedFromStart;
   if (source.timing?.firstContent !== undefined) target.timing = recordContentArrival({
     ...target.timing,
     start: target.startedAt

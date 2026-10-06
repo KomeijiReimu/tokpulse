@@ -46,7 +46,7 @@ import {
 import type { ActivityEvent, ActivityReplay } from "./activity.js";
 import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, type SpeedContribution, cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, parseModelDelta, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 import { getSessionAverageSummary, type AverageRateSummary, type SessionAverageSummary } from "./statistics.js";
-import { applyFirstResponseSignal, recordContentArrival, selectSpeedMeasurement, thinkingFirstResponseSignal } from "./statistics.js";
+import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteContentArrival, noteStepIdentity, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
 import {
   DEFAULT_MAX_RECORDS,
   readHistoryFile,
@@ -54,7 +54,7 @@ import {
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import type { TotalsRollup } from "./totals-aggregate.js";
-import { TOTALS_VERSION, resolveTotalsPath } from "./totals-storage.js";
+import { TOTALS_VERSION, projectTotalsGenerationBasis, resolveTotalsPath } from "./totals-storage.js";
 import type {
   OpenContribution,
   SessionDirectTotals,
@@ -73,11 +73,13 @@ export type StreamName = "legacy" | "v2";
 type SampleKind = "output" | "reasoning";
 export type RecordQuality = HistoryRecordQuality;
 const recordQualityByObject = new WeakMap<object, RecordQuality>();
-const observationRuntimes = new WeakMap<RuntimeStore, { instanceID: string; metadata: ContentMetadataCache; liveAssistantMessages: Set<string> }>();
+const observationRuntimes = new WeakMap<RuntimeStore, { instanceID: string; metadata: ContentMetadataCache; liveAssistantMessages: Set<string>;
+  observedSince: number; connected: boolean; taintedMessages: Set<string>; pendingTaints: Map<string, Set<string>> }>();
 function observationRuntime(store: RuntimeStore) {
   let runtime = observationRuntimes.get(store);
   if (!runtime) {
-    runtime = { instanceID: randomUUID(), metadata: createContentMetadataCache(), liveAssistantMessages: new Set<string>() };
+    runtime = { instanceID: randomUUID(), metadata: createContentMetadataCache(), liveAssistantMessages: new Set<string>(),
+      observedSince: Date.now(), connected: false, taintedMessages: new Set<string>(), pendingTaints: new Map() };
     observationRuntimes.set(store, runtime);
   }
   return runtime;
@@ -90,23 +92,76 @@ function knownNonAssistant(store: RuntimeStore, messageID: string): boolean {
   const role = observationRuntime(store).metadata.roles.get(messageID);
   return role !== undefined && role !== "assistant";
 }
-export function recordTuiPartMetadata(store: RuntimeStore, properties: ObjectRecord, event: CompatibleEvent = {}): void {
+export function recordTuiPartMetadata(store: RuntimeStore, properties: ObjectRecord, event: CompatibleEvent = {}, receivedAt = Date.now()): void {
   const observations = observationRuntime(store);
-  cachePartSnapshot(observations.metadata, properties);
   const part = asRecord(properties.part);
   const messageID = readString(part?.messageID);
+  const active = messageID ? store.active.get(messageID) : undefined;
+  if (active && part?.sessionID !== undefined && part.sessionID !== active.sessionID) return;
+  cachePartSnapshot(observations.metadata, properties);
+  if (part?.type === "step-start" && messageID) {
+    noteStepIdentity(cachedContentProgress(observations.metadata, messageID), stepIdentity(properties, part));
+  }
   if (!part || !messageID || knownCompletedMessage(store, messageID)) return;
   const state = store.active.get(messageID);
   if (!state) return;
   const signal = thinkingFirstResponseSignal(part, {
     messageID, sessionID: state.sessionID, role: observations.metadata.roles.get(messageID) ?? "unknown",
-    start: state.startedAt, now: eventTimestamp(event, properties),
+    start: state.startedAt, now: receivedAt,
     live: event.type === "message.part.updated" && observations.liveAssistantMessages.has(messageID) && !isReplayEvent(event, properties),
   });
   if (!signal) return;
   const previous = state.firstResponseAt;
   applyActiveTiming(state, applyFirstResponseSignal(activeTiming(state), signal));
   if (state.firstResponseAt !== previous) store.bump();
+}
+
+function stepIdentity(properties: ObjectRecord, part?: ObjectRecord): string | undefined {
+  return readString(properties.stepID ?? properties.stepId ?? part?.stepID ?? part?.stepId
+    ?? getPath(properties, "step.id") ?? part?.id ?? getPath(properties, "part.id") ?? properties.id);
+}
+
+function taintTuiState(store: RuntimeStore, state: ActiveState, reason: string): void {
+  state.progress ??= cachedContentProgress(observationRuntime(store).metadata, state.messageID);
+  taintContentProgress(state.progress, reason);
+  observationRuntime(store).taintedMessages.add(state.messageID);
+}
+
+function bindTuiPendingTaints(store: RuntimeStore, state: ActiveState): void {
+  const observations = observationRuntime(store);
+  for (const reason of observations.pendingTaints.get(state.sessionID) ?? []) taintTuiState(store, state, reason);
+  observations.pendingTaints.delete(state.sessionID);
+}
+
+/** Known disruptions are evidence; a quiet window alone is not a disconnect. */
+export function recordTuiObservationLifecycle(store: RuntimeStore, type: string, properties: ObjectRecord, event: CompatibleEvent, receivedAt = Date.now()): void {
+  const observations = observationRuntime(store);
+  const transport = type === "server.connected" ? observations.connected
+    : type === "server.instance.disposed" || (type.startsWith("workspace.") && /status|disposed|deleted/.test(type));
+  if (type === "server.connected") observations.connected = true;
+  if (transport) observations.observedSince = Math.max(observations.observedSince, receivedAt);
+  if (transport) for (const state of store.active.values()) {
+    taintTuiState(store, state, "transport-disruption");
+    observations.liveAssistantMessages.delete(state.messageID);
+  }
+  const info = eventInfo(properties, event);
+  const status = statusName(properties.status ?? event.status ?? info?.status ?? info?.state)?.toLowerCase();
+  const failure = status === "retry" || type === "session.next.retried" || type === "session.next.step.failed"
+    || type === "session.error" || eventInfo(properties, event)?.error !== undefined;
+  if (!failure) return;
+  const sessionID = readSessionID(properties, event)
+    ?? (type.startsWith("session.") && info?.role === undefined ? readString(info?.id) : undefined);
+  // Session metadata's info.id is NOT a message ID. Only assistant info owns it.
+  const messageID = readStringFrom([properties, event, info], ["messageID", "messageId", "message.id", "assistantMessageID", "assistantMessageId"])
+    ?? (info?.role === "assistant" ? readString(info.id) : undefined);
+  const reason = status === "retry" || type === "session.next.retried" ? "retry" : "failed";
+  const states = [...store.active.values()].filter((state) => messageID ? state.messageID === messageID : state.sessionID === sessionID);
+  if (messageID) observations.taintedMessages.add(messageID);
+  for (const state of states) taintTuiState(store, state, reason);
+  if (!messageID && !states.length && sessionID) {
+    const pending = observations.pendingTaints.get(sessionID) ?? new Set<string>();
+    pending.add(reason); observations.pendingTaints.set(sessionID, pending);
+  }
 }
 
 function isReplayEvent(event: CompatibleEvent, properties: ObjectRecord): boolean {
@@ -168,7 +223,13 @@ type CompatibleEventType =
   | "session.stopped"
   | "session.completed"
   | "session.created"
-  | "session.updated";
+  | "session.updated"
+  | "server.connected"
+  | "server.instance.disposed"
+  | "workspace.status"
+  | "workspace.status.changed"
+  | "workspace.disposed"
+  | "workspace.deleted";
 
 interface CompatibleEvent {
   type?: unknown;
@@ -200,6 +261,7 @@ export interface ActiveState {
   firstResponseTimeSource?: "part-start" | "arrival";
   firstResponseEstimated?: boolean;
   progress?: ContentProgress;
+  observedFromStart?: boolean;
   model?: string;
   cost?: number;
   fallbackTokens: Partial<TokenCounts>;
@@ -470,6 +532,7 @@ interface ChildRow {
   responseCount: number;
   generated: number;
   speed: number;
+  speedAvailable: boolean;
   model: string;
 }
 
@@ -2216,30 +2279,41 @@ export function recordDelta(
   stream: StreamName,
   _explicitKind: SampleKind | undefined,
   bytesPerToken: number,
+  receivedAt = Date.now(),
+  receivedMono = performance.now(),
 ): void {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
-  if (isReplayEvent(event, properties)) return;
+  if (isReplayEvent(event, properties)) {
+    const state = store.active.get(readMessageID(properties) ?? pendingKey(sessionID));
+    if (state) taintTuiState(store, state, "recovered-content");
+    return;
+  }
   const parentID = sessionParentFromEvent("message.part.delta", properties, event);
   if (parentID) rememberSessionParent(store, sessionID, parentID);
   const messageID = readMessageID(properties);
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
-  const timestamp = eventTimestamp(event, properties);
+  const timestamp = receivedAt;
   const existingState = (messageID ? store.active.get(messageID) : undefined)
     ?? store.active.get(pendingKey(sessionID));
-  if (existingState && (existingState.sessionID !== sessionID || timestamp < existingState.startedAt)) return;
+  if (existingState && existingState.sessionID !== sessionID) return;
   const progress = existingState?.progress ?? cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
   const parsed = parseModelDelta(progress, properties, event, stream, delta);
   if (!parsed) return;
   const runtime = ensureSessionRun(store, sessionID, timestamp);
   const state = existingState ?? getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.progress = progress;
+  bindTuiPendingTaints(store, state);
+  if (!state.observedFromStart || !messageID) taintTuiState(store, state, "unobserved-response-start");
   observationRuntime(store).metadata.progress.set(messageID ?? pendingKey(sessionID), progress);
-  applyActiveTiming(state, recordContentArrival(activeTiming(state), timestamp));
+  if (messageID && observationRuntime(store).liveAssistantMessages.has(messageID)) {
+    applyActiveTiming(state, recordContentArrival(activeTiming(state), timestamp));
+  }
   runtime.runFirstTokenAt = Math.min(runtime.runFirstTokenAt ?? timestamp, timestamp);
   const bytes = utf8ByteLength(delta);
+  noteContentArrival(progress, { kind: parsed.kind, partID: parsed.partID, bytes, receivedAt, receivedMono, stream });
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample: SpeedSample = {
     timestamp,
@@ -2284,16 +2358,20 @@ export function recordStepStarted(
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.startedAt = Math.min(state.startedAt, timestamp);
   state.model = state.model ?? modelName(properties);
+  state.progress ??= cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
+  noteStepIdentity(state.progress, stepIdentity(properties));
+  bindTuiPendingTaints(store, state);
   if (messageID) runtime.activeMessageID = messageID;
   store.active.set(messageID ?? pendingKey(sessionID), state);
   store.bump();
 }
 
-function recordStepFallback(
+export function recordStepFallback(
   store: RuntimeStore,
   properties: ObjectRecord,
   event: CompatibleEvent,
 ): void {
+  if (isReplayEvent(event, properties)) return;
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
@@ -2301,15 +2379,13 @@ function recordStepFallback(
   const timestamp = eventTimestamp(event, properties);
   const runtime = ensureSessionRun(store, sessionID, timestamp);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
-  state.fallbackTokens = mergeTokenFields(
-    state.fallbackTokens,
-    tokenFields(properties.tokens ?? properties),
-  );
+  const info = eventInfo(properties, event);
+  state.fallbackTokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
   state.progress ??= cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
-  state.progress.stepEnds ??= new Set();
-  state.progress.stepEnds.add(timestamp);
+  noteStepIdentity(state.progress, stepIdentity(properties));
+  bindTuiPendingTaints(store, state);
   state.model = state.model ?? modelName(properties);
-  state.cost = state.cost ?? readNumber(properties.cost);
+  state.cost = readNumber(info?.cost ?? properties.cost) ?? state.cost;
   if (messageID) runtime.activeMessageID = messageID;
   store.active.set(messageID ?? pendingKey(sessionID), state);
   store.bump();
@@ -2493,6 +2569,7 @@ export function handleMessageUpdated(
   ]);
   if (!messageID || !sessionID) return false;
   const observations = observationRuntime(store);
+  recordTuiObservationLifecycle(store, "message.updated", properties, event, receivedAt);
   if (typeof info.role === "string") observations.metadata.roles.set(messageID, info.role);
   if (info.role !== "assistant") {
     observations.liveAssistantMessages.delete(messageID);
@@ -2503,13 +2580,31 @@ export function handleMessageUpdated(
 
   if (!isCompleted(info, properties, event)) {
     if (knownCompletedMessage(store, messageID) || isReplayEvent(event, properties)) return false;
+    const created = infoTimeValue(info, ["start", "created"]);
+    const existing = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
+    // Do not infer a current response merely from an unfinished recovered record.
+    if (created === undefined || created < observations.observedSince || created < receivedAt - 1000 || created > receivedAt) return false;
+    for (const candidate of store.active.values()) {
+      if (candidate.sessionID !== sessionID || candidate.messageID === messageID || !observations.liveAssistantMessages.has(candidate.messageID)) continue;
+      if (candidate.startedAt > created) return false;
+      observations.liveAssistantMessages.delete(candidate.messageID);
+    }
     observations.liveAssistantMessages.add(messageID);
     const runtime = ensureSessionRun(store, sessionID, timestamp);
     const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
     state.startedAt = Math.min(
       state.startedAt,
-      infoTimeValue(info, ["start", "created"]) ?? timestamp,
+      created,
     );
+    if (state.observedFromStart === undefined) {
+      const cached = cachedContentProgress(observations.metadata, messageID);
+      state.observedFromStart = !(existing?.legacy.hasData || existing?.v2.hasData)
+        && ![...cached.parts.values()].some((part) => part.snapshotBytes > 0 || part.deltaBytes > 0);
+      state.progress = mergeContentProgress(createContentProgress({ fromCurrentStart: state.observedFromStart }), state.progress ?? cached);
+      observations.metadata.progress.set(messageID, state.progress!);
+    }
+    bindTuiPendingTaints(store, state);
+    if (observations.taintedMessages.has(messageID)) taintTuiState(store, state, "previous-response-disruption");
     state.model = state.model ?? modelName(info);
     state.cost = state.cost ?? readNumber(info.cost);
     state.fallbackTokens = mergeTokenFields(state.fallbackTokens, tokenFields(info.tokens));
@@ -2546,6 +2641,7 @@ export function handleMessageUpdated(
   const pendingState = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
   const candidateTokens = makeTokens(info, pendingState, bytesPerToken);
   const exactFields = tokenFields(info.tokens);
+  if (prior && (prior.quality ?? "exact") === "exact" && prior.tokens.reasoning > 0 && exactFields.reasoning === undefined) return false;
   const quality: RecordQuality = exactFields.output !== undefined && exactFields.input !== undefined
     && (exactFields.reasoning !== undefined || candidateTokens.reasoning === 0) ? "exact" : "provisional";
   if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") return false;
@@ -2579,7 +2675,8 @@ export function handleMessageUpdated(
     });
     record.time.ttft = timeToFirstToken({ time: { ...record.time, ttft: undefined } });
   }
-  record.speed = mergeRecordSpeed(record, prior, state && finalSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
+  record.speed = mergeRecordSpeed(record, prior, observations.taintedMessages.has(messageID)
+    || (state && finalSamples(state).length > 0 && !record.speed?.generation) ? "invalidated" : "unobserved");
   (record as MeasuredHistoryRecord).update = update;
   commitRecord(store, record, true);
   observations.metadata.completed.add(messageID);
@@ -2730,6 +2827,7 @@ export function handleSessionLifecycle(
   event: CompatibleEvent,
   bytesPerToken: number,
 ): boolean {
+  recordTuiObservationLifecycle(store, type, properties, event);
   const sessionID = readSessionID(properties, event);
   const status = sessionRunStatus(type, properties, event);
   if (!sessionID || status === undefined) return false;
@@ -3071,10 +3169,10 @@ function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefine
     : join(base, relativeOrAbsolute);
 }
 
-export function createRuntimeStore(maxRecords: number): RuntimeStore {
+export function createRuntimeStore(maxRecords: number, observedSince = Date.now()): RuntimeStore {
   return createRoot((disposeSignals): RuntimeStore => {
     const [revision, setRevision] = createSignal(0);
-    return {
+    const store: RuntimeStore = {
       maxRecords,
       diskRecords: [],
       records: [],
@@ -3099,6 +3197,8 @@ export function createRuntimeStore(maxRecords: number): RuntimeStore {
       disposed: false,
       disposeSignals,
     };
+    observationRuntime(store).observedSince = observedSince;
+    return store;
   });
 }
 
@@ -3196,11 +3296,15 @@ export function formatCacheHitRate(rate: number | undefined): string {
   return `${Math.round(Math.max(0, Math.min(1, rate)) * 100)}%`;
 }
 
-export function formatPulseMetrics(tokens: TokenCounts, speed: number): string {
-  const speedLabel = Number.isFinite(speed) && speed > 0
-    ? ` · ${formatCompactRate(speed)}`
-    : "";
-  return `${formatCompactNumber(totalTokens(tokens))} total${speedLabel} · cache ${formatCacheHitRate(cacheHitRate(tokens))}`;
+export function formatPulseMetrics(tokens: TokenCounts, speed: number | undefined, width = Number.POSITIVE_INFINITY): string {
+  const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactNumber(speed)}` : "--";
+  // Keep the scope and primary speed visible before truncating secondary usage.
+  const primary = `incl TPS ${speedLabel}`;
+  const usage = `${primary} · ${formatCompactNumber(totalTokens(tokens))} total`;
+  const full = `${usage} · cache ${formatCacheHitRate(cacheHitRate(tokens))}`;
+  if (full.length <= width) return full;
+  if (usage.length <= width) return usage;
+  return primary.length <= width ? primary : `incl ${speedLabel}/s`;
 }
 
 export function formatPulseSummary(tokens: TokenCounts, speed: number): string {
@@ -3228,7 +3332,9 @@ export function generationElapsed(record: HistoryRecord): number | undefined {
 
 export function recordSpeedSummary(record: HistoryRecord): RecordSpeedSummary {
   const generated = generatedTokens(record.tokens);
-  const sampleStats = calculateSpeedStats(record.samples);
+  const sampleStats = calculateSpeedStats(record.samples.map((sample) => ({ ...sample,
+    tokens: sample.estimatedTokens ?? (sample.bytes !== undefined ? bytesToTokens(sample.bytes, DEFAULT_BYTES_PER_TOKEN) : sample.tokens),
+  })));
   const selected = selectSpeedMeasurement(record);
   return {
     avg: selected.rate ?? 0,
@@ -3257,6 +3363,11 @@ export function formatArrivalPeaks(record: HistoryRecord): string {
   return summary.extremaAvailable
     ? `Arrival peaks (estimated window): max ~${formatCompactRate(summary.max)} · min ~${formatCompactRate(summary.min)}`
     : "Arrival peaks: -- (insufficient window observations)";
+}
+
+export function formatResponseThroughput(record: HistoryRecord): string {
+  const selected = selectResponseMeasurement(record);
+  return `Response throughput ${selected.available ? `${selected.estimated ? "~" : ""}${formatCompactRate(selected.rate!)}` : "--"}`;
 }
 
 export function aggregateSpeed(records: readonly HistoryRecord[]): number {
@@ -3446,7 +3557,7 @@ function ChildAgentRows(props: {
             {`${"  ".repeat(row.depth)}${shortTail(row.sessionID, 10)}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`}
           </text>
           <text fg={props.theme.current.textMuted} truncate wrapMode="none">
-            {`model ${truncateMiddle(row.model, 24)}  ${formatCompactRate(row.speed)}`}
+            {`model ${truncateMiddle(row.model, 24)}  ${row.speedAvailable ? `~${formatCompactRate(row.speed)}` : "--"}`}
           </text>
         </box>
       ))}
@@ -3526,6 +3637,7 @@ function recentRecords(
 const TOTALS_TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 
 interface TotalsProjectionLedger {
+  generationBasisVersion?: number;
   sessions: Record<string, SessionDirectTotals>;
   open: Record<string, OpenContribution>;
   settled?: Record<string, OpenContribution | true>;
@@ -3561,19 +3673,16 @@ export function formatAverageRate(summary: AverageRateSummary): string {
 export function sessionAverageDisplay(summary: SessionAverageSummary, isChild = false): {
   label: string; value: string; coverage?: string;
 } {
-  const basis = summary.generation.available ? "generation" : "response";
-  const measured = summary[basis];
-  const partial = measured.available && (measured.coveredResponseCount < summary.totalResponseCount
-    || measured.coveredGeneratedTokens < summary.totalGeneratedTokens);
+  const measured = summary.generation;
   return {
     label: isChild ? "Session avg TPS" : "Main avg TPS",
-    value: `${formatAverageRate(measured)}${measured.available && basis === "response" ? " (response)" : ""}`,
-    ...(partial ? { coverage: `Measured ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls` } : {}),
+    value: measured.available && measured.rate !== undefined ? `~${formatCompactRate(measured.rate)}` : "--",
+    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls`,
   };
 }
 
 function averageCoverage(summary: AverageRateSummary, total: SessionAverageSummary): string {
-  return `${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured · ${formatCompactNumber(summary.estimatedResponseCount)} estimated calls`;
+  return `Observed usage ${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured`;
 }
 
 export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStore; sessionID: string }): JSX.Element {
@@ -3648,16 +3757,17 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
         <text fg={theme.accent}>SESSION AVERAGES</text>
         <text fg={theme.text} wrapMode="word">{`Generation avg TPS  ${formatAverageRate(details().average.generation)}`}</text>
         <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.generation, details().average)}</text>
-        <text fg={theme.text} wrapMode="word">{`Response avg TPS  ${formatAverageRate(details().average.response)}`}</text>
+        <text fg={theme.text} wrapMode="word">{`Response throughput  ${formatAverageRate(details().average.response)}`}</text>
         <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.response, details().average)}</text>
-        <text fg={theme.textMuted} wrapMode="word">Response time includes TTFT and may include tool waits. Generation time needs complete content coverage and observed boundaries.</text>
+        <text fg={theme.textMuted} wrapMode="word">Response time includes TTFT and may include tool waits. Generation TPS requires complete content and at least 1s between observed arrivals.</text>
         <text fg={theme.accent} paddingTop={1}>SESSION USAGE</text>
         <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map((metric) => [metric])} />
         <text fg={theme.accent} paddingTop={1}>LAST RESPONSE</text>
         <text fg={theme.text} wrapMode="word">{details().last
-          ? `${details().lastSpeed!.available ? `${details().lastSpeed!.estimated ? "~" : ""}${formatCompactRate(details().lastSpeed!.avg)} (${details().lastSpeed!.basis})` : "Speed unavailable"} · TTFT ${formatOptionalDuration(details().last!.ttft)} · response time ${formatOptionalDuration(durationOf(details().last!.record))}`
+          ? `${details().lastSpeed!.available ? `~${formatCompactRate(details().lastSpeed!.avg)} (generation)` : "Generation TPS --"} · TTFT ${formatOptionalDuration(details().last!.ttft)} · response time ${formatOptionalDuration(durationOf(details().last!.record))}`
           : "No completed response in the loaded history"}</text>
         {details().last && <>
+          <text fg={theme.textMuted} wrapMode="word">{formatResponseThroughput(details().last!.record)}</text>
           <text fg={theme.textMuted} wrapMode="word">{formatResponseTimingDetails(details().last!.record)}</text>
           <text fg={theme.textMuted} wrapMode="word">{formatArrivalPeaks(details().last!.record)}</text>
         </>}
@@ -3667,12 +3777,13 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
           <text fg={theme.textMuted} wrapMode="word">Measured token/time sums, not wall-clock throughput. Includes every descendant once.</text>
           <text fg={theme.text} wrapMode="word">{`Generation avg TPS  ${formatAverageRate(tree().average.generation)}`}</text>
           <text fg={theme.textMuted} wrapMode="word">{averageCoverage(tree().average.generation, tree().average)}</text>
-          <text fg={theme.text} wrapMode="word">{`Response avg TPS  ${formatAverageRate(tree().average.response)}`}</text>
+          <text fg={theme.text} wrapMode="word">{`Response throughput  ${formatAverageRate(tree().average.response)}`}</text>
           <text fg={theme.textMuted} wrapMode="word">{averageCoverage(tree().average.response, tree().average)}</text>
           <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map((metric) => [metric])} />
         </> : <text fg={theme.textMuted} paddingTop={1} wrapMode="word">No known subagents in this scope</text>}
-        <text fg={theme.textMuted} paddingTop={1} wrapMode="word">Average = measured generated tokens / measured time, not an average of call speeds. Generated tokens include output and reasoning; input and cache are excluded.</text>
-        <text fg={theme.textMuted} wrapMode="word">~ means estimated. Coverage shows calls with usable timing. LIVE and peaks estimate windowed event arrivals, not token generation inside the model.</text>
+        <text fg={theme.textMuted} paddingTop={1} wrapMode="word">Average = estimated interval tokens / observed time, not an average of call speeds. The first arrival batch is excluded. Coverage counts accepted calls' full output + reasoning usage, not interval tokens.</text>
+        <text fg={theme.textMuted} wrapMode="word">incl TPS includes this session + subagents. Older or incomplete observations do not count toward generation speed.</text>
+        <text fg={theme.textMuted} wrapMode="word">~ means a host-observed estimate, not provider-internal speed. LIVE and peaks use byte-based windowed event arrivals, not token generation inside the model.</text>
         </box>
       </scrollbox>
       <text fg={theme.textMuted} paddingTop={compact() ? 0 : 1} flexShrink={0}>esc / ctrl+c to close</text>
@@ -3783,8 +3894,10 @@ function projectTotals(
   parentBySessionID: ReadonlyMap<string, string>,
 ): ProjectedTotals {
   const unique = mergeHistoryLayers(records, new Map(), Number.MAX_SAFE_INTEGER);
+  const basis = projectTotalsGenerationBasis({ ...ledger, version: TOTALS_VERSION,
+    generationBasisVersion: ledger.generationBasisVersion === 3 ? 3 : undefined, settled: ledger.settled ?? {} });
   return {
-    sessions: applyWindowAdjustments(ledger, unique),
+    sessions: applyWindowAdjustments(basis, unique),
     parents: projectionParents(parentBySessionID, unique),
   };
 }
@@ -4016,6 +4129,7 @@ function totalsHaveUsage(totals: SessionDirectTotals | undefined): boolean {
 function emptyTotalsLedger(): TotalsLedger {
   return {
     version: TOTALS_VERSION,
+    generationBasisVersion: 3,
     sessions: {},
     open: {},
     settled: {},
@@ -4052,12 +4166,13 @@ function coerceTotalsSnapshot(value: unknown): TotalsLedger {
     if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
     open[messageID] = coerceOpenContribution(contribution);
   }
-  return {
+  return projectTotalsGenerationBasis({
     version: TOTALS_VERSION,
+    ...(value.generationBasisVersion === 3 ? { generationBasisVersion: 3 } : {}),
     sessions,
     open,
     settled: coerceSettled(value.settled),
-  };
+  });
 }
 
 function coerceSettled(value: unknown): Record<string, OpenContribution | true> {
@@ -4132,7 +4247,7 @@ function isNodeError(value: unknown): value is NodeJS.ErrnoException {
   return value instanceof Error || isRecord(value);
 }
 
-function childRows(
+export function childRows(
   records: readonly HistoryRecord[],
   sessionID: string | undefined,
   store?: RuntimeStore,
@@ -4154,14 +4269,14 @@ function childRows(
         .sort((left, right) => (
           (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start)
         ))[0];
+      const generation = getSessionAverageSummary(rollup.direct).generation;
       rows.push({
         depth,
         sessionID: childID,
-        responseCount: rollup.direct.responseCount || rollup.including.responseCount,
-        generated: rollup.direct.responseCount > 0
-          ? generatedTokens(rollup.direct.tokens)
-          : generatedTokens(rollup.including.tokens),
-        speed: aggregateSpeed(directRecords),
+        responseCount: rollup.direct.responseCount,
+        generated: generatedTokens(rollup.direct.tokens),
+        speed: generation.rate ?? 0,
+        speedAvailable: generation.available,
         model: modelRecord?.model ?? "-",
       });
     }
@@ -4344,10 +4459,10 @@ function HistoryView(props: {
       <SummaryBlock theme={props.api.theme} store={props.store} sessionID={props.sessionID} />
       <box height={1} paddingX={1} backgroundColor={props.api.theme.current.backgroundElement}>
         <text fg={props.api.theme.current.textMuted} truncate wrapMode="none">
-          TIME     SESSION      MODEL            OUT/REAS   AVG BASIS       MAX~    MIN~    TTFT    DUR      COST      SPARK
+          TIME     SESSION      MODEL            OUT/REAS   GEN~ BASIS       MAX~    MIN~    TTFT    DUR      COST      SPARK
         </text>
       </box>
-      <text fg={props.api.theme.current.textMuted} paddingX={1} wrapMode="word">AVG uses the shown basis; ~ is estimated. MAX/MIN are windowed arrival estimates; -- means unavailable.</text>
+      <text fg={props.api.theme.current.textMuted} paddingX={1} wrapMode="word">GEN is host-observed generation TPS; ~ is estimated, not provider-internal speed. MAX/MIN use byte-based arrival windows; -- means insufficient observations.</text>
       <scrollbox
         flexGrow={1}
         flexDirection="column"
@@ -4422,6 +4537,7 @@ function BottomContent(props: {
   store: RuntimeStore;
   sessionID: string;
 }): JSX.Element {
+  const [metricWidth, setMetricWidth] = createSignal(Math.max(1, props.api.renderer.width - 4));
   const sessionID = createMemo(() => {
     props.store.revision();
     return displayedSessionID(props.store, props.sessionID);
@@ -4463,17 +4579,15 @@ function BottomContent(props: {
   });
   const pulseSummary = createMemo(() => {
     const currentView = view();
-    const currentSessionID = sessionID();
+    const average = getSessionAverageSummary(currentView.totals?.including ?? zeroDirectTotals()).generation;
     return {
       tokens: currentView.totals?.including.tokens ?? emptyTokenCounts(),
-      speed: currentView.aggregate && currentSessionID
-        ? aggregateSpeed(recordsForSession(currentView.records, currentSessionID))
-        : 0,
+      speed: average.available ? average.rate : undefined,
     };
   });
   const metricLabel = createMemo(() => {
     const summary = pulseSummary();
-    return formatPulseMetrics(summary.tokens, summary.speed);
+    return formatPulseMetrics(summary.tokens, summary.speed, metricWidth());
   });
   const taskWallTimeLabel = createMemo(() => {
     const wallTime = taskWallTime();
@@ -4508,7 +4622,8 @@ function BottomContent(props: {
           {expanded() ? "- Token Pulse" : "+ Token Pulse"}
         </text>
       </box>
-      <text fg={props.api.theme.current.textMuted} width="100%" paddingX={1} truncate wrapMode="none">
+      <text fg={props.api.theme.current.textMuted} width="100%" paddingX={1} truncate wrapMode="none"
+        onSizeChange={function () { setMetricWidth(Math.max(1, this.width - 2)); }}>
         {metricLabel()}
       </text>
       {expanded() && (!sessionID() ? (
@@ -4737,11 +4852,16 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const handleEvent = (input: unknown): void => {
     if (disposed) return;
     const receivedAt = Date.now();
+    const receivedMono = performance.now();
     try {
       const event = normalizeEvent(input);
       if (!event) return;
       const type = eventType(event);
       const properties = eventProperties(event);
+      if (type === "server.connected" || type === "server.instance.disposed" || type.startsWith("workspace.")) {
+        recordTuiObservationLifecycle(store, type, properties, event, receivedAt);
+        return;
+      }
       const eventSessionID = readSessionID(properties, event);
       if (type === "session.created" || type === "session.updated") {
         const mapped = cacheSessionParentFromEvent(store, event);
@@ -4753,11 +4873,11 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       }
       if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
       if (type === "message.part.updated") {
-        recordTuiPartMetadata(store, properties, event);
+        recordTuiPartMetadata(store, properties, event, receivedAt);
         return;
       }
       if (type === "message.part.delta") {
-        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken);
+        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken, receivedAt, receivedMono);
         return;
       }
       if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
@@ -4768,6 +4888,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           "v2",
           type.endsWith("reasoning.delta") ? "reasoning" : "output",
           options.bytesPerToken,
+          receivedAt,
+          receivedMono,
         );
         return;
       }
@@ -4818,6 +4940,12 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   subscribe("session.completed", handleEvent);
   subscribe("session.created", handleEvent);
   subscribe("session.updated", handleEvent);
+  subscribe("server.connected", handleEvent);
+  subscribe("server.instance.disposed", handleEvent);
+  subscribe("workspace.status", handleEvent);
+  subscribe("workspace.status.changed", handleEvent);
+  subscribe("workspace.disposed", handleEvent);
+  subscribe("workspace.deleted", handleEvent);
 
   const interval = setInterval(() => {
     if (!disposed && hasLiveTaskWallActivity(store)) store.bump();

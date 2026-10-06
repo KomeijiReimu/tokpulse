@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, basename, join } from "node:path";
 import { HISTORY_VERSION } from "./core.js";
-import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate } from './statistics.js';
+import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, mergeRecordSpeed } from './statistics.js';
 export const DEFAULT_MAX_RECORDS = 1000;
 
 /** Persist this marker: normalization's zero is not an original timing fact. */
@@ -87,7 +87,7 @@ export function mergeHistoryRecords(mainRecords, recoveredRecords) {
     if (!normalized) continue;
     const existing = byMessage.get(normalized.messageID);
     if (!existing || isPreferredRecord(normalized, existing)) {
-      byMessage.set(normalized.messageID, normalized);
+      byMessage.set(normalized.messageID, mergeAcceptedRecord(normalized, existing));
     }
   }
   return [...byMessage.values()];
@@ -153,7 +153,7 @@ export function parseHistoryJsonl(content) {
       if (record) {
         const existing = byMessage.get(record.messageID);
         if (!existing || isPreferredRecord(record, existing)) {
-          byMessage.set(record.messageID, record);
+          byMessage.set(record.messageID, mergeAcceptedRecord(record, existing));
         }
       }
     } catch {
@@ -169,7 +169,7 @@ export function serializeHistoryJsonl(records) {
     if (!normalized) continue;
     const existing = unique.get(normalized.messageID);
     if (!existing || isPreferredRecord(normalized, existing)) {
-      unique.set(normalized.messageID, normalized);
+      unique.set(normalized.messageID, mergeAcceptedRecord(normalized, existing));
     }
   }
   if (unique.size === 0) return "";
@@ -201,8 +201,10 @@ export function normalizeHistoryRecord(value) {
     ...(quality ? {
       quality
     } : {}),
-    ...(coerceSpeedContribution(value.speed) ? {
-      speed: coerceSpeedContribution(value.speed)
+    // Keep explicit empty live snapshots: absence means unobserved, whereas an
+    // empty server snapshot can revoke an earlier qualified measurement.
+    ...(isRecord(value.speed) ? {
+      speed: coerceSpeedContribution(value.speed) ?? {}
     } : {}),
     ...(coerceCompletionUpdate(value.update) ? {
       update: coerceCompletionUpdate(value.update)
@@ -213,10 +215,21 @@ function upsertRecord(records, record) {
   const normalized = normalizeHistoryRecord(record);
   if (!normalized) throw new TypeError("Invalid history record");
   const existing = records.find(entry => entry.messageID === normalized.messageID);
-  const chosen = existing && !isPreferredRecord(normalized, existing) ? existing : normalized;
+  const chosen = existing && !isPreferredRecord(normalized, existing) ? existing : mergeAcceptedRecord(normalized, existing);
   const result = records.filter(entry => entry.messageID !== normalized.messageID);
   result.push(chosen);
   return result;
+}
+
+/** Usage corrections reuse only the shared module's qualified v3 evidence. */
+function mergeAcceptedRecord(candidate, existing) {
+  if (!existing) return candidate;
+  const speed = coerceSpeedContribution(mergeRecordSpeed(candidate, existing, candidate.update && candidate.speed !== undefined && !candidate.speed.generation ? "invalidated" : "unobserved"));
+  const merged = {
+    ...candidate
+  };
+  if (speed) merged.speed = speed;else if (candidate.speed !== undefined) merged.speed = {};else delete merged.speed;
+  return merged;
 }
 function isPreferredRecord(candidate, existing) {
   const candidateQuality = candidate.quality ?? "exact";

@@ -1,10 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { addTokenCounts, emptyTokenCounts, normalizeTokenCounts } from "./core.js";
-import { coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
-import { hasOriginalResponseTiming } from "./storage.js";
-import { deriveSafeResponseMeasurement } from "./statistics.js";
+import { GENERATION_BASIS_VERSION, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, emptySpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 export const TOTALS_VERSION = 1;
+export { GENERATION_BASIS_VERSION } from './statistics.js';
 export const DEFAULT_TOTALS_FILENAME = "totals.json";
 const TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"];
 
@@ -49,9 +48,11 @@ export function createTotalsStorage(pathOrOptions) {
     }),
     seed: records => enqueuePath(path, () => seedLedger(path, records)),
     backfillSpeed: records => enqueuePath(path, async () => {
+      if (!Array.isArray(records)) throw new TypeError("Totals backfill records must be an array");
       const ledger = await loadLedger(path);
-      reconcileLegacySpeed(ledger, records);
-      return persistLedger(path, ledger);
+      // Compatibility entry point only. Old history cannot reconstruct the new
+      // observation basis, nor introduce guessed response timing.
+      return cloneLedger(ledger);
     }),
     read: () => enqueuePath(path, () => loadLedger(path)),
     quarantine: () => enqueuePath(path, () => quarantineFile(path))
@@ -71,7 +72,10 @@ function requireExplicitPath(path) {
 async function seedLedger(path, records) {
   if (!Array.isArray(records)) throw new TypeError("Totals seed records must be an array");
   const existing = await readExistingLedger(path);
-  if (existing) return cloneLedger(existing);
+  if (existing) {
+    if (migrateGenerationBasis(existing)) return persistLedger(path, existing);
+    return cloneLedger(existing);
+  }
   const ledger = emptyLedger();
   for (const record of records) applyRecord(ledger, record);
   return persistLedger(path, ledger);
@@ -84,7 +88,9 @@ async function loadLedger(path) {
     if (isNodeError(error) && error.code === "ENOENT") return emptyLedger();
     throw error;
   }
-  return cloneLedger(parseTotalsJson(content));
+  const ledger = parseTotalsJson(content);
+  if (migrateGenerationBasis(ledger)) return persistLedger(path, ledger);
+  return cloneLedger(ledger);
 }
 async function readExistingLedger(path) {
   let content;
@@ -134,22 +140,19 @@ function applyRecord(ledger, record, options = {}) {
 }
 function applyOpenRecord(ledger, record) {
   const messageID = requireMessageID(record);
-  const contribution = contributionFromRecord(record);
   const previous = ledger.open[messageID];
   const prior = ledger.settled[messageID] ?? previous;
+  const contribution = contributionFromRecord(record, prior === true ? undefined : prior);
+  if (prior && prior !== true && prior.quality === "exact" && contribution.quality === "provisional") return;
   if (prior && prior !== true) {
     if (contribution.update) {
       if (prior.update && !isNewerCompletionUpdate(contribution.update, prior.update)) return;
-    } else if (prior.update || prior.speedBackfill) return;
-  }
-  if (previous?.quality === "exact" && contribution.quality === "provisional") {
-    return;
+    } else if (prior.update && prior.quality === contribution.quality || prior.speedBackfill) return;
   }
   if (!previous) {
     const frozen = ledger.settled[messageID];
     if (frozen === true) return;
     if (frozen) {
-      if (frozen.quality === "exact" && contribution.quality === "provisional") return;
       if (sameContribution(frozen, contribution)) return;
       replaceContribution(ledger, frozen, contribution);
       delete ledger.settled[messageID];
@@ -166,59 +169,31 @@ function applyOpenRecord(ledger, record) {
   }
 }
 
-/** Never rebuild usage from history: only replace reversible speed snapshots. */
-function reconcileLegacySpeed(ledger, records) {
-  const history = new Map(records.map(record => [record.messageID, record]));
-  for (const [messageID, previous] of Object.entries({
-    ...ledger.settled,
-    ...ledger.open
-  })) {
-    if (previous === true) continue;
-    const record = history.get(messageID);
-    const evidence = previous.speed?.generationEvidence;
-    // Pruned contributions still have enough evidence to reject the old boolean-only contract.
-    const timing = record && (!previous.update || JSON.stringify(previous.update) === JSON.stringify(record.update)) ? record.time : {
-      start: evidence?.start ?? 0,
-      completed: evidence?.end ?? 0
-    };
-    const probe = {
-      version: 1,
-      messageID,
-      sessionID: previous.sessionID,
-      tokens: previous.tokens,
-      cost: previous.cost,
-      quality: previous.quality,
-      time: timing,
-      samples: [],
-      speed: previous.speed?.response ? {
-        response: previous.speed.response
-      } : {}
-    };
-    const speed = mergeRecordSpeed(probe, previous);
-    const sameUsage = record && record.sessionID === previous.sessionID && record.cost === previous.cost && TOKEN_FIELDS.every(field => record.tokens[field] === previous.tokens[field]);
-    const sameAuthority = !previous.update || JSON.stringify(previous.update) === JSON.stringify(record?.update);
-    if (!speed.response && record && sameUsage && sameAuthority && hasOriginalResponseTiming(record)) {
-      speed.response = deriveSafeResponseMeasurement({
-        ...record,
-        tokens: previous.tokens
-      }, {
-        rawTimingKnown: true,
-        usageExact: previous.quality === "exact"
-      });
-    }
-    if (sameSpeedContribution(previous.speed, speed)) continue;
-    const session = ensureSession(ledger, previous.sessionID);
-    session.speed = updateSpeedTotals(updateSpeedTotals(session.speed, previous.speed, -1), speed, 1);
-    const next = {
-      ...previous,
-      speedBackfill: {
-        version: 1,
-        source: "server"
-      }
-    };
-    const normalizedSpeed = coerceSpeedContribution(speed);
-    if (normalizedSpeed) next.speed = normalizedSpeed;else delete next.speed;
-    if (ledger.open[messageID]) ledger.open[messageID] = next;else ledger.settled[messageID] = next;
+/** Reset the observation epoch without touching usage or response throughput.
+ * The caller persists the marker and reset together with an atomic rename. */
+function migrateGenerationBasis(ledger) {
+  if (ledger.generationBasisVersion === GENERATION_BASIS_VERSION) return false;
+  clearGenerationMeasurements(ledger);
+  ledger.generationBasisVersion = GENERATION_BASIS_VERSION;
+  return true;
+}
+
+/** Read-only TUI projection; legacy generation is hidden without writing or
+ * marking the on-disk ledger as migrated. The server owns the atomic reset. */
+export function projectTotalsGenerationBasis(ledger) {
+  const projected = cloneLedger(ledger);
+  if (projected.generationBasisVersion !== GENERATION_BASIS_VERSION) clearGenerationMeasurements(projected);
+  return projected;
+}
+function clearGenerationMeasurements(ledger) {
+  for (const session of Object.values(ledger.sessions)) {
+    if (session.speed) session.speed.generation = emptySpeedTotals().generation;
+  }
+  for (const contribution of [...Object.values(ledger.open), ...Object.values(ledger.settled)]) {
+    if (contribution === true || !contribution.speed) continue;
+    delete contribution.speed.generation;
+    delete contribution.speed.generationEvidence;
+    if (!contribution.speed.response) delete contribution.speed;
   }
 }
 function replaceContribution(ledger, previous, contribution) {
@@ -234,14 +209,18 @@ function freezeRetained(ledger, retainedMessageIDs) {
   const retained = retainedSet(retainedMessageIDs);
   if (retained) freezeExact(ledger, retained);
 }
-function contributionFromRecord(record) {
+function contributionFromRecord(record, previous) {
   if (!isPlainObject(record) || typeof record.sessionID !== "string" || record.sessionID.length === 0) {
     throw new TypeError("Invalid totals record");
   }
   const quality = record.quality === "provisional" ? "provisional" : "exact";
-  // Coercion deliberately retains old measurements for reversible subtraction.
-  // Newly applied records, unlike loaded ledger snapshots, must meet the new contract.
-  const speed = coerceSpeedContribution(mergeRecordSpeed(record, undefined));
+  // Loaded snapshots retain legacy identity and reversible response throughput;
+  // newly applied generation must satisfy the shared v3 observation contract.
+  // The server has already calibrated explicit live speed snapshots. An
+  // explicit live omission is a revocation, not permission to resurrect prior
+  // evidence. Corrections without a speed snapshot can still use shared merge.
+  const update = coerceCompletionUpdate(record.update);
+  const speed = coerceSpeedContribution(mergeRecordSpeed(record, previous, update && record.speed !== undefined && !record.speed.generation ? "invalidated" : "unobserved"));
   return {
     sessionID: record.sessionID,
     quality,
@@ -250,8 +229,8 @@ function contributionFromRecord(record) {
     ...(speed ? {
       speed
     } : {}),
-    ...(coerceCompletionUpdate(record.update) ? {
-      update: coerceCompletionUpdate(record.update)
+    ...(update ? {
+      update
     } : {})
   };
 }
@@ -328,6 +307,7 @@ function clampTokenCounts(tokens) {
 function emptyLedger() {
   return {
     version: TOTALS_VERSION,
+    generationBasisVersion: GENERATION_BASIS_VERSION,
     sessions: {},
     open: {},
     settled: {}
@@ -351,6 +331,9 @@ function cloneLedger(ledger) {
   }
   return {
     version: TOTALS_VERSION,
+    ...(ledger.generationBasisVersion === GENERATION_BASIS_VERSION ? {
+      generationBasisVersion: GENERATION_BASIS_VERSION
+    } : {}),
     sessions,
     open,
     settled: cloneSettled(ledger.settled)
@@ -415,6 +398,9 @@ function coerceLedger(value) {
   }
   return {
     version: TOTALS_VERSION,
+    ...(value.generationBasisVersion === GENERATION_BASIS_VERSION ? {
+      generationBasisVersion: GENERATION_BASIS_VERSION
+    } : {}),
     sessions,
     open,
     settled: coerceSettled(value.settled)

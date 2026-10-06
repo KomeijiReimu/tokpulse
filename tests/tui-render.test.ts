@@ -10,7 +10,19 @@ import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable,
 import { testRender, useRenderer } from "@opentui/solid";
 import type { JSX } from "@opentui/solid";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { emptySpeedTotals, updateSpeedTotals } from "../src/statistics.js";
+import { emptySpeedTotals, updateSpeedTotals, type SpeedContribution } from "../src/statistics.js";
+
+function v3Generation(output: number, reasoning = 0, durationMs = 1000, start = 0): SpeedContribution {
+  return {
+    generation: { generatedTokens: (output + reasoning) / 2, coverageGeneratedTokens: output + reasoning, durationMs, estimated: true },
+    generationEvidence: { version: 3, coverage: "complete", start, end: start + durationMs,
+      firstReceiveMono: 0, lastReceiveMono: durationMs, observationCount: 2,
+      timeSource: "receive-monotonic", fromCurrentStart: true, selectedStream: "legacy", stepID: "step",
+      outputObserved: output > 0, reasoningObserved: reasoning > 0,
+      bytes: { output: { total: output > 0 ? 2 : 0, firstBatch: output > 0 ? 1 : 0 },
+        reasoning: { total: reasoning > 0 ? 2 : 0, firstBatch: reasoning > 0 ? 1 : 0 } }, usage: { output, reasoning } },
+  };
+}
 
 const cacheRoot = process.env.TMPDIR || join(homedir(), ".cache", "tokpulse-tests");
 
@@ -67,19 +79,57 @@ if (!nativeChild) {
     ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /4 pass/);
+    assert.match(output.stderr + output.stdout, /5 pass/);
   });
 }
 
 if (nativeChild) {
+test("native child rows show direct cumulative generation estimates or unavailable without response fallback", async () => {
+  const ui = (await uiPromise)!;
+  const store = ui.createRuntimeStore(1);
+  const direct = (output: number, measured = true) => ({
+    tokens: { input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 1, responseCount: 3,
+    speed: updateSpeedTotals(emptySpeedTotals(), measured ? v3Generation(output, 0, 2000)
+      : { response: { generatedTokens: output, durationMs: 1, estimated: false } }, 1),
+  });
+  store.totalsLedger.sessions = { child: direct(200), grand: direct(800), unavailable: direct(100, false) };
+  store.sessionParents = new Map([["child", "root"], ["grand", "child"], ["unavailable", "root"]]);
+  store.records = ["child", "grand", "unavailable"].map((sessionID) => ({
+    version: 1, messageID: `${sessionID}-last`, sessionID, model: `${sessionID}-model`,
+    tokens: store.totalsLedger.sessions[sessionID].tokens, cost: 1, time: { start: 0, completed: 1 }, samples: [],
+    speed: { response: { generatedTokens: store.totalsLedger.sessions[sessionID].tokens.output, durationMs: 1, estimated: false } },
+  }));
+  for (const record of store.records) store.totalsLedger.settled[record.messageID] = true;
+  store.pulseExpanded = true;
+  const api = host(110, 100);
+  const sidebar = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!;
+  const rendered = await testRender(() => sidebar({ theme: api.theme }, { session_id: "root" }), { width: 110, height: 100 });
+  try {
+    await rendered.renderOnce();
+    const frame = rendered.captureCharFrame();
+    assert.match(frame, /CHILD AGENTS/);
+    assert.match(frame, /model child-model\s+~50 tok\/s/);
+    assert.match(frame, /model grand-model\s+~200 tok\/s/);
+    assert.match(frame, /model unavailable-model\s+--/);
+    assert.doesNotMatch(frame, /200k tok\/s|800k tok\/s|100k tok\/s/);
+    assert.ok(frame.indexOf("model child-model") < frame.indexOf("model grand-model"));
+    assert.ok(frame.indexOf("model grand-model") < frame.indexOf("model unavailable-model"));
+  } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+});
+
 test("native sidebar stays compact when collapsed and shows direct average only in expanded SESSION ONLY", async () => {
   const ui = (await uiPromise)!;
   for (const width of [80, 24, 18]) {
     const store = ui.createRuntimeStore(1);
     store.totalsLedger.sessions.root = {
       tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
-      speed: updateSpeedTotals(emptySpeedTotals(), { response: { generatedTokens: 120, durationMs: 2000, estimated: true } }, 1),
+      speed: updateSpeedTotals(emptySpeedTotals(), { ...v3Generation(100, 20, 2000), response: { generatedTokens: 120, durationMs: 4000, estimated: true } }, 1),
     };
+    store.totalsLedger.sessions.child = {
+      tokens: { input: 0, output: 200, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, responseCount: 1,
+      speed: updateSpeedTotals(emptySpeedTotals(), v3Generation(200, 0, 2000), 1),
+    };
+    store.sessionParents.set("child", "root");
     const api = host(width, 45);
     const plugin = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({}));
     const sidebar = plugin.slots!.sidebar_content!;
@@ -88,7 +138,8 @@ test("native sidebar stays compact when collapsed and shows direct average only 
       await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
       assert.match(frame, /\+ Token Pulse/);
-      assert.doesNotMatch(frame, /(?:Main|Session) avg TPS|Measured|~60 tok\/s/);
+      assert.doesNotMatch(frame, /(?:Main|Session) avg TPS|Observed \d|~30 tok\/s/);
+      assert.match(frame, /incl TPS ~40/); // Empty history; cumulative including differs from direct ~30.
       assert.doesNotMatch(frame, /SESSION ONLY/);
       assert.ok(rendered.renderer.root.getChildren()[0].height <= 3, `${width}: collapsed sidebar must stay three rows`);
       assert.equal(store.pulseExpanded, false);
@@ -97,8 +148,8 @@ test("native sidebar stays compact when collapsed and shows direct average only 
       assert.match(rendered.captureCharFrame(), /- Token Pulse/);
       assert.match(rendered.captureCharFrame(), /SESSION ONLY/);
       assert.match(rendered.captureCharFrame(), /Main avg TPS/);
-      assert.match(rendered.captureCharFrame(), /~60 tok\/s/);
-      assert.match(rendered.captureCharFrame(), /Measured 1\/2/);
+      assert.match(rendered.captureCharFrame(), /~30 tok\/s/);
+      assert.match(rendered.captureCharFrame(), /Observed 1\/2/);
       assert.ok(rendered.captureCharFrame().indexOf("SESSION ONLY") < rendered.captureCharFrame().indexOf("Main avg TPS"));
       const includingPosition = rendered.captureCharFrame().indexOf("INCLUDING SUBAGENTS");
       if (includingPosition !== -1) assert.ok(rendered.captureCharFrame().indexOf("Main avg TPS") < includingPosition);
@@ -117,8 +168,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
   store.totalsLedger.sessions[sessionID] = {
     tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
     speed: updateSpeedTotals(emptySpeedTotals(), {
-      generation: { generatedTokens: 120, durationMs: 2000, estimated: true },
-      generationEvidence: { version: 2, coverage: "complete", start: 0, end: 2000, outputObserved: true, reasoningObserved: true },
+      ...v3Generation(100, 20, 2000),
       response: { generatedTokens: 120, durationMs: 4000, estimated: false },
     }, 1),
   };
@@ -146,8 +196,8 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     const frame = rendered.captureCharFrame();
     assert.equal(frame.match(/Token Pulse details/g)?.length, 1);
     if (width === 110) {
-      assert.match(frame, /Generation avg TPS\s+~60 tok\/s/);
-      assert.match(frame, /Response avg TPS\s+30 tok\/s/);
+      assert.match(frame, /Generation avg TPS\s+~30 tok\/s/);
+      assert.match(frame, /Response throughput\s+30 tok\/s/);
       assert.match(frame, /120\/120 generated tokens · 1\/2 calls/);
       assert.match(frame, /may include tool waits/);
     }
@@ -178,8 +228,8 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     assert.equal(children.at(-1)!.y, closeHintY);
     if (width === 110) {
       assert.match(bottom.replace(/[█▀▄]/g, ""), /not an average of call\s+speeds/);
-      assert.match(bottom, /~ means estimated/);
-      assert.match(bottom, /windowed event arrivals, not token generation inside the model\./);
+      assert.match(bottom, /~ means a host-observed estimate, not provider-internal speed/);
+      assert.match(bottom, /byte-based windowed event arrivals, not token generation inside the model\./);
     }
     assert.match(bottom, /esc \/ ctrl\+c to close/);
     if (width === 110) {
@@ -213,21 +263,19 @@ test("native session-tree selector switches direct details, retains ledger-only 
     const makeDirect = (generated: number, generationMs: number, responseMs: number) => ({
       tokens: { input: 10, output: generated, reasoning: 0, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 1,
       speed: updateSpeedTotals(emptySpeedTotals(), {
-        generation: { generatedTokens: generated, durationMs: generationMs, estimated: false },
-        generationEvidence: { version: 2, coverage: "complete", start: 0, end: generationMs, outputObserved: true, reasoningObserved: false },
+        ...v3Generation(generated, 0, generationMs),
         response: { generatedTokens: generated, durationMs: responseMs, estimated: false },
       }, 1),
     });
     store.totalsLedger.sessions = { [scope]: makeDirect(100, 1000, 2000), child: makeDirect(600, 2000, 3000),
-      grand: makeDirect(30, 3000, 6000), unrelated: makeDirect(9000, 1, 1) };
+      grand: makeDirect(30, 3000, 6000), unrelated: makeDirect(9000, 1000, 2000) };
     store.sessionParents = new Map([["child", scope], ["grand", "child"]]);
     for (let i = 0; i < 35; i++) store.sessionParents.set(`zz-${String(i).padStart(2, "0")}`, scope);
     store.lastCompletedBySession.set("child", ui.makeLastCompletedSnapshot({
       version: 1, messageID: "child-last", sessionID: "child", model: "known-child-model",
       tokens: store.totalsLedger.sessions.child.tokens, cost: 1,
       time: { start: 0, firstToken: 222, completed: 3000 }, samples: [],
-      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false },
-        generationEvidence: { version: 2, coverage: "complete", start: 222, end: 2222, outputObserved: true, reasoningObserved: false } },
+      speed: v3Generation(600, 0, 2000, 222),
     }));
     const api = host(width, height);
     api.state = { session: { get: (id: string) => ({ title: id === scope ? "Main work" : id === "child" ? "Child work" : id === "grand" ? "Grand work" : undefined }) } } as unknown as TuiPluginApi["state"];
@@ -258,7 +306,7 @@ test("native session-tree selector switches direct details, retains ledger-only 
       assert.ok(footer.y + footer.height <= height - 1);
       assert.match(rendered.captureCharFrame(), /Token Pulse details/);
       assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
-      if (width === 110) assert.match(rendered.captureCharFrame(), /Generation avg TPS\s+100 tok\/s/);
+      if (width === 110) assert.match(rendered.captureCharFrame(), /Generation avg TPS\s+~50 tok\/s/);
       rendered.mockInput.pressArrow("down");
       await rendered.renderOnce();
       assert.equal(selector.getSelectedOption()?.value, "child");
@@ -276,11 +324,11 @@ test("native session-tree selector switches direct details, retains ledger-only 
         assert.equal(footer.y, footerY);
         assert.equal(children[0].y, titleY);
       }
-      assert.match(selectedFrames, /Generation avg TPS\s+300 tok\/s/);
-      assert.match(selectedFrames, /Response avg TPS\s+200 tok\/s/);
+      assert.match(selectedFrames, /Generation avg TPS\s+~150 tok\/s/);
+      assert.match(selectedFrames, /Response throughput\s+200 tok\/s/);
       assert.match(selectedFrames, /known-child-model/);
       assert.match(selectedFrames, /222ms/);
-      assert.match(selectedFrames, /300 tok\/s \(generation\)/);
+      assert.match(selectedFrames, /~150 tok\/s \(generation\)/);
       assert.match(selectedFrames, /INCLUDING SUBAGENTS/);
       assert.match(selectedFrames, /730/);
       assert.match(selectedFrames.replace(/[█▀▄]/g, ""), /not\s+wall-\s*clock/);
