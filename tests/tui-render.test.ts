@@ -118,6 +118,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
     speed: updateSpeedTotals(emptySpeedTotals(), {
       generation: { generatedTokens: 120, durationMs: 2000, estimated: true },
+      generationEvidence: { version: 2, coverage: "complete", start: 0, end: 2000, outputObserved: true, reasoningObserved: true },
       response: { generatedTokens: 120, durationMs: 4000, estimated: false },
     }, 1),
   };
@@ -170,7 +171,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     scroll.scrollTo(scroll.scrollHeight);
     await rendered.renderOnce();
     const bottom = rendered.captureCharFrame();
-    assert.match(bottom, /model usage\./);
+    assert.match(bottom, /model\./);
     assert.match(bottom, /Token Pulse details/);
     assert.ok(scroll.scrollTop > 0);
     assert.equal(children[0].y, titleY);
@@ -178,6 +179,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     if (width === 110) {
       assert.match(bottom.replace(/[█▀▄]/g, ""), /not an average of call\s+speeds/);
       assert.match(bottom, /~ means estimated/);
+      assert.match(bottom, /windowed event arrivals, not token generation inside the model\./);
     }
     assert.match(bottom, /esc \/ ctrl\+c to close/);
     if (width === 110) {
@@ -194,7 +196,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
       assert.equal(content!.height, 16);
       scroll.scrollTo(scroll.scrollHeight);
       await rendered.renderOnce();
-      assert.match(rendered.captureCharFrame(), /model usage\./);
+      assert.match(rendered.captureCharFrame(), /model\./);
     }
   } finally {
     rendered.renderer.destroy();
@@ -212,6 +214,7 @@ test("native session-tree selector switches direct details, retains ledger-only 
       tokens: { input: 10, output: generated, reasoning: 0, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 1,
       speed: updateSpeedTotals(emptySpeedTotals(), {
         generation: { generatedTokens: generated, durationMs: generationMs, estimated: false },
+        generationEvidence: { version: 2, coverage: "complete", start: 0, end: generationMs, outputObserved: true, reasoningObserved: false },
         response: { generatedTokens: generated, durationMs: responseMs, estimated: false },
       }, 1),
     });
@@ -223,7 +226,8 @@ test("native session-tree selector switches direct details, retains ledger-only 
       version: 1, messageID: "child-last", sessionID: "child", model: "known-child-model",
       tokens: store.totalsLedger.sessions.child.tokens, cost: 1,
       time: { start: 0, firstToken: 222, completed: 3000 }, samples: [],
-      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false } },
+      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false },
+        generationEvidence: { version: 2, coverage: "complete", start: 222, end: 2222, outputObserved: true, reasoningObserved: false } },
     }));
     const api = host(width, height);
     api.state = { session: { get: (id: string) => ({ title: id === scope ? "Main work" : id === "child" ? "Child work" : id === "grand" ? "Grand work" : undefined }) } } as unknown as TuiPluginApi["state"];
@@ -281,7 +285,7 @@ test("native session-tree selector switches direct details, retains ledger-only 
       assert.match(selectedFrames, /730/);
       assert.match(selectedFrames.replace(/[█▀▄]/g, ""), /not\s+wall-\s*clock/);
       scroll.scrollTo(scroll.scrollHeight); await rendered.renderOnce();
-      assert.match(rendered.captureCharFrame(), /model usage\./);
+      assert.match(rendered.captureCharFrame(), /model\./);
       assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
       const next = fixed.flatMap((node) => [node, ...node.getChildren()]).find((node) => node instanceof TextRenderable && node.plainText === "[next]")!;
       await rendered.mockMouse.click(next.x, next.y);

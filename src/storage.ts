@@ -10,6 +10,14 @@ import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdat
 
 export const DEFAULT_MAX_RECORDS = 1000;
 
+/** Persist this marker: normalization's zero is not an original timing fact. */
+export type StoredResponseTiming = HistoryRecord["time"] & { startMissing?: true };
+export function hasOriginalResponseTiming(record: HistoryRecord): boolean {
+  const time = record.time as StoredResponseTiming;
+  return time.startMissing !== true && Number.isFinite(time.start) && time.start >= 0
+    && typeof time.completed === "number" && Number.isFinite(time.completed) && time.completed > time.start;
+}
+
 export interface HistoryStorageOptions {
   path: string;
   maxRecords?: number;
@@ -325,6 +333,12 @@ function normalizeTime(value: unknown): HistoryRecord["time"] {
   const source = isRecord(value) ? value : {};
   return {
     start: finiteNumber(source.start, 0),
+    ...(source.startMissing === true || finiteNumberOrUndefined(source.start) === undefined ? { startMissing: true as const } : {}),
+    ...(finiteNumberOrUndefined(source.firstResponse) !== undefined ? { firstResponse: source.firstResponse } : {}),
+    ...(finiteNumberOrUndefined(source.firstContent) !== undefined ? { firstContent: source.firstContent } : {}),
+    ...(["thinking", "content"].includes(source.firstResponseSource) ? { firstResponseSource: source.firstResponseSource } : {}),
+    ...(["part-start", "arrival"].includes(source.firstResponseTimeSource) ? { firstResponseTimeSource: source.firstResponseTimeSource } : {}),
+    ...(typeof source.firstResponseEstimated === "boolean" ? { firstResponseEstimated: source.firstResponseEstimated } : {}),
     ...(finiteNumberOrUndefined(source.firstToken) !== undefined
       ? { firstToken: finiteNumberOrUndefined(source.firstToken) }
       : {}),

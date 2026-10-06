@@ -34,15 +34,16 @@ function completionFact(id: string, output: number, reasoning: number, start: nu
     time: { created: start, completed: end },
   } } };
 }
-function snapshotFact(id: string, messageID: string, type: string, end?: number) {
+function snapshotFact(id: string, messageID: string, type: string, end?: number, text = "", start?: number) {
   return { type: "message.part.updated", timestamp: end ?? 10, properties: { part: {
-    id, messageID, sessionID: "s", type, text: "", ...(end !== undefined ? { time: { end } } : {}),
+    id, messageID, sessionID: "s", type, text,
+    ...(start !== undefined || end !== undefined ? { time: { ...(start !== undefined ? { start } : {}), ...(end !== undefined ? { end } : {}) } } : {}),
   } } };
 }
 async function textGeneration(send: (event: any) => Promise<void>, messageID: string) {
-  await send(snapshotFact(`${messageID}-p`, messageID, "text"));
+  await send(snapshotFact(`${messageID}-p`, messageID, "text", undefined, "", 100));
   await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID, partID: `${messageID}-p`, field: "text", delta: "hello" } });
-  await send(snapshotFact(`${messageID}-p`, messageID, "text", 200));
+  await send(snapshotFact(`${messageID}-p`, messageID, "text", 200, "hello", 100));
   await send(completionFact(messageID, 10, 0, 0, 300));
 }
 
@@ -145,9 +146,9 @@ test("hidden reasoning correction and incompatible response times invalidate old
 });
 test("real legacy reasoning metadata classifies field:text without kind and calibrates final usage", async () => {
   await backendCase(async ({ path, send }) => {
-    await send(snapshotFact("p", "m", "reasoning"));
+    await send(snapshotFact("p", "m", "reasoning", undefined, "", 100));
     await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "think" } });
-    await send(snapshotFact("p", "m", "reasoning", 200));
+    await send(snapshotFact("p", "m", "reasoning", 200, "think", 100));
     await send(completionFact("m", 0, 100, 0, 300));
     const [record] = await readRecords(path);
     assert.equal(record.samples[0].kind, "reasoning");
@@ -175,20 +176,22 @@ test("snapshot-only entry point never rebuilds active and known user deltas cann
     assert.equal((await readRecords(path)).length, 1);
   });
 });
-test("real v2 textID reasoningID and callID associate content with end metadata", async () => {
+test("real v2 IDs associate complete content metadata, but tool-input coverage still downgrades generation", async () => {
   await backendCase(async ({ path, send }) => {
     await send({ type: "session.next.text.delta", timestamp: 100, properties: { sessionID: "s", assistantMessageID: "m", textID: "text", delta: "hello" } });
     await send({ type: "session.next.reasoning.delta", timestamp: 150, properties: { sessionID: "s", assistantMessageID: "m", reasoningID: "reason", delta: "think" } });
     await send({ type: "session.next.tool.input.delta", timestamp: 200, properties: { sessionID: "s", assistantMessageID: "m", callID: "call", delta: "{}" } });
-    await send(snapshotFact("text", "m", "text", 190));
-    await send(snapshotFact("reason", "m", "reasoning", 180));
+    await send(snapshotFact("text", "m", "text", 190, "hello", 100));
+    await send(snapshotFact("reason", "m", "reasoning", 180, "think", 150));
     await send({ type: "message.part.updated", timestamp: 250, properties: { part: { id: "tool-part", callID: "call", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 250 } } } } });
     await send(completionFact("m", 10, 5, 0, 1000));
     const [record] = await readRecords(path);
     assert.equal(record.samples.length, 3);
     assert.equal(record.samples.filter((s: any) => s.kind === "reasoning").reduce((sum: number, s: any) => sum + s.tokens, 0), 5);
-    assert.equal(record.speed.generation.durationMs, 150);
-    assert.equal(record.speed.generationEvidence.reasoningObserved, true);
+    assert.equal(record.speed.generation, undefined);
+    assert.equal(record.speed.generationEvidence, undefined);
+    assert.equal(record.speed.response.durationMs, 1000);
+    assert.equal((await readTotals(path)).sessions.s.speed.generation.responseCount, 0);
   });
 });
 test("explicit envelope revisions reject stale updates and permit a genuinely newer return to old facts", async () => {
@@ -240,18 +243,18 @@ function assistantCompleted(
   };
 }
 
-test("trusted content timing spans reasoning/tool input, snapshots do not sample and tools output is ignored", async () => {
+test("known snapshot gap and uncertain tool input downgrade generation without sampling snapshots or tool output", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-content-"));
   const historyPath = join(directory, "history.jsonl");
   try {
     const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     const send = async (type: string, timestamp: number, properties: any) => hooks.event!({ event: { type, timestamp, properties } as never });
-    await send("message.part.updated", 10, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "old snapshot" } });
+    await send("message.part.updated", 10, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "old snapshot", time: { start: 300 } } });
     await send("session.next.text.delta", 300, { sessionID: "s", assistantMessageID: "m", partID: "text", delta: "hi" });
     await send("message.part.delta", 100, { sessionID: "s", messageID: "m", partID: "reason", kind: "reasoning", field: "text", delta: "think" });
     await send("session.next.tool.input.delta", 400, { sessionID: "s", assistantMessageID: "m", partID: "tool", delta: "{}" });
-    await send("message.part.updated", 500, { part: { id: "reason", messageID: "m", sessionID: "s", type: "reasoning", text: "think", time: { end: 200 } } });
-    await send("message.part.updated", 510, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "hi", time: { end: 350 } } });
+    await send("message.part.updated", 500, { part: { id: "reason", messageID: "m", sessionID: "s", type: "reasoning", text: "think", time: { start: 100, end: 200 } } });
+    await send("message.part.updated", 510, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "hi", time: { start: 300, end: 350 } } });
     await send("message.part.updated", 520, { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 450 } } } });
     await send("message.part.delta", 600, { sessionID: "s", messageID: "m", partID: "tool", field: "output", delta: "tool result must not count" });
     await send("message.part.updated", 950, { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 450, end: 900 } } } });
@@ -261,8 +264,8 @@ test("trusted content timing spans reasoning/tool input, snapshots do not sample
     assert.equal(records[0].time.firstToken, 100);
     assert.equal(records[0].time.ttft, 100);
     assert.equal(records[0].samples.length, 2); // v2 final priority, no snapshot/result duplication
-    assert.equal(records[0].speed.generation.durationMs, 350);
-    assert.equal(records[0].speed.generation.estimated, true);
+    assert.equal(records[0].speed.generation, undefined);
+    assert.equal(records[0].speed.generationEvidence, undefined);
     assert.equal(records[0].speed.response.durationMs, 1000);
     await send("message.updated", 1200, { info: { ...info, time: { created: 0, firstToken: 300, completed: 1200 } } });
     records = await readRecords(historyPath);
@@ -271,7 +274,7 @@ test("trusted content timing spans reasoning/tool input, snapshots do not sample
     const totals = await readTotals(historyPath);
     assert.equal(totals.sessions.s.responseCount, 1);
     assert.equal(totals.sessions.s.speed.response.durationMs, 1200);
-    assert.equal(totals.sessions.s.speed.generation.durationMs, 350);
+    assert.equal(totals.sessions.s.speed.generation.responseCount, 0);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

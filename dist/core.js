@@ -78,16 +78,20 @@ export function appendSpeedSample(samples, sample, windowMs = DEFAULT_ROLLING_WI
   if (!Number.isFinite(windowMs) || windowMs <= 0 || next.length === 0) return next;
   const newest = next[next.length - 1].timestamp;
   const cutoff = newest - windowMs;
-  return next.filter(entry => entry.timestamp >= cutoff);
+  // Retain the entire equal-timestamp predecessor batch for interpolation.
+  const predecessor = next.filter(entry => entry.timestamp < cutoff).at(-1)?.timestamp;
+  return next.filter(entry => entry.timestamp >= cutoff || entry.timestamp === predecessor);
 }
 
 /**
  * Measures token arrivals, not the model's precise generation speed. The first
- * retained timestamp is a cumulative-count baseline: its entire batch is
- * excluded because its generation interval is unknown. All later batches are
- * counted over the same baseline-to-now interval (including recent silence).
- * No interpolation is made at the window's left edge: the first observation
- * at or after that edge becomes the baseline. Equal timestamps are merged.
+ * timestamp is a cumulative-count baseline (its unknown batch is excluded).
+ * Later batches are spread uniformly across the preceding arrival interval;
+ * a left-edge crossing takes only the overlapping fraction, not a whole-batch
+ * deletion. Silence extends the denominator, never the numerator. A full-window
+ * arrival gap starts a new warmup; we do not interpolate across inactive gaps.
+ * Equal timestamps merge. Final usage calibration does not improve arrival
+ * timing: estimatedTokens, where present, remain the numerator for LIVE/peaks.
  */
 export function measureRollingTokenRate(samples, now, windowMs = DEFAULT_ROLLING_WINDOW_MS) {
   const empty = {
@@ -107,22 +111,35 @@ export function measureRollingTokenRate(samples, now, windowMs = DEFAULT_ROLLING
   for (const sample of ordered) {
     if (sample.timestamp > referenceNow) break;
     latestObservationAt = sample.timestamp;
-    const tokens = nonNegativeNumber(sample.tokens);
+    const tokens = nonNegativeNumber(sample.estimatedTokens ?? sample.tokens);
     if (tokens > 0) latestTokenAt = sample.timestamp;
-    if (sample.timestamp < cutoff) continue;
     const previous = points.at(-1);
-    if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;else points.push({
-      timestamp: sample.timestamp,
-      tokens
-    });
+    if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;else {
+      if (previous && sample.timestamp - previous.timestamp > windowMs) points.length = 0;
+      points.push({
+        timestamp: sample.timestamp,
+        tokens
+      });
+    }
   }
-  const elapsedMs = points.length > 0 ? referenceNow - points[0].timestamp : 0;
-  const observedTokens = points.slice(1).reduce((sum, point) => sum + point.tokens, 0);
+  const baseline = points.length > 0 ? Math.max(cutoff, points[0].timestamp) : referenceNow;
+  const elapsedMs = referenceNow - baseline;
+  let observedTokens = 0;
+  let observationCount = points.filter(point => point.timestamp >= cutoff).length;
+  // The predecessor is a real timestamp supporting the interpolated boundary.
+  if (points.some(point => point.timestamp < cutoff) && (points.find(point => point.timestamp >= cutoff)?.timestamp ?? cutoff) > cutoff) observationCount += 1;
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const point = points[index];
+    if (point.timestamp <= baseline) continue;
+    const fraction = (point.timestamp - Math.max(baseline, previous.timestamp)) / (point.timestamp - previous.timestamp);
+    observedTokens += point.tokens * fraction;
+  }
   const measurement = {
     ...empty,
     elapsedMs,
     observedTokens,
-    observationCount: points.length
+    observationCount
   };
   const lastActivityAt = latestTokenAt ?? latestObservationAt;
   if (lastActivityAt !== undefined && referenceNow - lastActivityAt >= windowMs) {
@@ -131,7 +148,7 @@ export function measureRollingTokenRate(samples, now, windowMs = DEFAULT_ROLLING
       status: "inactive"
     };
   }
-  if (points.length < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) return measurement;
+  if (observationCount < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) return measurement;
   const rate = observedTokens / elapsedMs * 1000;
   if (!Number.isFinite(elapsedMs) || !Number.isFinite(rate)) return measurement;
   return {
@@ -159,22 +176,28 @@ export function calculateRateStats(values) {
   };
 }
 export function calculateSpeedStats(samples) {
-  if (samples.length < 2) return {
-    avg: 0,
-    max: 0,
-    min: 0
-  };
-  const ordered = [...samples].sort((left, right) => left.timestamp - right.timestamp);
+  const timestamps = [...new Set(samples.filter(sample => Number.isFinite(sample.timestamp)).map(sample => sample.timestamp))].sort((a, b) => a - b);
   const rates = [];
-  for (let index = 1; index < ordered.length; index += 1) {
-    const elapsed = ordered[index].timestamp - ordered[index - 1].timestamp;
-    if (elapsed <= 0) continue;
-    const tokens = nonNegativeNumber(ordered[index].tokens);
-    rates.push(tokens * 1000 / elapsed);
+  // Peaks/troughs are supported rolling windows ending at actual observations,
+  // not arbitrary adjacent-chunk rates or a response-average fallback.
+  for (const timestamp of timestamps) {
+    const measurement = measureRollingTokenRate(samples, timestamp);
+    if (measurement.status === "ready") rates.push(measurement.rate);
   }
-  return calculateRateStats(rates);
+  return {
+    ...calculateRateStats(rates),
+    available: rates.length > 0,
+    extremaAvailable: rates.length > 0,
+    estimated: true
+  };
 }
 export function timeToFirstToken(record) {
+  const {
+    firstResponse,
+    start,
+    completed
+  } = record.time;
+  if (typeof firstResponse === "number" && Number.isFinite(firstResponse) && Number.isFinite(start) && firstResponse >= start && (completed === undefined || firstResponse <= completed)) return firstResponse - start;
   if (typeof record.time.ttft !== "number" || !Number.isFinite(record.time.ttft)) {
     if (typeof record.time.firstToken !== "number" || !Number.isFinite(record.time.firstToken)) return undefined;
     if (!Number.isFinite(record.time.start)) return undefined;

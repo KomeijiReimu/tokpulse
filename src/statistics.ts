@@ -1,7 +1,13 @@
-import type { HistoryRecord, TokenCounts } from "./core.js";
+import type { HistoryRecord, ResponseTiming, TokenCounts } from "./core.js";
 
 export interface RateMeasurement { generatedTokens: number; durationMs: number; estimated: boolean }
-export interface GenerationEvidence { start: number; end: number; outputObserved: boolean; reasoningObserved: boolean }
+export type GenerationCoverage = "complete" | "unknown" | "gap";
+export interface GenerationEvidence {
+  start: number; end: number; outputObserved: boolean; reasoningObserved: boolean;
+  /** Boolean-only legacy evidence is category presence, not interval coverage. */
+  version?: 2;
+  coverage?: GenerationCoverage;
+}
 export interface SpeedContribution { generation?: RateMeasurement; response?: RateMeasurement; generationEvidence?: GenerationEvidence }
 export interface CompletionUpdate {
   source: "live";
@@ -19,7 +25,8 @@ export interface SpeedObservations {
   usageExact?: boolean;
   responseTimingExact?: boolean;
   /** Only a verified, complete model-generation interval, never a step end. */
-  generation?: { start: number; end: number; complete: boolean; estimated: boolean; outputObserved?: boolean; reasoningObserved?: boolean };
+  generation?: { start: number; end: number; complete: boolean; estimated: boolean; outputObserved?: boolean; reasoningObserved?: boolean; version?: 2; coverage?: GenerationCoverage };
+  generationCoverage?: { status: GenerationCoverage; reasons: string[] };
 }
 export interface AverageRateSummary {
   available: boolean;
@@ -40,22 +47,71 @@ export interface SessionAverageSummary {
 export function measureRecordSpeed(record: HistoryRecord, observations: SpeedObservations = {}): SpeedContribution {
   const generatedTokens = record.tokens.output + record.tokens.reasoning;
   const speed: SpeedContribution = {};
+  if (!valid(record.tokens.output) || !valid(record.tokens.reasoning) || !valid(generatedTokens)) return speed;
   const start = record.time.start;
   const end = record.time.completed;
-  if (valid(start) && valid(end) && end > start) {
-    speed.response = { generatedTokens, durationMs: end - start,
-      estimated: observations.usageExact !== true || observations.responseTimingExact !== true };
-  }
+  speed.response = deriveSafeResponseMeasurement(record, { rawTimingKnown: true, ...observations });
+  if (!speed.response) delete speed.response;
   const generation = observations.generation;
-  if (generation?.complete && valid(generation.start) && valid(generation.end) && generation.end > generation.start) {
+  if (generation?.complete && generation.version === 2 && generation.coverage === "complete"
+    && valid(generation.start) && valid(generation.end) && generation.end > generation.start
+    && valid(start) && valid(end) && generation.start >= start && generation.end <= end
+    && typeof generation.outputObserved === "boolean" && typeof generation.reasoningObserved === "boolean"
+    && (record.tokens.output === 0 || generation.outputObserved) && (record.tokens.reasoning === 0 || generation.reasoningObserved)) {
     speed.generation = { generatedTokens, durationMs: generation.end - generation.start,
       estimated: generation.estimated || observations.usageExact !== true };
     if (typeof generation.outputObserved === "boolean" && typeof generation.reasoningObserved === "boolean") {
       speed.generationEvidence = { start: generation.start, end: generation.end,
-        outputObserved: generation.outputObserved, reasoningObserved: generation.reasoningObserved };
+        outputObserved: generation.outputObserved, reasoningObserved: generation.reasoningObserved, version: 2, coverage: "complete" };
     }
   }
   return speed;
+}
+
+/** Only callers holding original start/completed facts may opt in. A normalized
+ * zero start is not provenance. Response throughput includes TTFT/tool wait. */
+export function deriveSafeResponseMeasurement(record: HistoryRecord,
+  provenance: { rawTimingKnown: boolean; usageExact?: boolean; responseTimingExact?: boolean }): RateMeasurement | undefined {
+  const { start, completed } = record.time;
+  const generatedTokens = record.tokens.output + record.tokens.reasoning;
+  if (provenance.rawTimingKnown !== true || !valid(start) || !valid(completed) || completed <= start
+    || !valid(record.tokens.output) || !valid(record.tokens.reasoning) || !valid(generatedTokens)) return undefined;
+  return { generatedTokens, durationMs: completed - start,
+    estimated: provenance.usageExact !== true || provenance.responseTimingExact !== true };
+}
+
+export interface SelectedSpeedMeasurement {
+  available: boolean;
+  rate?: number;
+  basis?: "generation" | "response";
+  estimated: boolean;
+  coverage: { generation: boolean; response: boolean; generatedTokens: number; durationMs: number };
+  measurement?: RateMeasurement;
+}
+
+/** LAST, history and details share this decision. Never fabricate generation
+ * from firstToken/completion, nor derive response from normalized old timing. */
+export function selectSpeedMeasurement(record: HistoryRecord): SelectedSpeedMeasurement {
+  const speed = coerceSpeedContribution(record.speed);
+  const generation = qualifiedGeneration(speed, record) ? speed?.generation : undefined;
+  const response = speed?.response;
+  const measurement = generation ?? response;
+  const rate = measurement ? measurement.generatedTokens * 1000 / measurement.durationMs : undefined;
+  const available = rate !== undefined && Number.isFinite(rate);
+  return { available, ...(available ? { rate, basis: generation ? "generation" as const : "response" as const, measurement } : {}),
+    estimated: measurement?.estimated ?? true,
+    coverage: { generation: !!generation, response: !!response, generatedTokens: available ? measurement!.generatedTokens : 0,
+      durationMs: available ? measurement!.durationMs : 0 } };
+}
+
+function qualifiedGeneration(speed: SpeedContribution | undefined, record?: HistoryRecord): boolean {
+  const evidence = speed?.generationEvidence;
+  if (!speed?.generation || !evidence || evidence.version !== 2 || evidence.coverage !== "complete"
+    || evidence.end - evidence.start !== speed.generation.durationMs) return false;
+  if (!record) return true;
+  return valid(record.time.start) && valid(record.time.completed) && evidence.start >= record.time.start && evidence.end <= record.time.completed
+    && (record.tokens.output === 0 || evidence.outputObserved) && (record.tokens.reasoning === 0 || evidence.reasoningObserved)
+    && speed.generation.generatedTokens === record.tokens.output + record.tokens.reasoning;
 }
 
 export function emptySpeedTotals(): SessionSpeedTotals {
@@ -76,7 +132,9 @@ export function coerceSpeedContribution(value: unknown): SpeedContribution | und
     && typeof evidence.outputObserved === "boolean" && typeof evidence.reasoningObserved === "boolean"
     && evidence.end - evidence.start === result.generation.durationMs) {
     result.generationEvidence = { start: evidence.start, end: evidence.end,
-      outputObserved: evidence.outputObserved, reasoningObserved: evidence.reasoningObserved };
+      outputObserved: evidence.outputObserved, reasoningObserved: evidence.reasoningObserved,
+      ...(evidence.version === 2 && ["complete", "unknown", "gap"].includes(evidence.coverage)
+        ? { version: 2 as const, coverage: evidence.coverage as GenerationCoverage } : {}) };
   }
   return result.generation || result.response ? result : undefined;
 }
@@ -88,8 +146,9 @@ export function mergeRecordSpeed(record: HistoryRecord, previous: { tokens: Toke
   generationStatus: "unobserved" | "invalidated" = "unobserved"): SpeedContribution {
   const next = coerceSpeedContribution(record.speed) ?? {};
   const prior = coerceSpeedContribution(previous?.speed);
+  if (!qualifiedGeneration(next, record)) { delete next.generation; delete next.generationEvidence; }
   if (generationStatus === "invalidated") { delete next.generation; delete next.generationEvidence; return next; }
-  if (next.generation || !prior?.generation) return next;
+  if (next.generation || !prior?.generation || !qualifiedGeneration(prior)) return next;
   const evidence = prior.generationEvidence;
   if (!evidence || record.time.completed === undefined || evidence.start < record.time.start || evidence.end > record.time.completed
     || (record.tokens.output > 0 && !evidence.outputObserved) || (record.tokens.reasoning > 0 && !evidence.reasoningObserved)) return next;
@@ -134,6 +193,9 @@ export function updateSpeedTotals(current: SessionSpeedTotals | undefined, contr
   for (const kind of ["generation", "response"] as const) {
     const m = speed[kind];
     if (!m) continue;
+    // Retain legacy measurements in coercion so reversible ledger corrections
+    // can subtract old contributions; never add them as newly covered calls.
+    if (kind === "generation" && sign === 1 && !qualifiedGeneration(speed)) continue;
     const a = result[kind];
     a.generatedTokens = Math.max(0, a.generatedTokens + sign * m.generatedTokens);
     a.durationMs = Math.max(0, a.durationMs + sign * m.durationMs);
@@ -170,10 +232,76 @@ export function earliestFirstOutput(start: number, completed: number, ...values:
   return candidates.length ? Math.min(...candidates) : undefined;
 }
 
+export interface FirstResponseSignal {
+  timestamp: number;
+  source: "thinking" | "content";
+  timeSource: "part-start" | "arrival";
+  estimated: boolean;
+}
+export interface FirstResponseContext {
+  messageID: string; sessionID?: string; role: string;
+  start: number; now: number; completed?: number; live: boolean;
+}
+
+/** Match Host ReasoningPart visibility, not session busy/provider activity.
+ * The caller must establish live ingress/current assistant ownership; history
+ * and reconnect snapshots set live=false. This helper never creates samples. */
+export function thinkingFirstResponseSignal(part: unknown, context: FirstResponseContext): FirstResponseSignal | undefined {
+  if (!object(part) || !context.live || context.role !== "assistant" || context.completed !== undefined
+    || part.type !== "reasoning" || part.messageID !== context.messageID
+    || (context.sessionID !== undefined && part.sessionID !== undefined && part.sessionID !== context.sessionID)
+    || (part.role !== undefined && part.role !== "assistant") || part.time?.end != null
+    || !valid(context.start) || !valid(context.now) || context.now < context.start) return undefined;
+  const visibleText = typeof part.text === "string" ? part.text.replaceAll("[REDACTED]", "").trim() : "";
+  if (!visibleText && !part.metadata) return undefined;
+  const start = part.time?.start;
+  if (valid(start) && start >= context.start && start <= context.now) {
+    return { timestamp: start, source: "thinking", timeSource: "part-start", estimated: false };
+  }
+  return { timestamp: context.now, source: "thinking", timeSource: "arrival", estimated: true };
+}
+
+/** Earliest valid signal wins with its provenance; duplicate replay cannot
+ * rewrite existing equal-time provenance. Neither alias nor samples change. */
+export function applyFirstResponseSignal(time: ResponseTiming, signal: FirstResponseSignal): ResponseTiming {
+  if (!valid(time.start) || !valid(signal.timestamp) || signal.timestamp < time.start
+    || (time.completed !== undefined && (!valid(time.completed) || signal.timestamp > time.completed))) return { ...time };
+  const prior = time.firstResponse;
+  const priorValid = valid(prior) && prior >= time.start && (time.completed === undefined || prior <= time.completed);
+  const content = earliestFirstOutput(time.start, time.completed ?? Infinity, time.firstContent, time.firstToken);
+  if (priorValid && prior <= signal.timestamp && (content === undefined || prior <= content)) return { ...time };
+  // Migrating an active legacy state must not replace an already earlier real
+  // content fact with a later Thinking signal just because firstResponse is new.
+  if (content !== undefined && content <= signal.timestamp && (!priorValid || content < prior)) {
+    return { ...time, firstResponse: content, firstResponseSource: "content", firstResponseTimeSource: "arrival", firstResponseEstimated: true };
+  }
+  return { ...time, firstResponse: signal.timestamp, firstResponseSource: signal.source,
+    firstResponseTimeSource: signal.timeSource, firstResponseEstimated: signal.estimated };
+}
+
+/** Actual model delta arrivals establish firstContent and its legacy alias.
+ * Thinking alone can never establish either. Arrival time is estimated. */
+export function recordContentArrival(time: ResponseTiming, timestamp: number): ResponseTiming {
+  if (!valid(time.start) || !valid(timestamp) || timestamp < time.start
+    || (time.completed !== undefined && (!valid(time.completed) || timestamp > time.completed))) return { ...time };
+  const firstContent = earliestFirstOutput(time.start, time.completed ?? timestamp, time.firstContent, time.firstToken, timestamp)!;
+  return applyFirstResponseSignal({ ...time, firstContent, firstToken: firstContent },
+    { timestamp: firstContent, source: "content", timeSource: "arrival", estimated: true });
+}
+
 function valid(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
 function object(value: unknown): value is Record<string, any> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 
-export interface ContentProgress { parts: Map<string, { type: string; deltaBytes: number; snapshotBytes: number; end?: number }>; eventIDs: Set<string>; stepEnds?: Set<number> }
+export interface ContentPartProgress {
+  type: string; deltaBytes: number; snapshotBytes: number; end?: number; start?: number;
+  /** Comparable final text snapshot, not an absent text property normalized to ''. */
+  finalSnapshotBytes?: number;
+  knownGap?: boolean;
+}
+export interface ContentProgress {
+  parts: Map<string, ContentPartProgress>; eventIDs: Set<string>; stepEnds?: Set<number>;
+  unknownCoverage?: boolean;
+}
 export interface ContentMetadataCache {
   progress: Map<string, ContentProgress>;
   roles: Map<string, string>;
@@ -201,9 +329,17 @@ export function mergeContentProgress(target: ContentProgress | undefined, source
   if (!source || target === source) return target;
   for (const [id, incoming] of source.parts) {
     const previous = target.parts.get(id);
-    target.parts.set(id, previous ? { type: previous.type, deltaBytes: previous.deltaBytes + incoming.deltaBytes,
-      snapshotBytes: Math.max(previous.snapshotBytes, incoming.snapshotBytes), end: previous.end ?? incoming.end } : { ...incoming });
+    if (previous === incoming) continue;
+    // Independent streams cannot prove byte identity/deduplication merely by
+    // adding lengths. Preserve the uncertainty instead of inventing coverage.
+    if (previous && previous.deltaBytes > 0 && incoming.deltaBytes > 0) target.unknownCoverage = true;
+    const merged = previous ? { ...previous, deltaBytes: previous.deltaBytes + incoming.deltaBytes,
+      snapshotBytes: Math.max(previous.snapshotBytes, incoming.snapshotBytes), end: previous.end ?? incoming.end,
+      start: previous.start ?? incoming.start, finalSnapshotBytes: incoming.finalSnapshotBytes ?? previous.finalSnapshotBytes,
+      knownGap: previous.knownGap || incoming.knownGap } : { ...incoming };
+    target.parts.set(id, merged);
   }
+  target.unknownCoverage ||= source.unknownCoverage;
   for (const id of source.eventIDs) target.eventIDs.add(id);
   if (source.stepEnds) {
     target.stepEnds ??= new Set();
@@ -217,11 +353,18 @@ export function notePartSnapshot(progress: ContentProgress, properties: Record<s
   if (!object(part) || typeof part.id !== "string" || typeof part.type !== "string") return;
   const callKey = typeof part.callID === "string" ? `call:${part.callID}` : undefined;
   const previous = progress.parts.get(part.id) ?? (callKey ? progress.parts.get(callKey) : undefined);
-  const content = typeof part.text === "string" ? part.text : "";
-  const entry = { type: part.type, deltaBytes: previous?.deltaBytes ?? 0,
-    snapshotBytes: Math.max(previous?.snapshotBytes ?? 0, new TextEncoder().encode(content).length),
+  const snapshotBytes = typeof part.text === "string" ? new TextEncoder().encode(part.text).length : undefined;
+  const entry: ContentPartProgress = { ...previous, type: part.type, deltaBytes: previous?.deltaBytes ?? 0,
+    snapshotBytes: Math.max(previous?.snapshotBytes ?? 0, snapshotBytes ?? 0),
+    start: valid(part.time?.start) ? part.time.start : previous?.start,
     end: part.type === "text" || part.type === "reasoning" ? (valid(part.time?.end) ? part.time.end : previous?.end)
       : part.type === "tool" && part.state?.status === "running" && valid(part.state?.time?.start) ? part.state.time.start : previous?.end };
+  // Comparing UTF-8 text snapshots to UTF-8 text deltas is meaningful; token
+  // calibration and tool JSON snapshots are not byte-coverage evidence.
+  if ((part.type === "text" || part.type === "reasoning") && snapshotBytes !== undefined) {
+    if (snapshotBytes > entry.deltaBytes) entry.knownGap = true;
+    if (valid(part.time?.end)) entry.finalSnapshotBytes = snapshotBytes;
+  }
   progress.parts.set(part.id, entry);
   if (callKey) progress.parts.set(callKey, entry);
 }
@@ -249,7 +392,7 @@ export function parseModelDelta(progress: ContentProgress, properties: Record<st
     const entry = part ?? { type: typeof type === "string" ? type : "text", deltaBytes: 0, snapshotBytes: 0 };
     entry.deltaBytes += new TextEncoder().encode(delta).length;
     progress.parts.set(partID, entry);
-  }
+  } else progress.unknownCoverage = true;
   return { kind: type === "reasoning" || properties.field === "reasoning" ? "reasoning" : "output", ...(typeof partID === "string" ? { partID } : {}) };
 }
 /** Compatibility wrapper; new consumers must use parseModelDelta's kind. */
@@ -257,28 +400,45 @@ export function acceptModelDelta(progress: ContentProgress, properties: Record<s
   return parseModelDelta(progress, properties, event, stream, delta) !== undefined;
 }
 
-/** Host 1.18.34: content end / tool-running start precede tool wait;
- * step-finish and tool-completed end do not. Arrival first-output is estimated. */
+/** Version 2 coverage: a comparable final UTF-8 snapshot must equal captured
+ * delta bytes for EVERY content part, with no previously known gap, original
+ * start/end boundaries, known reasoning usage and no uncertain tool/multistep
+ * span. Equal byte lengths are necessary, not proof of token identity or model
+ * internal timing: generation remains estimated. Usage calibration cannot
+ * satisfy any of these checks. Tool-running start excludes subsequent wait;
+ * step-finish/tool-completed end are never generation end boundaries. */
 export function contentSpeedObservations(record: HistoryRecord, progress: ContentProgress | undefined, firstOutput: number | undefined, usageExact: boolean, responseTimingExact: boolean, reasoningUsageKnown = true): SpeedObservations {
   const observations: SpeedObservations = { usageExact, responseTimingExact };
-  if (!progress || firstOutput === undefined || !valid(firstOutput)) return observations;
-  if (!reasoningUsageKnown) return observations;
-  if ((progress.stepEnds?.size ?? 0) > 1) return observations;
+  const reject = (reason: string, status: GenerationCoverage = "unknown"): SpeedObservations => {
+    observations.generationCoverage = { status, reasons: [reason] };
+    return observations;
+  };
+  if (!progress || firstOutput === undefined || !valid(firstOutput)) return reject("missing-content-observation");
+  if (!reasoningUsageKnown) return reject("unknown-reasoning-usage");
+  if (progress.unknownCoverage) return reject("unattributed-or-merged-deltas");
+  if ((progress.stepEnds?.size ?? 0) > 1) return reject("multiple-steps");
   const parts = [...new Set(progress.parts.values())];
   const modelParts = parts.filter((p) => ["text", "reasoning", "tool"].includes(p.type));
-  const ended = modelParts.filter((p) => p.end !== undefined);
-  // All known model parts must have an end boundary. Hidden reasoning must be observed.
-  if (!modelParts.length || ended.length !== modelParts.length) return observations;
-  if (record.tokens.reasoning > 0 && !parts.some((p) => p.type === "reasoning" && p.deltaBytes > 0)) return observations;
-  if (record.tokens.output > 0 && !parts.some((p) => (p.type === "text" || p.type === "tool") && p.deltaBytes > 0)) return observations;
+  const contentParts = modelParts.filter((p) => p.type !== "tool");
+  const ended = modelParts.filter((p) => valid(p.end));
+  if (contentParts.some((p) => p.knownGap || (p.finalSnapshotBytes !== undefined && p.finalSnapshotBytes !== p.deltaBytes))) return reject("snapshot-delta-gap", "gap");
+  if (!modelParts.length || ended.length !== modelParts.length) return reject("missing-end-boundary");
+  if (contentParts.some((p) => !valid(p.start) || !valid(p.end) || p.start < record.time.start || p.start > p.end)) return reject("missing-or-invalid-start-boundary");
+  if (contentParts.some((p) => p.finalSnapshotBytes === undefined)) return reject("missing-comparable-final-snapshot");
+  if (record.tokens.reasoning > 0 && !contentParts.some((p) => p.type === "reasoning" && p.deltaBytes > 0)) return reject("hidden-reasoning");
+  if (record.tokens.output > 0 && !contentParts.some((p) => p.type === "text" && p.deltaBytes > 0)) return reject("unobserved-output");
+  if (modelParts.some((p) => p.type === "tool" && p.deltaBytes > 0)) return reject("tool-input-coverage-uncertain");
   const end = Math.max(...ended.map((p) => p.end!));
   const toolStart = parts.filter((p) => p.type === "tool" && p.end !== undefined).map((p) => p.end!);
   // A later content end following tool-running evidence could be another round
   // on the same message. The gap cannot be presented as model generation.
-  if (toolStart.length && parts.some((p) => (p.type === "text" || p.type === "reasoning") && (p.end ?? 0) > Math.min(...toolStart))) return observations;
-  if (firstOutput < record.time.start || end > (record.time.completed ?? end) || end <= firstOutput) return observations;
-  observations.generation = { start: firstOutput, end, complete: true, estimated: true,
-    outputObserved: parts.some((p) => (p.type === "text" || p.type === "tool") && p.deltaBytes > 0),
-    reasoningObserved: parts.some((p) => p.type === "reasoning" && p.deltaBytes > 0) };
+  if (toolStart.length && contentParts.some((p) => (p.end ?? 0) > Math.min(...toolStart))) return reject("content-after-tool-start");
+  const start = Math.min(firstOutput, ...contentParts.map((p) => p.start!));
+  if (!contentParts.length || !valid(record.time.completed) || firstOutput < record.time.start || firstOutput > end
+    || end > record.time.completed || end <= start) return reject("invalid-response-interval");
+  observations.generationCoverage = { status: "complete", reasons: [] };
+  observations.generation = { start, end, complete: true, estimated: true, version: 2, coverage: "complete",
+    outputObserved: contentParts.some((p) => p.type === "text" && p.deltaBytes > 0),
+    reasoningObserved: contentParts.some((p) => p.type === "reasoning" && p.deltaBytes > 0) };
   return observations;
 }

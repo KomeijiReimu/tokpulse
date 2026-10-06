@@ -1,7 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { addTokenCounts, emptyTokenCounts, normalizeTokenCounts } from "./core.js";
-import { coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { hasOriginalResponseTiming } from "./storage.js";
+import { deriveSafeResponseMeasurement } from "./statistics.js";
 export const TOTALS_VERSION = 1;
 export const DEFAULT_TOTALS_FILENAME = "totals.json";
 const TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"];
@@ -46,6 +48,11 @@ export function createTotalsStorage(pathOrOptions) {
       return persistLedger(path, ledger);
     }),
     seed: records => enqueuePath(path, () => seedLedger(path, records)),
+    backfillSpeed: records => enqueuePath(path, async () => {
+      const ledger = await loadLedger(path);
+      reconcileLegacySpeed(ledger, records);
+      return persistLedger(path, ledger);
+    }),
     read: () => enqueuePath(path, () => loadLedger(path)),
     quarantine: () => enqueuePath(path, () => quarantineFile(path))
   };
@@ -129,6 +136,12 @@ function applyOpenRecord(ledger, record) {
   const messageID = requireMessageID(record);
   const contribution = contributionFromRecord(record);
   const previous = ledger.open[messageID];
+  const prior = ledger.settled[messageID] ?? previous;
+  if (prior && prior !== true) {
+    if (contribution.update) {
+      if (prior.update && !isNewerCompletionUpdate(contribution.update, prior.update)) return;
+    } else if (prior.update || prior.speedBackfill) return;
+  }
   if (previous?.quality === "exact" && contribution.quality === "provisional") {
     return;
   }
@@ -152,6 +165,62 @@ function applyOpenRecord(ledger, record) {
     ledger.open[messageID] = contribution;
   }
 }
+
+/** Never rebuild usage from history: only replace reversible speed snapshots. */
+function reconcileLegacySpeed(ledger, records) {
+  const history = new Map(records.map(record => [record.messageID, record]));
+  for (const [messageID, previous] of Object.entries({
+    ...ledger.settled,
+    ...ledger.open
+  })) {
+    if (previous === true) continue;
+    const record = history.get(messageID);
+    const evidence = previous.speed?.generationEvidence;
+    // Pruned contributions still have enough evidence to reject the old boolean-only contract.
+    const timing = record && (!previous.update || JSON.stringify(previous.update) === JSON.stringify(record.update)) ? record.time : {
+      start: evidence?.start ?? 0,
+      completed: evidence?.end ?? 0
+    };
+    const probe = {
+      version: 1,
+      messageID,
+      sessionID: previous.sessionID,
+      tokens: previous.tokens,
+      cost: previous.cost,
+      quality: previous.quality,
+      time: timing,
+      samples: [],
+      speed: previous.speed?.response ? {
+        response: previous.speed.response
+      } : {}
+    };
+    const speed = mergeRecordSpeed(probe, previous);
+    const sameUsage = record && record.sessionID === previous.sessionID && record.cost === previous.cost && TOKEN_FIELDS.every(field => record.tokens[field] === previous.tokens[field]);
+    const sameAuthority = !previous.update || JSON.stringify(previous.update) === JSON.stringify(record?.update);
+    if (!speed.response && record && sameUsage && sameAuthority && hasOriginalResponseTiming(record)) {
+      speed.response = deriveSafeResponseMeasurement({
+        ...record,
+        tokens: previous.tokens
+      }, {
+        rawTimingKnown: true,
+        usageExact: previous.quality === "exact"
+      });
+    }
+    if (sameSpeedContribution(previous.speed, speed)) continue;
+    const session = ensureSession(ledger, previous.sessionID);
+    session.speed = updateSpeedTotals(updateSpeedTotals(session.speed, previous.speed, -1), speed, 1);
+    const next = {
+      ...previous,
+      speedBackfill: {
+        version: 1,
+        source: "server"
+      }
+    };
+    const normalizedSpeed = coerceSpeedContribution(speed);
+    if (normalizedSpeed) next.speed = normalizedSpeed;else delete next.speed;
+    if (ledger.open[messageID]) ledger.open[messageID] = next;else ledger.settled[messageID] = next;
+  }
+}
 function replaceContribution(ledger, previous, contribution) {
   if (previous.sessionID !== contribution.sessionID) {
     const previousSession = ledger.sessions[previous.sessionID];
@@ -170,13 +239,16 @@ function contributionFromRecord(record) {
     throw new TypeError("Invalid totals record");
   }
   const quality = record.quality === "provisional" ? "provisional" : "exact";
+  // Coercion deliberately retains old measurements for reversible subtraction.
+  // Newly applied records, unlike loaded ledger snapshots, must meet the new contract.
+  const speed = coerceSpeedContribution(mergeRecordSpeed(record, undefined));
   return {
     sessionID: record.sessionID,
     quality,
     tokens: normalizeTokenCounts(record.tokens),
     cost: nonNegativeCost(record.cost),
-    ...(coerceSpeedContribution(record.speed) ? {
-      speed: coerceSpeedContribution(record.speed)
+    ...(speed ? {
+      speed
     } : {}),
     ...(coerceCompletionUpdate(record.update) ? {
       update: coerceCompletionUpdate(record.update)
@@ -309,6 +381,12 @@ function cloneContribution(contribution) {
     } : {}),
     ...(contribution.update ? {
       update: coerceCompletionUpdate(contribution.update)
+    } : {}),
+    ...(contribution.speedBackfill ? {
+      speedBackfill: {
+        version: 1,
+        source: "server"
+      }
     } : {})
   };
 }
@@ -385,6 +463,12 @@ function coerceContribution(value) {
     } : {}),
     ...(value.update !== undefined ? {
       update: requireCompletionUpdate(value.update)
+    } : {}),
+    ...(value.speedBackfill?.version === 1 && value.speedBackfill?.source === "server" ? {
+      speedBackfill: {
+        version: 1,
+        source: "server"
+      }
     } : {})
   };
 }

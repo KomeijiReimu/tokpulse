@@ -10,6 +10,7 @@ import {
   calibrateResponseSamples,
   emptyTokenCounts,
   normalizeTokenCounts,
+  timeToFirstToken,
   utf8ByteLength,
 } from "./core.js";
 import {
@@ -23,7 +24,8 @@ import {
 } from "./activity.js";
 import { ActivityLedger, createActivityLedger } from "./runs-storage.js";
 import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, parseModelDelta } from './statistics.js';
-import { createHistoryStorage, HistoryStorage } from "./storage.js";
+import { createHistoryStorage, HistoryStorage, readHistoryFile } from "./storage.js";
+import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage } from "./totals-storage.js";
 
 export interface ServerOptions {
@@ -44,6 +46,8 @@ interface ActiveState {
   sessionID: string;
   startedAt: number;
   firstTokenAt?: number;
+  timing?: HistoryRecord["time"];
+  liveAssistant?: boolean;
   progress?: ContentProgress;
   model?: string;
   cost?: number;
@@ -80,9 +84,22 @@ function runtimeContentMetadata(active: Map<string, ActiveState>): ContentMetada
   if (!metadata) { metadata = createContentMetadataCache(); contentMetadataByRuntime.set(active, metadata); }
   return metadata;
 }
-/** Snapshot-only entry point: cache type/end facts without creating activity. */
-export function recordPartMetadata(active: Map<string, ActiveState>, properties: AnyRecord): void {
-  cachePartSnapshot(runtimeContentMetadata(active), properties);
+function isSnapshotIngress(event: AnyRecord, properties: AnyRecord): boolean {
+  return event.replay === true || properties.replay === true
+    || [event.source, properties.source].some((source) => ["snapshot", "history", "reconnect"].includes(source));
+}
+/** Two-argument snapshots only cache metadata. Live ingress may attach a signal
+ * to an already-owned current assistant, but never creates activity/samples. */
+export function recordPartMetadata(active: Map<string, ActiveState>, properties: AnyRecord, now?: number, event: AnyRecord = {}): void {
+  const metadata = runtimeContentMetadata(active);
+  cachePartSnapshot(metadata, properties);
+  const part = asRecord(properties.part);
+  if (!part || now === undefined || isSnapshotIngress(event, properties)) return;
+  const state = active.get(part.messageID);
+  if (!state?.liveAssistant || metadata.completed.has(part.messageID)) return;
+  const signal = thinkingFirstResponseSignal(part, { messageID: state.messageID, sessionID: state.sessionID,
+    role: metadata.roles.get(state.messageID) ?? "unknown", start: state.startedAt, now, live: true });
+  if (signal) state.timing = applyFirstResponseSignal(state.timing ?? { start: state.startedAt }, signal);
 }
 
 export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginOptions) => {
@@ -108,7 +125,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
     initializeActivityRuntime(activity).catch((error: unknown) => {
       warn("activity ledger initialization failed", error);
     }),
-    initializeTotals(storage, totals).catch((error: unknown) => {
+    initializeTotals(storage, totals, historyPath).catch((error: unknown) => {
       warn("totals ledger initialization failed", error);
     }),
   ]).then(() => undefined);
@@ -174,23 +191,26 @@ function initializeActivityRuntime(runtime: ActivityRuntime): Promise<void> {
   return result;
 }
 
-async function initializeTotals(storage: HistoryStorage, totals: TotalsStorage): Promise<void> {
+async function initializeTotals(storage: HistoryStorage, totals: TotalsStorage, historyPath: string): Promise<void> {
   const retained = await storage.read();
+  const recoverable = await readHistoryFile(historyPath);
   try {
-    await seedRetainedTotals(totals, retained);
+    await seedRetainedTotals(totals, retained, recoverable);
   } catch (error) {
     if (!isCorruptTotalsError(error)) throw error;
     warn("totals ledger is corrupt", error);
     await totals.quarantine();
-    await seedRetainedTotals(totals, retained);
+    await seedRetainedTotals(totals, retained, recoverable);
   }
 }
 
 async function seedRetainedTotals(
   totals: TotalsStorage,
   retained: readonly HistoryRecord[],
+  recoverable: readonly HistoryRecord[] = retained,
 ): Promise<void> {
-  await totals.seed(retained);
+  await totals.seed(recoverable);
+  await totals.backfillSpeed(recoverable);
   await totals.applyMany(retained, {
     retainedMessageIDs: retained.map((record) => record.messageID),
   });
@@ -838,7 +858,7 @@ async function handleEvent(
     }
 
     if (type === "message.part.updated") {
-      recordPartMetadata(active, properties);
+      recordPartMetadata(active, properties, timestamp, event);
       return;
     }
     if (type === "message.part.delta") {
@@ -926,6 +946,7 @@ function recordDelta(
   const kind = parsed.kind;
   if (timestamp < state.startedAt) state.startedAt = timestamp;
   state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
+  state.timing = recordContentArrival({ ...state.timing, start: state.startedAt }, timestamp);
   const bytes = utf8ByteLength(delta);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample: SpeedSample = {
@@ -985,8 +1006,28 @@ async function handleMessageUpdated(
   const metadata = runtimeContentMetadata(active);
   if (typeof info.role === "string") metadata.roles.set(messageID, info.role);
   if (info.role !== "assistant") { active.delete(messageID); return; }
-  if (!isCompleted(info, properties, event)) return;
-  if (event.replay === true || properties.replay === true || event.source === "snapshot") return;
+  if (!isCompleted(info, properties, event)) {
+    // Only a newly created live assistant may receive metadata-only Thinking.
+    // Old unfinished snapshots are not evidence of a new response in this runtime.
+    if (metadata.completed.has(messageID) || isSnapshotIngress(event, properties)) return;
+    const created = numberOrUndefined(info.time?.created ?? info.time?.start);
+    if (created === undefined || created < timestamp - 1000 || created > timestamp) return;
+    if (active.get(messageID)?.liveAssistant === false) return;
+    for (const candidate of active.values()) {
+      if (candidate.sessionID !== sessionID || candidate.messageID === messageID || !candidate.liveAssistant) continue;
+      if (candidate.startedAt > created) return;
+      candidate.liveAssistant = false;
+    }
+    const state = getOrCreateState(active, messageID, sessionID, created);
+    if (state.sessionID !== sessionID) return;
+    state.startedAt = Math.min(state.startedAt, created);
+    state.timing = { ...state.timing, start: state.startedAt };
+    state.liveAssistant = true;
+    state.progress = mergeContentProgress(state.progress, cachedContentProgress(metadata, messageID));
+    active.set(messageID, state);
+    return;
+  }
+  if (isSnapshotIngress(event, properties)) return;
   const previous = (await storage.read()).find((record) => record.messageID === messageID);
   const ledger = await totals.read().catch(() => undefined);
   const snapshot = ledger?.open[messageID] ?? ledger?.settled[messageID];
@@ -1067,12 +1108,17 @@ async function handleMessageUpdated(
     quality,
   });
   if (previous) {
-    const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstToken, record.time.firstToken);
+    const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstContent, previous.time.firstToken, record.time.firstToken);
     if (firstToken !== undefined) {
-      record.time.firstToken = firstToken;
-      record.time.ttft = firstToken - record.time.start;
+      record.time = recordContentArrival(record.time, firstToken);
+    }
+    if (previous.time.firstResponse !== undefined && previous.time.firstResponseSource && previous.time.firstResponseTimeSource) {
+      record.time = applyFirstResponseSignal(record.time, { timestamp: previous.time.firstResponse,
+        source: previous.time.firstResponseSource, timeSource: previous.time.firstResponseTimeSource,
+        estimated: previous.time.firstResponseEstimated ?? true });
     }
   }
+  record.time.ttft = timeToFirstToken(record);
   record.speed = mergeRecordSpeed(record, prior, state && chooseSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
   (record as MeasuredHistoryRecord).update = update;
   if (await safeUpsert(storage, totals, record)) { completedMessageIDs.add(messageID); metadata.completed.add(messageID); }
@@ -1188,6 +1234,14 @@ function makeHistoryRecord(input: {
     samples: input.samples,
     quality: input.quality,
   };
+  if (firstToken !== undefined) record.time = recordContentArrival(record.time, firstToken);
+  const timing = input.state?.timing;
+  if (timing?.firstResponse !== undefined && timing.firstResponseSource && timing.firstResponseTimeSource) {
+    record.time = applyFirstResponseSignal(record.time, { timestamp: timing.firstResponse,
+      source: timing.firstResponseSource, timeSource: timing.firstResponseTimeSource,
+      estimated: timing.firstResponseEstimated ?? true });
+  }
+  record.time.ttft = timeToFirstToken(record);
   record.speed = measureRecordSpeed(record, contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt,
     input.quality === "exact", numberOrUndefined(infoTime.start ?? infoTime.created) !== undefined && numberOrUndefined(infoTime.end ?? infoTime.completed) !== undefined,
     tokenFields(input.info?.tokens).reasoning !== undefined));
@@ -1264,6 +1318,13 @@ function getOrCreateState(
 function mergeStates(target: ActiveState, source: ActiveState): void {
   target.progress = mergeContentProgress(target.progress, source.progress);
   target.startedAt = Math.min(target.startedAt, source.startedAt);
+  target.liveAssistant ||= source.liveAssistant;
+  if (source.timing?.firstContent !== undefined) target.timing = recordContentArrival({ ...target.timing, start: target.startedAt }, source.timing.firstContent);
+  if (source.timing?.firstResponse !== undefined && source.timing.firstResponseSource && source.timing.firstResponseTimeSource) {
+    target.timing = applyFirstResponseSignal({ ...target.timing, start: target.startedAt }, { timestamp: source.timing.firstResponse,
+      source: source.timing.firstResponseSource, timeSource: source.timing.firstResponseTimeSource,
+      estimated: source.timing.firstResponseEstimated ?? true });
+  }
   if (target.firstTokenAt === undefined || (source.firstTokenAt !== undefined && source.firstTokenAt < target.firstTokenAt)) {
     target.firstTokenAt = source.firstTokenAt;
   }

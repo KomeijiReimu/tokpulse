@@ -36,7 +36,13 @@ export interface RollingRateMeasurement {
 
 export interface ResponseTiming {
   start: number;
+  /** Compatibility alias for firstContent, never a Thinking-only signal. */
   firstToken?: number;
+  firstResponse?: number;
+  firstContent?: number;
+  firstResponseSource?: "thinking" | "content";
+  firstResponseTimeSource?: "part-start" | "arrival";
+  firstResponseEstimated?: boolean;
   completed?: number;
   ttft?: number;
   duration?: number;
@@ -60,6 +66,10 @@ export interface RateStats {
   avg: number;
   max: number;
   min: number;
+  available?: boolean;
+  extremaAvailable?: boolean;
+  /** Arrival windows are estimates even after final usage calibration. */
+  estimated?: boolean;
 }
 
 export interface ActiveResponse {
@@ -68,6 +78,11 @@ export interface ActiveResponse {
   model?: string;
   startedAt: number;
   firstTokenAt?: number;
+  firstResponseAt?: number;
+  firstContentAt?: number;
+  firstResponseSource?: "thinking" | "content";
+  firstResponseTimeSource?: "part-start" | "arrival";
+  firstResponseEstimated?: boolean;
   estimatedOutputTokens: number;
   estimatedReasoningTokens: number;
   samples: SpeedSample[];
@@ -234,16 +249,20 @@ export function appendSpeedSample(
   if (!Number.isFinite(windowMs) || windowMs <= 0 || next.length === 0) return next;
   const newest = next[next.length - 1].timestamp;
   const cutoff = newest - windowMs;
-  return next.filter((entry) => entry.timestamp >= cutoff);
+  // Retain the entire equal-timestamp predecessor batch for interpolation.
+  const predecessor = next.filter((entry) => entry.timestamp < cutoff).at(-1)?.timestamp;
+  return next.filter((entry) => entry.timestamp >= cutoff || entry.timestamp === predecessor);
 }
 
 /**
  * Measures token arrivals, not the model's precise generation speed. The first
- * retained timestamp is a cumulative-count baseline: its entire batch is
- * excluded because its generation interval is unknown. All later batches are
- * counted over the same baseline-to-now interval (including recent silence).
- * No interpolation is made at the window's left edge: the first observation
- * at or after that edge becomes the baseline. Equal timestamps are merged.
+ * timestamp is a cumulative-count baseline (its unknown batch is excluded).
+ * Later batches are spread uniformly across the preceding arrival interval;
+ * a left-edge crossing takes only the overlapping fraction, not a whole-batch
+ * deletion. Silence extends the denominator, never the numerator. A full-window
+ * arrival gap starts a new warmup; we do not interpolate across inactive gaps.
+ * Equal timestamps merge. Final usage calibration does not improve arrival
+ * timing: estimatedTokens, where present, remain the numerator for LIVE/peaks.
  */
 export function measureRollingTokenRate(
   samples: readonly SpeedSample[],
@@ -265,21 +284,34 @@ export function measureRollingTokenRate(
   for (const sample of ordered) {
     if (sample.timestamp > referenceNow) break;
     latestObservationAt = sample.timestamp;
-    const tokens = nonNegativeNumber(sample.tokens);
+    const tokens = nonNegativeNumber(sample.estimatedTokens ?? sample.tokens);
     if (tokens > 0) latestTokenAt = sample.timestamp;
-    if (sample.timestamp < cutoff) continue;
     const previous = points.at(-1);
     if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;
-    else points.push({ timestamp: sample.timestamp, tokens });
+    else {
+      if (previous && sample.timestamp - previous.timestamp > windowMs) points.length = 0;
+      points.push({ timestamp: sample.timestamp, tokens });
+    }
   }
-  const elapsedMs = points.length > 0 ? referenceNow - points[0].timestamp : 0;
-  const observedTokens = points.slice(1).reduce((sum, point) => sum + point.tokens, 0);
-  const measurement = { ...empty, elapsedMs, observedTokens, observationCount: points.length };
+  const baseline = points.length > 0 ? Math.max(cutoff, points[0].timestamp) : referenceNow;
+  const elapsedMs = referenceNow - baseline;
+  let observedTokens = 0;
+  let observationCount = points.filter((point) => point.timestamp >= cutoff).length;
+  // The predecessor is a real timestamp supporting the interpolated boundary.
+  if (points.some((point) => point.timestamp < cutoff) && (points.find((point) => point.timestamp >= cutoff)?.timestamp ?? cutoff) > cutoff) observationCount += 1;
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const point = points[index];
+    if (point.timestamp <= baseline) continue;
+    const fraction = (point.timestamp - Math.max(baseline, previous.timestamp)) / (point.timestamp - previous.timestamp);
+    observedTokens += point.tokens * fraction;
+  }
+  const measurement = { ...empty, elapsedMs, observedTokens, observationCount };
   const lastActivityAt = latestTokenAt ?? latestObservationAt;
   if (lastActivityAt !== undefined && referenceNow - lastActivityAt >= windowMs) {
     return { ...measurement, status: "inactive" };
   }
-  if (points.length < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) return measurement;
+  if (observationCount < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) return measurement;
   const rate = (observedTokens / elapsedMs) * 1000;
   if (!Number.isFinite(elapsedMs) || !Number.isFinite(rate)) return measurement;
   return { ...measurement, status: "ready", rate };
@@ -307,19 +339,22 @@ export function calculateRateStats(values: readonly number[]): RateStats {
 }
 
 export function calculateSpeedStats(samples: readonly SpeedSample[]): RateStats {
-  if (samples.length < 2) return { avg: 0, max: 0, min: 0 };
-  const ordered = [...samples].sort((left, right) => left.timestamp - right.timestamp);
+  const timestamps = [...new Set(samples.filter((sample) => Number.isFinite(sample.timestamp)).map((sample) => sample.timestamp))].sort((a, b) => a - b);
   const rates: number[] = [];
-  for (let index = 1; index < ordered.length; index += 1) {
-    const elapsed = ordered[index].timestamp - ordered[index - 1].timestamp;
-    if (elapsed <= 0) continue;
-    const tokens = nonNegativeNumber(ordered[index].tokens);
-    rates.push((tokens * 1000) / elapsed);
+  // Peaks/troughs are supported rolling windows ending at actual observations,
+  // not arbitrary adjacent-chunk rates or a response-average fallback.
+  for (const timestamp of timestamps) {
+    const measurement = measureRollingTokenRate(samples, timestamp);
+    if (measurement.status === "ready") rates.push(measurement.rate);
   }
-  return calculateRateStats(rates);
+  return { ...calculateRateStats(rates), available: rates.length > 0,
+    extremaAvailable: rates.length > 0, estimated: true };
 }
 
 export function timeToFirstToken(record: Pick<HistoryRecord, "time">): number | undefined {
+  const { firstResponse, start, completed } = record.time;
+  if (typeof firstResponse === "number" && Number.isFinite(firstResponse) && Number.isFinite(start)
+    && firstResponse >= start && (completed === undefined || firstResponse <= completed)) return firstResponse - start;
   if (typeof record.time.ttft !== "number" || !Number.isFinite(record.time.ttft)) {
     if (typeof record.time.firstToken !== "number" || !Number.isFinite(record.time.firstToken)) return undefined;
     if (!Number.isFinite(record.time.start)) return undefined;

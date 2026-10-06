@@ -3,6 +3,13 @@ import { dirname, basename, join } from "node:path";
 import { HISTORY_VERSION } from "./core.js";
 import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate } from './statistics.js';
 export const DEFAULT_MAX_RECORDS = 1000;
+
+/** Persist this marker: normalization's zero is not an original timing fact. */
+
+export function hasOriginalResponseTiming(record) {
+  const time = record.time;
+  return time.startMissing !== true && Number.isFinite(time.start) && time.start >= 0 && typeof time.completed === "number" && Number.isFinite(time.completed) && time.completed > time.start;
+}
 export function createHistoryStorage(pathOrOptions, options = {}) {
   const settings = typeof pathOrOptions === "string" ? {
     path: pathOrOptions,
@@ -270,6 +277,24 @@ function normalizeTime(value) {
   const source = isRecord(value) ? value : {};
   return {
     start: finiteNumber(source.start, 0),
+    ...(source.startMissing === true || finiteNumberOrUndefined(source.start) === undefined ? {
+      startMissing: true
+    } : {}),
+    ...(finiteNumberOrUndefined(source.firstResponse) !== undefined ? {
+      firstResponse: source.firstResponse
+    } : {}),
+    ...(finiteNumberOrUndefined(source.firstContent) !== undefined ? {
+      firstContent: source.firstContent
+    } : {}),
+    ...(["thinking", "content"].includes(source.firstResponseSource) ? {
+      firstResponseSource: source.firstResponseSource
+    } : {}),
+    ...(["part-start", "arrival"].includes(source.firstResponseTimeSource) ? {
+      firstResponseTimeSource: source.firstResponseTimeSource
+    } : {}),
+    ...(typeof source.firstResponseEstimated === "boolean" ? {
+      firstResponseEstimated: source.firstResponseEstimated
+    } : {}),
     ...(finiteNumberOrUndefined(source.firstToken) !== undefined ? {
       firstToken: finiteNumberOrUndefined(source.firstToken)
     } : {}),

@@ -24,6 +24,9 @@ import {
   formatCacheHitRate,
   formatCompactNumber,
   formatCompactRate,
+  formatHistoryRow,
+  formatResponseTimingDetails,
+  formatArrivalPeaks,
   formatPulseMetrics,
   formatPulseSummary,
   projectSessionTotals,
@@ -149,13 +152,16 @@ test("duplicate completion does not add twice or consume another pending respons
 });
 
 test("completed snapshot remains available with stable generated rate", () => {
-  const snapshot = makeLastCompletedSnapshot(record("done", "s", 20, 5), 3);
+  const snapshot = makeLastCompletedSnapshot(record("done", "s", 20, 5, {
+    speed: { response: { generatedTokens: 25, durationMs: 1100, estimated: true } },
+  }), 3);
   assert.equal(snapshot.generated, 25);
-  assert.equal(snapshot.elapsed, 1_000);
-  assert.equal(snapshot.rate, 25);
+  assert.equal(snapshot.elapsed, 1_100);
+  assert.equal(snapshot.rate, 25000 / 1100);
   assert.equal(snapshot.ttft, 100);
   assert.equal(snapshot.runEpoch, 3);
-  assert.equal(snapshot.estimated, false);
+  assert.equal(snapshot.estimated, true);
+  assert.equal(snapshot.basis, "response");
 });
 
 test("busy and retry continue the same epoch, while idle is idempotent", () => {
@@ -449,9 +455,11 @@ test("total token count includes cache writes and collapsed pulse shows speed", 
 test("aggregate speed is generated-weighted instead of response-average", () => {
   const fast = record("fast", "s", 1, 0, {
     time: { start: 0, firstToken: 0, completed: 100, duration: 100 },
+    speed: { response: { generatedTokens: 1, durationMs: 100, estimated: true } },
   });
   const slow = record("slow", "s", 100, 0, {
     time: { start: 0, firstToken: 0, completed: 1_000, duration: 1_000 },
+    speed: { response: { generatedTokens: 100, durationMs: 1000, estimated: true } },
   });
   const expected = (101 * 1000) / 1_100;
   assert.equal(aggregateSpeed([fast, slow]), expected);
@@ -459,13 +467,14 @@ test("aggregate speed is generated-weighted instead of response-average", () => 
   assert.equal(recordSpeedSummary(slow).avg, 100);
 });
 
-test("projected direct speed replaces time-only changes without overlay/disk double counting", () => {
+test("projected direct speed accepts a newer authoritative time-only correction without double counting", () => {
   const original = record("speed", "root", 100, 0, { speed: { response: { generatedTokens: 100, durationMs: 1000, estimated: true } } });
+  const update = { source: "live" as const, instanceID: "writer", sequence: 1, receivedAt: 1, fingerprint: "first", seenFingerprints: ["first"] };
   const ledger = { sessions: { root: { tokens: original.tokens, cost: original.cost, responseCount: 1,
     speed: { generation: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0 },
       response: { generatedTokens: 100, durationMs: 1000, responseCount: 1, estimatedResponseCount: 1 } } } },
-    open: { speed: { sessionID: "root", quality: "exact" as const, tokens: original.tokens, cost: original.cost, speed: original.speed } }, settled: {} };
-  const corrected = { ...original, speed: { response: { generatedTokens: 100, durationMs: 2000, estimated: false } } };
+    open: { speed: { sessionID: "root", quality: "exact" as const, tokens: original.tokens, cost: original.cost, speed: original.speed, update } }, settled: {} };
+  const corrected = { ...original, update: { ...update, sequence: 2, receivedAt: 2, fingerprint: "corrected", seenFingerprints: ["first", "corrected"] }, speed: { response: { generatedTokens: 100, durationMs: 2000, estimated: false } } };
   assert.equal(historyRecordsEquivalent(original, corrected), false);
   const projected = projectSessionTotals(ledger, [corrected, corrected], new Map(), "root");
   assert.equal(projected.direct.responseCount, 1);
@@ -477,9 +486,10 @@ test("projected direct speed replaces time-only changes without overlay/disk dou
   assert.equal(projectSessionTotals(legacy, [corrected], new Map(), "root").direct.speed?.response.durationMs, 1000);
 });
 
-test("single-response average prefers generation duration over high sample bursts", () => {
+test("single-response average keeps its selected basis and insufficient arrival peaks stay unavailable", () => {
   const response = record("stable", "s", 10, 0, {
     time: { start: 0, firstToken: 0, completed: 1_000, duration: 1_000 },
+    speed: { response: { generatedTokens: 10, durationMs: 1000, estimated: true } },
     samples: [
       { timestamp: 0, tokens: 100, estimatedTokens: 100, kind: "output" },
       { timestamp: 1, tokens: 100, estimatedTokens: 100, kind: "output" },
@@ -487,7 +497,65 @@ test("single-response average prefers generation duration over high sample burst
   });
   const summary = recordSpeedSummary(response);
   assert.equal(summary.avg, 10);
-  assert.ok(summary.max > summary.avg);
+  assert.equal(summary.basis, "response");
+  assert.equal(summary.extremaAvailable, false);
+  assert.equal(summary.max, 0);
+  assert.equal(summary.min, 0);
+});
+
+test("LAST history and details select the same qualified generation and estimated status", () => {
+  const response = record("consistent", "s", 1000, 0, {
+    time: { start: 0, firstResponse: 100, firstContent: 1000, firstToken: 1000,
+      firstResponseSource: "thinking", firstResponseTimeSource: "part-start", firstResponseEstimated: false,
+      ttft: 100, completed: 5000 },
+    speed: {
+      generation: { generatedTokens: 1000, durationMs: 100, estimated: true },
+      generationEvidence: { version: 2, coverage: "complete", start: 1000, end: 1100, outputObserved: true, reasoningObserved: false },
+      response: { generatedTokens: 1000, durationMs: 5000, estimated: false },
+    },
+  });
+  const last = makeLastCompletedSnapshot(response, 1, false);
+  const history = recordSpeedSummary(response);
+  const store = createRuntimeStore(2);
+  try {
+    store.lastCompletedBySession.set("s", last);
+    const details = selectSessionDetails(buildSessionDetailsTree(store, "s"), "s", store.lastCompletedBySession);
+    assert.equal(last.rate, 10000);
+    assert.equal(last.elapsed, 100);
+    assert.equal(last.ttft, 100);
+    assert.equal(last.rate, history.avg);
+    assert.equal(last.basis, history.basis);
+    assert.equal(last.estimated, history.estimated);
+    assert.equal(last.estimated, true);
+    assert.deepEqual(details.lastSpeed, history);
+    assert.match(liveLabel(store, "s", 5.5, 28), /^LAST ~10k tok\/s generation$/);
+    assert.match(formatHistoryRow(response), /~10k\s+generation\s+--\s+--/);
+    assert.match(formatResponseTimingDetails(response), /First content TTFT 1s.*thinking · part start/);
+    assert.match(formatResponseTimingDetails(response), /not an exact provider request time/);
+    assert.match(formatArrivalPeaks(response), /--.*insufficient/);
+  } finally { store.disposeSignals(); }
+});
+
+test("legacy boolean generation evidence cannot override response; missing measurements never fall back to samples", () => {
+  const response = record("legacy", "s", 100, 0, { speed: {
+    generation: { generatedTokens: 100, durationMs: 100, estimated: false },
+    generationEvidence: { start: 100, end: 200, outputObserved: true, reasoningObserved: false },
+    response: { generatedTokens: 100, durationMs: 1100, estimated: true },
+  } });
+  assert.equal(makeLastCompletedSnapshot(response).basis, "response");
+  assert.equal(recordSpeedSummary(response).avg, 100000 / 1100);
+  const missing = { ...response, speed: undefined,
+    samples: [{ timestamp: 0, tokens: 10 }, { timestamp: 1000, tokens: 20 }] };
+  assert.equal(recordSpeedSummary(missing).available, false);
+  assert.equal(recordSpeedSummary(missing).avg, 0);
+  assert.equal(recordSpeedSummary(missing).extremaAvailable, true);
+  assert.match(formatHistoryRow(missing), /--\s+--\s+~20\s+~20/);
+  assert.match(formatArrivalPeaks(missing), /estimated window/);
+  const store = createRuntimeStore(1);
+  try {
+    store.lastCompletedBySession.set("s", makeLastCompletedSnapshot(missing));
+    assert.equal(liveLabel(store, "s", 5.5, 20), "LAST --");
+  } finally { store.disposeSignals(); }
 });
 
 test("slot registration appends sidebar content without taking the footer or app", async () => {
@@ -1213,10 +1281,12 @@ test("main average uses cumulative direct speed, excluding children and the deta
   const store = createRuntimeStore(1);
   const speed = updateSpeedTotals(emptySpeedTotals(), {
     generation: { generatedTokens: 120, durationMs: 2000, estimated: false },
+    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 2000, outputObserved: true, reasoningObserved: true },
     response: { generatedTokens: 120, durationMs: 4000, estimated: false },
   }, 1)!;
   const childSpeed = updateSpeedTotals(emptySpeedTotals(), {
     generation: { generatedTokens: 9000, durationMs: 1000, estimated: false },
+    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 1000, outputObserved: true, reasoningObserved: false },
     response: { generatedTokens: 9000, durationMs: 2000, estimated: false },
   }, 1)!;
   store.totalsLedger.sessions = {
@@ -1246,6 +1316,7 @@ test("details tree retains ledger-only child/grandchild and selects their own di
     tokens: tokens(output, reasoning), cost, responseCount: 1,
     speed: updateSpeedTotals(emptySpeedTotals(), {
       generation: { generatedTokens: output + reasoning, durationMs: generationMs, estimated: false },
+      generationEvidence: { version: 2, coverage: "complete", start: 0, end: generationMs, outputObserved: true, reasoningObserved: reasoning > 0 },
       response: { generatedTokens: output + reasoning, durationMs: responseMs, estimated: false },
     }, 1),
   });
@@ -1255,7 +1326,8 @@ test("details tree retains ledger-only child/grandchild and selects their own di
   store.lastCompletedBySession.set("root", makeLastCompletedSnapshot(record("root-last", "root", 80, 20)));
   store.lastCompletedBySession.set("child", makeLastCompletedSnapshot(record("child-last", "child", 550, 50,
     { model: "known-child-model", time: { start: 0, firstToken: 222, completed: 3000 },
-      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false } } })));
+      speed: { generation: { generatedTokens: 600, durationMs: 2000, estimated: false },
+        generationEvidence: { version: 2, coverage: "complete", start: 222, end: 2222, outputObserved: true, reasoningObserved: true } } })));
   store.lastCompletedBySession.set("grand", makeLastCompletedSnapshot(record("grand-last", "grand", 30, 0)));
   const before = structuredClone(store.totalsLedger);
   const tree = buildSessionDetailsTree(store, "root");
@@ -1311,8 +1383,10 @@ test("details tree traverses empty intermediate parents, visits cycles once and 
 
 test("main average uses ratio of cumulative sums and identifies partial estimated timing", () => {
   const store = createRuntimeStore(1);
-  let speed = updateSpeedTotals(emptySpeedTotals(), { generation: { generatedTokens: 1, durationMs: 100, estimated: false } }, 1);
-  speed = updateSpeedTotals(speed, { generation: { generatedTokens: 100, durationMs: 1000, estimated: true } }, 1);
+  let speed = updateSpeedTotals(emptySpeedTotals(), { generation: { generatedTokens: 1, durationMs: 100, estimated: false },
+    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 100, outputObserved: true, reasoningObserved: false } }, 1);
+  speed = updateSpeedTotals(speed, { generation: { generatedTokens: 100, durationMs: 1000, estimated: true },
+    generationEvidence: { version: 2, coverage: "complete", start: 0, end: 1000, outputObserved: true, reasoningObserved: false } }, 1);
   store.totalsLedger.sessions.root = { tokens: tokens(150, 0), cost: 0, responseCount: 3, speed };
   const summary = sessionUsageSummary(store, "root");
   assert.equal(summary.generation.rate, 101000 / 1100);

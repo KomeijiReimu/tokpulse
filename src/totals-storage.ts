@@ -8,7 +8,9 @@ import {
   emptyTokenCounts,
   normalizeTokenCounts,
 } from "./core.js";
-import { type CompletionUpdate, type MeasuredHistoryRecord, type SessionSpeedTotals, type SpeedContribution, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { type CompletionUpdate, type MeasuredHistoryRecord, type SessionSpeedTotals, type SpeedContribution, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { hasOriginalResponseTiming } from "./storage.js";
+import { deriveSafeResponseMeasurement } from "./statistics.js";
 
 export const TOTALS_VERSION = 1 as const;
 export const DEFAULT_TOTALS_FILENAME = "totals.json";
@@ -34,6 +36,8 @@ export interface OpenContribution {
   cost: number;
   speed?: SpeedContribution;
   update?: CompletionUpdate;
+  /** Server-only speed migration. Unversioned history overlays must keep it. */
+  speedBackfill?: { version: 1; source: "server" };
 }
 
 export interface TotalsLedger {
@@ -62,6 +66,7 @@ export interface TotalsStorage {
   apply(record: HistoryRecord, options?: TotalsApplyOptions): Promise<TotalsLedger>;
   applyMany(records: readonly HistoryRecord[], options?: TotalsApplyOptions): Promise<TotalsLedger>;
   seed(records: readonly HistoryRecord[]): Promise<TotalsLedger>;
+  backfillSpeed(records: readonly HistoryRecord[]): Promise<TotalsLedger>;
   read(): Promise<TotalsLedger>;
   quarantine(): Promise<void>;
 }
@@ -104,6 +109,11 @@ export function createTotalsStorage(pathOrOptions: string | TotalsPathOptions): 
       return persistLedger(path, ledger);
     }),
     seed: (records) => enqueuePath(path, () => seedLedger(path, records)),
+    backfillSpeed: (records) => enqueuePath(path, async () => {
+      const ledger = await loadLedger(path);
+      reconcileLegacySpeed(ledger, records);
+      return persistLedger(path, ledger);
+    }),
     read: () => enqueuePath(path, () => loadLedger(path)),
     quarantine: () => enqueuePath(path, () => quarantineFile(path)),
   };
@@ -202,6 +212,12 @@ function applyOpenRecord(ledger: TotalsLedger, record: HistoryRecord): void {
   const messageID = requireMessageID(record);
   const contribution = contributionFromRecord(record);
   const previous = ledger.open[messageID];
+  const prior = ledger.settled[messageID] ?? previous;
+  if (prior && prior !== true) {
+    if (contribution.update) {
+      if (prior.update && !isNewerCompletionUpdate(contribution.update, prior.update)) return;
+    } else if (prior.update || prior.speedBackfill) return;
+  }
   if (previous?.quality === "exact" && contribution.quality === "provisional") {
     return;
   }
@@ -225,6 +241,38 @@ function applyOpenRecord(ledger: TotalsLedger, record: HistoryRecord): void {
   if (!sameContribution(previous, contribution)) {
     replaceContribution(ledger, previous, contribution);
     ledger.open[messageID] = contribution;
+  }
+}
+
+/** Never rebuild usage from history: only replace reversible speed snapshots. */
+function reconcileLegacySpeed(ledger: TotalsLedger, records: readonly HistoryRecord[]): void {
+  const history = new Map(records.map((record) => [record.messageID, record]));
+  for (const [messageID, previous] of Object.entries({ ...ledger.settled, ...ledger.open })) {
+    if (previous === true) continue;
+    const record = history.get(messageID);
+    const evidence = previous.speed?.generationEvidence;
+    // Pruned contributions still have enough evidence to reject the old boolean-only contract.
+    const timing = record && (!previous.update || JSON.stringify(previous.update) === JSON.stringify((record as MeasuredHistoryRecord).update))
+      ? record.time : { start: evidence?.start ?? 0, completed: evidence?.end ?? 0 };
+    const probe: HistoryRecord = { version: 1, messageID, sessionID: previous.sessionID,
+      tokens: previous.tokens, cost: previous.cost, quality: previous.quality, time: timing, samples: [],
+      speed: previous.speed?.response ? { response: previous.speed.response } : {} };
+    const speed = mergeRecordSpeed(probe, previous);
+    const sameUsage = record && record.sessionID === previous.sessionID && record.cost === previous.cost
+      && TOKEN_FIELDS.every((field) => record.tokens[field] === previous.tokens[field]);
+    const sameAuthority = !previous.update || JSON.stringify(previous.update) === JSON.stringify((record as MeasuredHistoryRecord | undefined)?.update);
+    if (!speed.response && record && sameUsage && sameAuthority && hasOriginalResponseTiming(record)) {
+      speed.response = deriveSafeResponseMeasurement({ ...record, tokens: previous.tokens }, { rawTimingKnown: true, usageExact: previous.quality === "exact" });
+    }
+    if (sameSpeedContribution(previous.speed, speed)) continue;
+    const session = ensureSession(ledger, previous.sessionID);
+    session.speed = updateSpeedTotals(updateSpeedTotals(session.speed, previous.speed, -1), speed, 1);
+    const next: OpenContribution = { ...previous, speedBackfill: { version: 1, source: "server" } };
+    const normalizedSpeed = coerceSpeedContribution(speed);
+    if (normalizedSpeed) next.speed = normalizedSpeed;
+    else delete next.speed;
+    if (ledger.open[messageID]) ledger.open[messageID] = next;
+    else ledger.settled[messageID] = next;
   }
 }
 
@@ -255,12 +303,15 @@ function contributionFromRecord(record: HistoryRecord): OpenContribution {
     throw new TypeError("Invalid totals record");
   }
   const quality: HistoryRecordQuality = record.quality === "provisional" ? "provisional" : "exact";
+  // Coercion deliberately retains old measurements for reversible subtraction.
+  // Newly applied records, unlike loaded ledger snapshots, must meet the new contract.
+  const speed = coerceSpeedContribution(mergeRecordSpeed(record, undefined));
   return {
     sessionID: record.sessionID,
     quality,
     tokens: normalizeTokenCounts(record.tokens),
     cost: nonNegativeCost(record.cost),
-    ...(coerceSpeedContribution(record.speed) ? { speed: coerceSpeedContribution(record.speed) } : {}),
+    ...(speed ? { speed } : {}),
     ...(coerceCompletionUpdate((record as MeasuredHistoryRecord).update) ? { update: coerceCompletionUpdate((record as MeasuredHistoryRecord).update) } : {}),
   };
 }
@@ -407,6 +458,7 @@ function cloneContribution(contribution: OpenContribution): OpenContribution {
     cost: contribution.cost,
     ...(contribution.speed ? { speed: coerceSpeedContribution(contribution.speed) } : {}),
     ...(contribution.update ? { update: coerceCompletionUpdate(contribution.update) } : {}),
+    ...(contribution.speedBackfill ? { speedBackfill: { version: 1 as const, source: "server" as const } } : {}),
   };
 }
 
@@ -485,6 +537,7 @@ function coerceContribution(value: unknown): OpenContribution {
     cost: requireNonNegative(value.cost),
     ...(value.speed !== undefined ? { speed: requireSpeedContribution(value.speed) } : {}),
     ...(value.update !== undefined ? { update: requireCompletionUpdate(value.update) } : {}),
+    ...(value.speedBackfill?.version === 1 && value.speedBackfill?.source === "server" ? { speedBackfill: { version: 1 as const, source: "server" as const } } : {}),
   };
 }
 

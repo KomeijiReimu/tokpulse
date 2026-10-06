@@ -11,6 +11,7 @@ import {
   parseHistoryJsonl,
   readHistoryFile,
   serializeHistoryJsonl,
+  hasOriginalResponseTiming,
 } from "../src/storage.js";
 
 test("recovers valid records from a temp-only file", async (context) => {
@@ -121,6 +122,19 @@ test("legacy records without quality remain readable", () => {
   const parsed = parseHistoryJsonl(`${legacy}\n`);
   assert.equal(parsed[0]?.quality, undefined);
   assert.equal(parsed[0]?.messageID, "legacy");
+});
+
+test("separate Thinking/content timing and normalization provenance survive repeated JSONL round trips", () => {
+  const original = historyRecord("thinking", { time: { start: 0, completed: 1000, firstToken: 500, firstContent: 500,
+    firstResponse: 100, firstResponseSource: "thinking", firstResponseTimeSource: "part-start", firstResponseEstimated: false } });
+  const [roundTrip] = parseHistoryJsonl(serializeHistoryJsonl(parseHistoryJsonl(JSON.stringify(original))));
+  assert.deepEqual(roundTrip.time, original.time);
+  assert.equal(hasOriginalResponseTiming(roundTrip), true);
+  const [missing] = parseHistoryJsonl(JSON.stringify({ ...original, time: { completed: 1000 } }));
+  assert.equal(missing.time.start, 0);
+  assert.equal(hasOriginalResponseTiming(missing), false);
+  const [reloaded] = parseHistoryJsonl(serializeHistoryJsonl([missing]));
+  assert.equal(hasOriginalResponseTiming(reloaded), false);
 });
 
 test("explicit live update order outranks nonzero completeness; unversioned recovery does not", async (context) => {

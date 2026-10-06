@@ -18,6 +18,7 @@ import {
   measureRollingTokenRate,
   normalizeTokenCounts,
   rollingTokenRate,
+  timeToFirstToken,
   utf8ByteLength,
 } from "../src/core.js";
 
@@ -127,11 +128,12 @@ test("rolling samples and rate stats respect the time window", () => {
   const second = createSpeedSample(110, 1_000);
   const third = createSpeedSample(220, 2_000);
   const samples = appendSpeedSample(appendSpeedSample([first], second, 1_500), third, 1_500);
-  assert.equal(samples.length, 2);
-  // The first retained batch is the baseline, not arrivals during this interval.
-  assert.equal(rollingTokenRate(samples, 2_000, 1_500), 40);
+  assert.equal(samples.length, 3);
+  // Retained predecessor permits a fractional left-edge batch contribution.
+  assert.equal(rollingTokenRate(samples, 2_000, 1_500), 50_000 / 1_500);
   assert.deepEqual(calculateRateStats([10, 20, 30]), { avg: 20, max: 30, min: 10 });
-  assert.deepEqual(calculateSpeedStats([second, third]), { avg: 40, max: 40, min: 40 });
+  assert.deepEqual(calculateSpeedStats([second, third]), { avg: 40, max: 40, min: 40,
+    available: true, extremaAvailable: true, estimated: true });
 });
 
 test("rolling rate warms up instead of dividing the first chunk by 20ms", () => {
@@ -168,7 +170,7 @@ test("uniform arrivals give their observable rate without a speed cap", () => {
   assert.equal(rollingTokenRate([{ timestamp: 0, tokens: 50_000 }, { timestamp: 1_000, tokens: 50_000 }]), 50_000);
 });
 
-test("left window boundary excludes its baseline batch and matches count to duration", () => {
+test("left window boundary interpolates cumulative counts without dropping the next batch", () => {
   const samples = [
     { timestamp: 0, tokens: 1_000 },
     { timestamp: 1_000, tokens: 100 },
@@ -178,9 +180,9 @@ test("left window boundary excludes its baseline batch and matches count to dura
   assert.deepEqual(measureRollingTokenRate(samples, 2_500, 1_500), {
     status: "ready", rate: 10, elapsedMs: 1_500, observedTokens: 15, observationCount: 3,
   });
-  // Moving past that batch also moves the denominator's start to the next point.
+  // Moving one millisecond past the edge removes 1/500 of the next five tokens.
   assert.deepEqual(measureRollingTokenRate(samples, 2_501, 1_500), {
-    status: "ready", rate: (10 / 1_001) * 1000, elapsedMs: 1_001, observedTokens: 10, observationCount: 2,
+    status: "ready", rate: (14.99 / 1_500) * 1000, elapsedMs: 1_500, observedTokens: 14.99, observationCount: 3,
   });
   assert.equal(measureRollingTokenRate(samples, 2_500, 999).status, "warming");
 });
@@ -188,7 +190,7 @@ test("left window boundary excludes its baseline batch and matches count to dura
 test("recent silence lowers the arrival estimate and a full-window pause becomes inactive", () => {
   const samples = [{ timestamp: 0, tokens: 10 }, { timestamp: 1_000, tokens: 10 }];
   assert.equal(rollingTokenRate(samples, 2_000), 5);
-  assert.equal(measureRollingTokenRate(samples, 10_999).status, "warming");
+  assert.equal(measureRollingTokenRate(samples, 10_999).status, "ready");
   assert.equal(measureRollingTokenRate(samples, 11_000).status, "inactive");
   assert.equal(rollingTokenRate(samples, 11_000), 0);
   assert.equal(measureRollingTokenRate(samples, 20_000).status, "inactive");
@@ -197,6 +199,51 @@ test("recent silence lowers the arrival estimate and a full-window pause becomes
   const resumed = [...samples, { timestamp: 12_000, tokens: 100 }];
   assert.equal(measureRollingTokenRate(resumed).status, "warming");
   assert.equal(rollingTokenRate([...resumed, { timestamp: 13_000, tokens: 10 }]), 10);
+});
+
+test("audit left-edge trajectory stays continuous and retains the predecessor batch", () => {
+  const samples = [{ timestamp: 1_000, tokens: 1 }, { timestamp: 10_000, tokens: 100 }, { timestamp: 11_000, tokens: 1 }];
+  const before = measureRollingTokenRate(samples, 11_000);
+  const after = measureRollingTokenRate(samples, 11_001);
+  assert.equal(before.rate, 10.1);
+  assert.ok(Math.abs(after.rate - before.rate) < 0.002);
+  assert.equal(after.elapsedMs, 10_000);
+  assert.equal(after.observationCount, 3);
+  const kept = appendSpeedSample(samples.slice(0, 2), samples[2]);
+  assert.deepEqual(measureRollingTokenRate(kept, 11_001), after);
+  const splitPredecessor = [{ timestamp: 1_000, tokens: 0.5 }, { timestamp: 1_000, tokens: 0.5 }, ...samples.slice(1)];
+  assert.equal(appendSpeedSample(splitPredecessor.slice(0, 3), splitPredecessor[3], 9_999).length, 4);
+  assert.deepEqual(measureRollingTokenRate(splitPredecessor, 11_001), after);
+});
+
+test("historical extrema require the same supported window as LIVE, not millisecond ratios or average fallback", () => {
+  const insufficient = calculateSpeedStats([{ timestamp: 100, tokens: 1 }, { timestamp: 101, tokens: 100 }]);
+  assert.equal(insufficient.available, false);
+  assert.equal(insufficient.extremaAvailable, false);
+  assert.equal(insufficient.max, 0);
+  const samples = [{ timestamp: 100, tokens: 1 }, { timestamp: 101, tokens: 100 }, { timestamp: 1_100, tokens: 1 }];
+  const stats = calculateSpeedStats(samples);
+  assert.equal(stats.max, 101);
+  assert.equal(stats.min, measureRollingTokenRate(samples, 1_100).rate);
+  assert.equal(stats.extremaAvailable, true);
+  assert.equal(stats.estimated, true);
+  assert.equal(calculateSpeedStats([{ timestamp: 0, tokens: 5 }, { timestamp: 0, tokens: 5 }]).available, false);
+});
+
+test("final usage calibration leaves byte-arrival speed and extrema estimated", () => {
+  const raw = [createSpeedSample(55, 0), createSpeedSample(55, 1_000)];
+  const calibrated = calibrateEstimatedOutput(raw, 2_000);
+  assert.equal(calibrated[1].tokens, 1_000);
+  assert.equal(rollingTokenRate(calibrated), rollingTokenRate(raw));
+  assert.deepEqual(calculateSpeedStats(calibrated), calculateSpeedStats(raw));
+});
+
+test("UI TTFT prefers a valid first response, independently of the first-content alias", () => {
+  const time = { start: 100, firstResponse: 200, firstContent: 500, firstToken: 500, completed: 900, ttft: 400 };
+  assert.equal(timeToFirstToken({ time }), 100);
+  assert.equal(timeToFirstToken({ time: { ...time, firstResponse: 99 } }), 400);
+  assert.equal(timeToFirstToken({ time: { ...time, firstResponse: 1_000 } }), 400);
+  assert.equal(timeToFirstToken({ time: { start: 0, firstToken: 100 } }), 100);
 });
 
 test("reasoning arrivals participate in the same rate and baseline as output", () => {

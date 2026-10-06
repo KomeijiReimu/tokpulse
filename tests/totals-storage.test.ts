@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
+import type { MeasuredHistoryRecord } from "../src/statistics.js";
+import { parseHistoryJsonl } from "../src/storage.js";
 import { createTotalsStorage, isCorruptTotalsError, resolveTotalsPath } from "../src/totals-storage.js";
 import { getSessionAverageSummary } from "../src/statistics.js";
 
@@ -159,8 +161,10 @@ for (const settled of [false, true]) {
     const options = { retainedMessageIDs: settled ? [] : ["m"] };
     const exact = historyRecord("m", {
       quality: "exact", tokens: tokens(1, 10, 2), cost: 3,
+      time: { start: 0, completed: 300 },
       speed: {
         generation: { generatedTokens: 12, durationMs: 100, estimated: true },
+        generationEvidence: { start: 100, end: 200, outputObserved: true, reasoningObserved: true, version: 2, coverage: "complete" },
         response: { generatedTokens: 12, durationMs: 300, estimated: false },
       },
     });
@@ -185,8 +189,10 @@ for (const settled of [false, true]) {
 
     const corrected = await reloaded.apply(historyRecord("m", {
       quality: "exact", tokens: tokens(1), cost: 0,
+      time: { start: 0, completed: 200 },
       speed: {
         generation: { generatedTokens: 0, durationMs: 50, estimated: false },
+        generationEvidence: { start: 100, end: 150, outputObserved: true, reasoningObserved: true, version: 2, coverage: "complete" },
         response: { generatedTokens: 0, durationMs: 200, estimated: false },
       },
     }), options);
@@ -500,6 +506,83 @@ test("legacy settled true is not adjusted when a larger record is applied", asyn
   assert.equal(after.sessions.session?.responseCount, 1);
   assert.equal(after.settled.frozen, true);
   assert.equal(after.open.frozen, undefined);
+});
+
+for (const settled of [false, true]) {
+  test(`server backfill corrects ${settled ? "settled" : "open"} legacy generation speed only and survives reload/old overlays`, async (context) => {
+    const directory = await makeTestDirectory(context);
+    const path = join(directory, "totals.json");
+    const storage = createTotalsStorage(path);
+    const record = historyRecord("m", { time: { start: 0, completed: 1000 }, tokens: tokens(2, 10, 5), cost: 3,
+      speed: { generation: { generatedTokens: 15, durationMs: 100, estimated: true },
+        generationEvidence: { start: 100, end: 200, outputObserved: true, reasoningObserved: true } } });
+    const before = await storage.apply(record, { retainedMessageIDs: settled ? [] : ["m"] });
+    const oldContribution = settled ? before.settled.m : before.open.m;
+    (oldContribution as any).speed = record.speed;
+    before.sessions.session.speed = { generation: { generatedTokens: 15, durationMs: 100, responseCount: 1, estimatedResponseCount: 1 },
+      response: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0 } };
+    await writeFile(path, JSON.stringify(before));
+    const migrated = await storage.backfillSpeed([record]);
+    assert.deepEqual(migrated.sessions.session.tokens, before.sessions.session.tokens);
+    assert.equal(migrated.sessions.session.cost, 3);
+    assert.equal(migrated.sessions.session.responseCount, 1);
+    assert.equal(migrated.sessions.session.speed?.generation.responseCount, 0);
+    assert.equal(migrated.sessions.session.speed?.response.responseCount, 1);
+    assert.equal(migrated.sessions.session.speed?.response.generatedTokens, 15);
+    assert.equal(migrated.sessions.session.speed?.response.durationMs, 1000);
+    assert.equal(migrated.sessions.session.speed?.response.estimatedResponseCount, 1);
+    const contribution = settled ? migrated.settled.m : migrated.open.m;
+    assert.notEqual(contribution, true);
+    assert.deepEqual((contribution as any).speedBackfill, { version: 1, source: "server" });
+    const reloaded = createTotalsStorage(path);
+    assert.deepEqual(await reloaded.backfillSpeed([record]), migrated);
+    assert.deepEqual(await reloaded.apply(record, { retainedMessageIDs: settled ? [] : ["m"] }), migrated);
+    // After pruning, no original response times need to be guessed again.
+    const pruned = await reloaded.applyMany([], { retainedMessageIDs: [] });
+    assert.deepEqual((await reloaded.backfillSpeed([])).sessions, pruned.sessions);
+  });
+}
+
+test("backfill rejects fabricated timing and settled true; pruned boolean generation is removed", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const [missing] = parseHistoryJsonl(JSON.stringify({ ...historyRecord("missing"), time: { completed: 1000 } }));
+  await storage.apply(missing);
+  const old = historyRecord("pruned", { speed: { generation: { generatedTokens: 0, durationMs: 100, estimated: true },
+    generationEvidence: { start: 10, end: 110, outputObserved: true, reasoningObserved: false } } });
+  await storage.apply(old, { retainedMessageIDs: ["missing"] });
+  const before = await storage.read();
+  (before.settled.pruned as any).speed = old.speed;
+  before.sessions.session.speed = { generation: { generatedTokens: 0, durationMs: 100, responseCount: 1, estimatedResponseCount: 1 },
+    response: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0 } };
+  before.settled.frozen = true;
+  await writeFile(storage.path, JSON.stringify(before));
+  const migrated = await storage.backfillSpeed([missing, historyRecord("frozen")]);
+  assert.equal(migrated.open.missing.speed, undefined);
+  assert.equal(migrated.sessions.session.speed?.generation.responseCount, 0);
+  assert.equal(migrated.sessions.session.speed?.response.responseCount, 0);
+  assert.equal(migrated.settled.frozen, true);
+  assert.equal(migrated.sessions.session.responseCount, 2);
+  assert.deepEqual(migrated.sessions.session.tokens, before.sessions.session.tokens);
+  assert.deepEqual(await createTotalsStorage(storage.path).backfillSpeed([missing]), migrated);
+});
+
+test("backfill and stale history cannot overwrite a newer authoritative exact correction", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const stale = historyRecord("m", { tokens: tokens(1, 100), time: { start: 0, completed: 1000 } });
+  await storage.apply(stale);
+  await storage.backfillSpeed([stale]);
+  const exact: MeasuredHistoryRecord = { ...stale, tokens: tokens(1, 2), time: { start: 500, completed: 600 },
+    speed: { response: { generatedTokens: 2, durationMs: 100, estimated: false } },
+    update: { source: "live", instanceID: "writer", sequence: 2, receivedAt: 2000, fingerprint: "new", seenFingerprints: ["new"] } };
+  const corrected = await storage.apply(exact, { retainedMessageIDs: [] });
+  assert.equal((corrected.settled.m as any).speedBackfill, undefined);
+  assert.equal(corrected.sessions.session.speed?.response.durationMs, 100);
+  assert.deepEqual(await storage.backfillSpeed([stale]), corrected);
+  assert.deepEqual(await createTotalsStorage(storage.path).apply(stale), corrected);
+  const replay: MeasuredHistoryRecord = { ...stale, update: { ...exact.update!, sequence: 1, fingerprint: "old", seenFingerprints: ["old"] } };
+  assert.deepEqual(await storage.apply(replay), corrected);
 });
 
 test("moving a settled record to another session transfers usage instead of double counting", async (context) => {

@@ -18,6 +18,7 @@ import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, ad
 import { replayActivity, resolveRootSessionID } from "./activity.js";
 import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, parseModelDelta, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 import { getSessionAverageSummary } from "./statistics.js";
+import { applyFirstResponseSignal, recordContentArrival, selectSpeedMeasurement, thinkingFirstResponseSignal } from "./statistics.js";
 import { DEFAULT_MAX_RECORDS, readHistoryFile } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
@@ -35,7 +36,8 @@ function observationRuntime(store) {
   if (!runtime) {
     runtime = {
       instanceID: randomUUID(),
-      metadata: createContentMetadataCache()
+      metadata: createContentMetadataCache(),
+      liveAssistantMessages: new Set()
     };
     observationRuntimes.set(store, runtime);
   }
@@ -48,8 +50,48 @@ function knownNonAssistant(store, messageID) {
   const role = observationRuntime(store).metadata.roles.get(messageID);
   return role !== undefined && role !== "assistant";
 }
-export function recordTuiPartMetadata(store, properties) {
-  cachePartSnapshot(observationRuntime(store).metadata, properties);
+export function recordTuiPartMetadata(store, properties, event = {}) {
+  const observations = observationRuntime(store);
+  cachePartSnapshot(observations.metadata, properties);
+  const part = asRecord(properties.part);
+  const messageID = readString(part?.messageID);
+  if (!part || !messageID || knownCompletedMessage(store, messageID)) return;
+  const state = store.active.get(messageID);
+  if (!state) return;
+  const signal = thinkingFirstResponseSignal(part, {
+    messageID,
+    sessionID: state.sessionID,
+    role: observations.metadata.roles.get(messageID) ?? "unknown",
+    start: state.startedAt,
+    now: eventTimestamp(event, properties),
+    live: event.type === "message.part.updated" && observations.liveAssistantMessages.has(messageID) && !isReplayEvent(event, properties)
+  });
+  if (!signal) return;
+  const previous = state.firstResponseAt;
+  applyActiveTiming(state, applyFirstResponseSignal(activeTiming(state), signal));
+  if (state.firstResponseAt !== previous) store.bump();
+}
+function isReplayEvent(event, properties) {
+  return event.replay === true || properties.replay === true || [event.source, properties.source].some(source => source === "snapshot" || source === "history" || source === "reconnect");
+}
+function activeTiming(state) {
+  return {
+    start: state.startedAt,
+    firstToken: state.firstTokenAt,
+    firstContent: state.firstContentAt,
+    firstResponse: state.firstResponseAt,
+    firstResponseSource: state.firstResponseSource,
+    firstResponseTimeSource: state.firstResponseTimeSource,
+    firstResponseEstimated: state.firstResponseEstimated
+  };
+}
+function applyActiveTiming(state, time) {
+  state.firstTokenAt = time.firstToken;
+  state.firstContentAt = time.firstContent;
+  state.firstResponseAt = time.firstResponse;
+  state.firstResponseSource = time.firstResponseSource;
+  state.firstResponseTimeSource = time.firstResponseTimeSource;
+  state.firstResponseEstimated = time.firstResponseEstimated;
 }
 
 // Same canonical payload fingerprint as the server, for cross-process replay
@@ -707,7 +749,26 @@ function makeHistoryRecord(input) {
   const start = infoTimeValue(input.info, ["start", "created"]) ?? input.state?.startedAt ?? input.completedAt;
   const completed = infoTimeValue(input.info, ["end", "completed"]) ?? input.completedAt;
   const firstToken = earliestFirstOutput(start, completed, infoTimeValue(input.info, ["firstToken", "firstTokenAt"]), input.state?.firstTokenAt);
-  const ttft = firstToken === undefined ? undefined : Math.max(0, firstToken - start);
+  let timing = {
+    start,
+    completed,
+    duration: Math.max(0, completed - start),
+    ...(firstToken !== undefined ? {
+      firstToken,
+      firstContent: firstToken
+    } : {})
+  };
+  if (input.state?.firstResponseAt !== undefined) {
+    timing = applyFirstResponseSignal(timing, {
+      timestamp: input.state.firstResponseAt,
+      source: input.state.firstResponseSource ?? "content",
+      timeSource: input.state.firstResponseTimeSource ?? "arrival",
+      estimated: input.state.firstResponseEstimated ?? true
+    });
+  }
+  const ttft = timeToFirstToken({
+    time: timing
+  });
   const duration = Math.max(0, completed - start);
   const record = {
     version: HISTORY_VERSION,
@@ -722,11 +783,7 @@ function makeHistoryRecord(input) {
     tokens: input.tokens,
     cost: Math.max(0, Number.isFinite(input.cost) ? input.cost : 0),
     time: {
-      start,
-      ...(firstToken !== undefined ? {
-        firstToken
-      } : {}),
-      completed,
+      ...timing,
       ...(ttft !== undefined ? {
         ttft
       } : {}),
@@ -892,25 +949,22 @@ export function applyRecordToSessionRuntime(runtime, record, quality = "exact") 
   }
   return previous === undefined;
 }
-function completedElapsed(record) {
-  const completed = record.time.completed ?? record.time.start;
-  const firstToken = record.time.firstToken;
-  if (firstToken !== undefined) return Math.max(0, completed - firstToken);
-  return Math.max(0, durationOf(record) ?? 0);
-}
-export function makeLastCompletedSnapshot(record, runEpoch = 0, estimated = false) {
-  const elapsed = completedElapsed(record);
+export function makeLastCompletedSnapshot(record, runEpoch = 0, _estimated = false) {
+  const selected = selectSpeedMeasurement(record);
+  const elapsed = selected.measurement?.durationMs ?? 0;
   const generated = record.tokens.output + record.tokens.reasoning;
   return {
     record,
-    rate: elapsed > 0 ? generated * 1000 / elapsed : 0,
+    rate: selected.rate ?? 0,
     generated,
     ...(timeToFirstToken(record) !== undefined ? {
       ttft: timeToFirstToken(record)
     } : {}),
     elapsed,
     runEpoch,
-    estimated
+    estimated: selected.estimated,
+    available: selected.available,
+    basis: selected.basis
   };
 }
 function commitRecord(store, record, markCompleted) {
@@ -1322,6 +1376,7 @@ export function noteTaskRecord(store, api, record) {
 export function recordDelta(store, properties, event, stream, _explicitKind, bytesPerToken) {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
+  if (isReplayEvent(event, properties)) return;
   const parentID = sessionParentFromEvent("message.part.delta", properties, event);
   if (parentID) rememberSessionParent(store, sessionID, parentID);
   const messageID = readMessageID(properties);
@@ -1330,6 +1385,7 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
   if (!delta) return;
   const timestamp = eventTimestamp(event, properties);
   const existingState = (messageID ? store.active.get(messageID) : undefined) ?? store.active.get(pendingKey(sessionID));
+  if (existingState && (existingState.sessionID !== sessionID || timestamp < existingState.startedAt)) return;
   const progress = existingState?.progress ?? cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
   const parsed = parseModelDelta(progress, properties, event, stream, delta);
   if (!parsed) return;
@@ -1337,7 +1393,7 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
   const state = existingState ?? getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.progress = progress;
   observationRuntime(store).metadata.progress.set(messageID ?? pendingKey(sessionID), progress);
-  state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
+  applyActiveTiming(state, recordContentArrival(activeTiming(state), timestamp));
   runtime.runFirstTokenAt = Math.min(runtime.runFirstTokenAt ?? timestamp, timestamp);
   const bytes = utf8ByteLength(delta);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
@@ -1358,8 +1414,6 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
   }
   if (state.sessionID !== sessionID) return;
   state.selectedSource = lockStreamSource(state.selectedSource, stream);
-  state.startedAt = Math.min(state.startedAt, timestamp);
-  state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
   runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined ? timestamp : Math.min(runtime.runFirstTokenAt, timestamp);
   if (messageID) runtime.activeMessageID = messageID;
   state[stream].hasData = true;
@@ -1369,6 +1423,7 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
   store.bump();
 }
 export function recordStepStarted(store, properties, event) {
+  if (isReplayEvent(event, properties)) return;
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
@@ -1512,12 +1567,14 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
   const observations = observationRuntime(store);
   if (typeof info.role === "string") observations.metadata.roles.set(messageID, info.role);
   if (info.role !== "assistant") {
+    observations.liveAssistantMessages.delete(messageID);
     if (typeof info.role === "string") store.active.delete(messageID);
     return false;
   }
   const timestamp = eventTimestamp(event, properties);
   if (!isCompleted(info, properties, event)) {
-    if (knownCompletedMessage(store, messageID) || event.replay === true || properties.replay === true || event.source === "snapshot") return false;
+    if (knownCompletedMessage(store, messageID) || isReplayEvent(event, properties)) return false;
+    observations.liveAssistantMessages.add(messageID);
     const runtime = ensureSessionRun(store, sessionID, timestamp);
     const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
     state.startedAt = Math.min(state.startedAt, infoTimeValue(info, ["start", "created"]) ?? timestamp);
@@ -1529,7 +1586,7 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     store.bump();
     return false;
   }
-  if (event.replay === true || properties.replay === true || event.source === "snapshot") return false;
+  if (isReplayEvent(event, properties)) return false;
   const previous = previousTuiRecord(store, messageID);
   const openSnapshot = store.totalsLedger.open[messageID];
   const snapshot = openSnapshot ?? store.totalsLedger.settled[messageID];
@@ -1590,13 +1647,26 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstToken, record.time.firstToken);
     if (firstToken !== undefined) {
       record.time.firstToken = firstToken;
-      record.time.ttft = firstToken - record.time.start;
+      record.time.firstContent = firstToken;
     }
+    if (previous.time.firstResponse !== undefined) record.time = applyFirstResponseSignal(record.time, {
+      timestamp: previous.time.firstResponse,
+      source: previous.time.firstResponseSource ?? "content",
+      timeSource: previous.time.firstResponseTimeSource ?? "arrival",
+      estimated: previous.time.firstResponseEstimated ?? true
+    });
+    record.time.ttft = timeToFirstToken({
+      time: {
+        ...record.time,
+        ttft: undefined
+      }
+    });
   }
   record.speed = mergeRecordSpeed(record, prior, state && finalSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
   record.update = update;
   commitRecord(store, record, true);
   observations.metadata.completed.add(messageID);
+  observations.liveAssistantMessages.delete(messageID);
   noteTaskRecord(store, api, record);
   return true;
 }
@@ -1744,7 +1814,7 @@ function tokenCountsEqual(left, right) {
   return left.input === right.input && left.output === right.output && left.reasoning === right.reasoning && left.cacheRead === right.cacheRead && left.cacheWrite === right.cacheWrite;
 }
 export function historyRecordsEquivalent(left, right) {
-  return left.messageID === right.messageID && left.sessionID === right.sessionID && left.parentSessionID === right.parentSessionID && left.model === right.model && left.cost === right.cost && tokenCountsEqual(left.tokens, right.tokens) && left.time.start === right.time.start && left.time.firstToken === right.time.firstToken && left.time.completed === right.time.completed && left.time.ttft === right.time.ttft && left.time.duration === right.time.duration && (left.quality ?? "exact") === (right.quality ?? "exact") && sameSpeedContribution(left.speed, right.speed) && JSON.stringify(coerceCompletionUpdate(left.update)) === JSON.stringify(coerceCompletionUpdate(right.update));
+  return left.messageID === right.messageID && left.sessionID === right.sessionID && left.parentSessionID === right.parentSessionID && left.model === right.model && left.cost === right.cost && tokenCountsEqual(left.tokens, right.tokens) && left.time.start === right.time.start && left.time.firstToken === right.time.firstToken && left.time.firstContent === right.time.firstContent && left.time.firstResponse === right.time.firstResponse && left.time.firstResponseSource === right.time.firstResponseSource && left.time.firstResponseTimeSource === right.time.firstResponseTimeSource && left.time.firstResponseEstimated === right.time.firstResponseEstimated && left.time.completed === right.time.completed && left.time.ttft === right.time.ttft && left.time.duration === right.time.duration && (left.quality ?? "exact") === (right.quality ?? "exact") && sameSpeedContribution(left.speed, right.speed) && JSON.stringify(coerceCompletionUpdate(left.update)) === JSON.stringify(coerceCompletionUpdate(right.update));
 }
 function recordCompletedAt(record) {
   return record.time.completed ?? record.time.start;
@@ -1827,8 +1897,15 @@ export async function reloadHistory(store, api, path, totalsPath, maxRecords, ge
     warnWithToast(api, "totals read failed", error);
   }
   if (store.disposed || generation !== store.historyGeneration) return;
-  store.diskRecords = diskRecords;
   if (totalsLedger) store.totalsLedger = totalsLedger;
+  store.diskRecords = diskRecords.map(record => withCanonicalLedgerSpeed(store.totalsLedger, record));
+  for (const [id, record] of store.optimistic) {
+    store.optimistic.set(id, withCanonicalLedgerSpeed(store.totalsLedger, record));
+  }
+  for (const [sessionID, last] of store.lastCompletedBySession) {
+    const record = withCanonicalLedgerSpeed(store.totalsLedger, last.record);
+    if (record !== last.record) store.lastCompletedBySession.set(sessionID, makeLastCompletedSnapshot(record, last.runEpoch));
+  }
   repairKnownParents(store);
   hydrateHistoryState(store, store.diskRecords);
   store.records = mergeHistoryLayers(store.diskRecords, store.optimistic, maxRecords, store.optimisticQuality, store.optimisticOrder);
@@ -2033,47 +2110,44 @@ function formatOptionalDuration(value) {
   return value === undefined ? "--" : formatDuration(value);
 }
 export function generationElapsed(record) {
-  return record.speed?.generation?.durationMs ?? record.speed?.response?.durationMs ?? durationOf(record);
-}
-function stableGeneratedRate(record) {
-  const elapsed = generationElapsed(record);
-  const generated = generatedTokens(record.tokens);
-  return elapsed !== undefined && elapsed > 0 ? generated * 1000 / elapsed : 0;
+  return selectSpeedMeasurement(record).measurement?.durationMs;
 }
 export function recordSpeedSummary(record) {
   const generated = generatedTokens(record.tokens);
   const sampleStats = calculateSpeedStats(record.samples);
-  const stableRate = stableGeneratedRate(record);
-  const metadata = {
-    estimated: (record.speed?.generation ?? record.speed?.response)?.estimated ?? true,
-    basis: record.speed?.generation ? "generation" : "response"
-  };
-  if (record.samples.length >= 2 && sampleStats.avg > 0) {
-    return {
-      ...sampleStats,
-      avg: stableRate > 0 ? stableRate : sampleStats.avg,
-      generated,
-      ...metadata
-    };
-  }
+  const selected = selectSpeedMeasurement(record);
   return {
-    avg: stableRate,
-    max: stableRate,
-    min: stableRate,
+    avg: selected.rate ?? 0,
+    max: sampleStats.extremaAvailable ? sampleStats.max : 0,
+    min: sampleStats.extremaAvailable ? sampleStats.min : 0,
+    extremaAvailable: sampleStats.extremaAvailable === true,
+    available: selected.available,
     generated,
-    ...metadata
+    estimated: selected.estimated,
+    basis: selected.basis
   };
+}
+export function formatResponseTimingDetails(record) {
+  const time = record.time;
+  const firstContent = earliestFirstOutput(time.start, time.completed ?? time.start, time.firstContent, time.firstToken);
+  const contentTTFT = firstContent === undefined ? undefined : firstContent - time.start;
+  const signal = time.firstResponse !== undefined ? `${time.firstResponseSource ?? "content"} · ${time.firstResponseTimeSource === "part-start" ? "part start" : "event arrival"}${time.firstResponseEstimated ? " (estimated)" : ""}` : "legacy content timing";
+  return `First content TTFT ${formatOptionalDuration(contentTTFT)} · first response: ${signal}. Start is assistant message creation, not an exact provider request time.`;
+}
+export function formatArrivalPeaks(record) {
+  const summary = recordSpeedSummary(record);
+  return summary.extremaAvailable ? `Arrival peaks (estimated window): max ~${formatCompactRate(summary.max)} · min ~${formatCompactRate(summary.min)}` : "Arrival peaks: -- (insufficient window observations)";
 }
 export function aggregateSpeed(records) {
   let generated = 0;
   let elapsed = 0;
   for (const record of records) {
-    // Window/LAST aggregate uses a single response basis; never mix generation
+    // Window aggregate uses a single response basis; never mix generation
     // and response durations when only a subset has generation coverage.
-    const generationTime = record.speed?.response?.durationMs ?? durationOf(record);
-    if (generationTime === undefined || generationTime <= 0) continue;
-    generated += generatedTokens(record.tokens);
-    elapsed += generationTime;
+    const response = coerceSpeedContribution(record.speed)?.response;
+    if (!response) continue;
+    generated += response.generatedTokens;
+    elapsed += response.durationMs;
   }
   return elapsed > 0 ? generated * 1000 / elapsed : 0;
 }
@@ -2103,11 +2177,11 @@ function padRight(value, width) {
 function padLeft(value, width) {
   return value.length >= width ? value.slice(-width) : value.padStart(width, " ");
 }
-function formatHistoryRow(record) {
+export function formatHistoryRow(record) {
   const speed = recordSpeedSummary(record);
   const ttft = timeToFirstToken(record);
   const duration = durationOf(record);
-  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(formatCompactNumber(speed.avg), 6), padLeft(formatCompactNumber(speed.max), 6), padLeft(formatCompactNumber(speed.min), 6), padLeft(formatOptionalDuration(ttft), 7), padLeft(formatOptionalDuration(duration), 7), padLeft(formatCost(record.cost), 9), sparkline(record.samples)].join(" ");
+  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(speed.available ? `${speed.estimated ? "~" : ""}${formatCompactNumber(speed.avg)}` : "--", 7), padRight(speed.basis ?? "--", 10), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.max)}` : "--", 7), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.min)}` : "--", 7), padLeft(formatOptionalDuration(ttft), 7), padLeft(formatOptionalDuration(duration), 7), padLeft(formatCost(record.cost), 9), sparkline(record.samples)].join(" ");
 }
 function summaryLines(label, tokens, cost, responseCount) {
   return [label, `  Total tokens (input + generated + cache) ${formatCompactNumber(totalTokens(tokens))}`, `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`, `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`, `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`, `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`, `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
@@ -2603,7 +2677,7 @@ export function TokenPulseDetails(props) {
     _$insert(_el$25, () => `Response avg TPS  ${formatAverageRate(details().average.response)}`);
     _$setProp(_el$26, "wrapMode", "word");
     _$insert(_el$26, () => averageCoverage(details().average.response, details().average));
-    _$insertNode(_el$27, _$createTextNode(`Response time includes TTFT and may include tool waits. Generation time needs observed start and end boundaries.`));
+    _$insertNode(_el$27, _$createTextNode(`Response time includes TTFT and may include tool waits. Generation time needs complete content coverage and observed boundaries.`));
     _$setProp(_el$27, "wrapMode", "word");
     _$insertNode(_el$29, _$createTextNode(`SESSION USAGE`));
     _$setProp(_el$29, "paddingTop", 1);
@@ -2620,56 +2694,72 @@ export function TokenPulseDetails(props) {
     _$setProp(_el$33, "wrapMode", "word");
     _$insert(_el$33, (() => {
       var _c$3 = _$memo(() => !!details().last);
-      return () => _c$3() ? `${details().lastSpeed.estimated ? "~" : ""}${formatCompactRate(details().lastSpeed.avg)} (${details().lastSpeed.basis}) · TTFT ${formatOptionalDuration(details().last.ttft)} · response time ${formatOptionalDuration(durationOf(details().last.record))}` : "No completed response in the loaded history";
+      return () => _c$3() ? `${details().lastSpeed.available ? `${details().lastSpeed.estimated ? "~" : ""}${formatCompactRate(details().lastSpeed.avg)} (${details().lastSpeed.basis})` : "Speed unavailable"} · TTFT ${formatOptionalDuration(details().last.ttft)} · response time ${formatOptionalDuration(durationOf(details().last.record))}` : "No completed response in the loaded history";
     })());
     _$insert(_el$17, (() => {
-      var _c$4 = _$memo(() => !!details().last?.record.model);
-      return () => _c$4() && (() => {
+      var _c$4 = _$memo(() => !!details().last);
+      return () => _c$4() && [(() => {
         var _el$54 = _$createElement("text");
         _$setProp(_el$54, "wrapMode", "word");
-        _$insert(_el$54, () => `Last model: ${details().last.record.model}`);
+        _$insert(_el$54, () => formatResponseTimingDetails(details().last.record));
         _$effect(_$p => _$setProp(_el$54, "fg", theme.textMuted, _$p));
         return _el$54;
+      })(), (() => {
+        var _el$55 = _$createElement("text");
+        _$setProp(_el$55, "wrapMode", "word");
+        _$insert(_el$55, () => formatArrivalPeaks(details().last.record));
+        _$effect(_$p => _$setProp(_el$55, "fg", theme.textMuted, _$p));
+        return _el$55;
+      })()];
+    })(), _el$34);
+    _$insert(_el$17, (() => {
+      var _c$5 = _$memo(() => !!details().last?.record.model);
+      return () => _c$5() && (() => {
+        var _el$56 = _$createElement("text");
+        _$setProp(_el$56, "wrapMode", "word");
+        _$insert(_el$56, () => `Last model: ${details().last.record.model}`);
+        _$effect(_$p => _$setProp(_el$56, "fg", theme.textMuted, _$p));
+        return _el$56;
       })();
     })(), _el$34);
     _$insert(_el$17, (() => {
-      var _c$5 = _$memo(() => tree().nodes.length > 1);
-      return () => _c$5() ? [(() => {
-        var _el$55 = _$createElement("text");
-        _$insertNode(_el$55, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
-        _$setProp(_el$55, "paddingTop", 1);
-        _$effect(_$p => _$setProp(_el$55, "fg", theme.accent, _$p));
-        return _el$55;
-      })(), (() => {
+      var _c$6 = _$memo(() => tree().nodes.length > 1);
+      return () => _c$6() ? [(() => {
         var _el$57 = _$createElement("text");
-        _$insertNode(_el$57, _$createTextNode(`Measured token/time sums, not wall-clock throughput. Includes every descendant once.`));
-        _$setProp(_el$57, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$57, "fg", theme.textMuted, _$p));
+        _$insertNode(_el$57, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
+        _$setProp(_el$57, "paddingTop", 1);
+        _$effect(_$p => _$setProp(_el$57, "fg", theme.accent, _$p));
         return _el$57;
       })(), (() => {
         var _el$59 = _$createElement("text");
+        _$insertNode(_el$59, _$createTextNode(`Measured token/time sums, not wall-clock throughput. Includes every descendant once.`));
         _$setProp(_el$59, "wrapMode", "word");
-        _$insert(_el$59, () => `Generation avg TPS  ${formatAverageRate(tree().average.generation)}`);
-        _$effect(_$p => _$setProp(_el$59, "fg", theme.text, _$p));
+        _$effect(_$p => _$setProp(_el$59, "fg", theme.textMuted, _$p));
         return _el$59;
-      })(), (() => {
-        var _el$60 = _$createElement("text");
-        _$setProp(_el$60, "wrapMode", "word");
-        _$insert(_el$60, () => averageCoverage(tree().average.generation, tree().average));
-        _$effect(_$p => _$setProp(_el$60, "fg", theme.textMuted, _$p));
-        return _el$60;
       })(), (() => {
         var _el$61 = _$createElement("text");
         _$setProp(_el$61, "wrapMode", "word");
-        _$insert(_el$61, () => `Response avg TPS  ${formatAverageRate(tree().average.response)}`);
+        _$insert(_el$61, () => `Generation avg TPS  ${formatAverageRate(tree().average.generation)}`);
         _$effect(_$p => _$setProp(_el$61, "fg", theme.text, _$p));
         return _el$61;
       })(), (() => {
         var _el$62 = _$createElement("text");
         _$setProp(_el$62, "wrapMode", "word");
-        _$insert(_el$62, () => averageCoverage(tree().average.response, tree().average));
+        _$insert(_el$62, () => averageCoverage(tree().average.generation, tree().average));
         _$effect(_$p => _$setProp(_el$62, "fg", theme.textMuted, _$p));
         return _el$62;
+      })(), (() => {
+        var _el$63 = _$createElement("text");
+        _$setProp(_el$63, "wrapMode", "word");
+        _$insert(_el$63, () => `Response avg TPS  ${formatAverageRate(tree().average.response)}`);
+        _$effect(_$p => _$setProp(_el$63, "fg", theme.text, _$p));
+        return _el$63;
+      })(), (() => {
+        var _el$64 = _$createElement("text");
+        _$setProp(_el$64, "wrapMode", "word");
+        _$insert(_el$64, () => averageCoverage(tree().average.response, tree().average));
+        _$effect(_$p => _$setProp(_el$64, "fg", theme.textMuted, _$p));
+        return _el$64;
       })(), _$createComponent(PulseMetricGrid, {
         get theme() {
           return props.api.theme;
@@ -2678,18 +2768,18 @@ export function TokenPulseDetails(props) {
           return pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map(metric => [metric]);
         }
       })] : (() => {
-        var _el$63 = _$createElement("text");
-        _$insertNode(_el$63, _$createTextNode(`No known subagents in this scope`));
-        _$setProp(_el$63, "paddingTop", 1);
-        _$setProp(_el$63, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$63, "fg", theme.textMuted, _$p));
-        return _el$63;
+        var _el$65 = _$createElement("text");
+        _$insertNode(_el$65, _$createTextNode(`No known subagents in this scope`));
+        _$setProp(_el$65, "paddingTop", 1);
+        _$setProp(_el$65, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$65, "fg", theme.textMuted, _$p));
+        return _el$65;
       })();
     })(), _el$34);
     _$insertNode(_el$34, _$createTextNode(`Average = measured generated tokens / measured time, not an average of call speeds. Generated tokens include output and reasoning; input and cache are excluded.`));
     _$setProp(_el$34, "paddingTop", 1);
     _$setProp(_el$34, "wrapMode", "word");
-    _$insertNode(_el$36, _$createTextNode(`~ means estimated. Coverage shows which calls have usable timing; older calls may have none. Live speed uses observed stream samples, not exact model usage.`));
+    _$insertNode(_el$36, _$createTextNode(`~ means estimated. Coverage shows calls with usable timing. LIVE and peaks estimate windowed event arrivals, not token generation inside the model.`));
     _$setProp(_el$36, "wrapMode", "word");
     _$insertNode(_el$38, _$createTextNode(`esc / ctrl+c to close`));
     _$setProp(_el$38, "flexShrink", 0);
@@ -2899,13 +2989,14 @@ function applyWindowAdjustments(ledger, records) {
   for (const record of records) {
     const settledValue = settled[record.messageID];
     if (settledValue === true) continue;
-    const next = contributionNumbers(record);
+    const next = contributionNumbers(withCanonicalLedgerSpeed(ledger, record));
     if (!next) continue;
     const previous = settledValue ?? open[record.messageID];
     if (previous) {
       if (previous.quality === "exact" && record.quality === "provisional") continue;
       const priorUpdate = coerceCompletionUpdate(previous.update);
       const nextUpdate = coerceCompletionUpdate(record.update);
+      if (previous.speedBackfill && !nextUpdate) continue;
       if (priorUpdate) {
         if (!nextUpdate) continue;
         // Disk ledger confirms this provider fact; use its canonical speed.
@@ -2925,6 +3016,22 @@ function applyWindowAdjustments(ledger, records) {
     addDirect(ensureDirect(sessions, next.sessionID), next.tokens, next.cost, next.speed);
   }
   return sessions;
+}
+
+// Server owns speed-only backfill/invalidation. Matching usage is not evidence
+// that a stale history or optimistic record can replace its canonical timing.
+function withCanonicalLedgerSpeed(ledger, record) {
+  const previous = ledger.settled?.[record.messageID] ?? ledger.open?.[record.messageID];
+  if (!previous || previous === true || previous.quality !== "exact" && !previous.speedBackfill && !previous.update || previous.sessionID !== record.sessionID || previous.cost !== record.cost || !tokenCountsEqual(previous.tokens, record.tokens)) return record;
+  const priorUpdate = coerceCompletionUpdate(previous.update);
+  const nextUpdate = coerceCompletionUpdate(record.update);
+  if (previous.speedBackfill && !priorUpdate && nextUpdate) return record;
+  if (priorUpdate && nextUpdate && isNewerCompletionUpdate(nextUpdate, priorUpdate)) return record;
+  if (sameSpeedContribution(record.speed, previous.speed)) return record;
+  return {
+    ...record,
+    speed: coerceSpeedContribution(previous.speed)
+  };
 }
 function contributionNumbers(record) {
   if (typeof record.sessionID !== "string" || record.sessionID.length === 0) return undefined;
@@ -3134,6 +3241,12 @@ function coerceOpenContribution(value) {
     } : {}),
     ...(value.update !== undefined ? {
       update: coerceCompletionUpdate(value.update)
+    } : {}),
+    ...(isRecord(value.speedBackfill) && value.speedBackfill.version === 1 && value.speedBackfill.source === "server" ? {
+      speedBackfill: {
+        version: 1,
+        source: "server"
+      }
     } : {})
   };
 }
@@ -3197,8 +3310,8 @@ function activeStats(state, now, bytesPerToken) {
     rate: measured.rate,
     status: measured.status,
     generated: generatedTokens(tokens),
-    ...(state.firstTokenAt !== undefined ? {
-      ttft: Math.max(0, state.firstTokenAt - state.startedAt)
+    ...((state.firstResponseAt ?? state.firstTokenAt) !== undefined ? {
+      ttft: Math.max(0, (state.firstResponseAt ?? state.firstTokenAt) - state.startedAt)
     } : {}),
     elapsed: Math.max(0, now - state.startedAt)
   };
@@ -3224,13 +3337,13 @@ export function liveLabel(store, sessionID, bytesPerToken, width, now = Date.now
   const last = store.lastCompletedBySession.get(sessionID);
   if (last) {
     const prefix = last.estimated ? "LAST ~" : "LAST ";
-    const rate = `${prefix}${formatCompactRate(last.rate)}`;
+    const rate = last.available === false ? "LAST --" : `${prefix}${formatCompactRate(last.rate)} ${last.basis ?? ""}`.trimEnd();
     const totalGenerated = runtime && runtime.runEpoch > 0 ? runGenerated : last.generated;
     if (width < 34) return rate;
     if (width < 58) {
       return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)}`;
     }
-    return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)} elapsed ${formatDuration(last.elapsed)} total ${formatCompactNumber(totalGenerated)}`;
+    return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)} measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)} total ${formatCompactNumber(totalGenerated)}`;
   }
   return "IDLE";
 }
@@ -3264,34 +3377,34 @@ function warnWithToast(api, message, error) {
 }
 function Header(props) {
   return (() => {
-    var _el$65 = _$createElement("box"),
-      _el$66 = _$createElement("text"),
+    var _el$67 = _$createElement("box"),
       _el$68 = _$createElement("text"),
-      _el$69 = _$createTextNode(`session `);
-    _$insertNode(_el$65, _el$66);
-    _$insertNode(_el$65, _el$68);
-    _$setProp(_el$65, "height", 2);
-    _$setProp(_el$65, "paddingX", 1);
-    _$setProp(_el$65, "flexDirection", "column");
-    _$insertNode(_el$66, _$createTextNode(`OC TPS / history`));
-    _$insertNode(_el$68, _el$69);
-    _$setProp(_el$68, "truncate", true);
-    _$setProp(_el$68, "wrapMode", "none");
-    _$insert(_el$68, () => shortTail(props.sessionID, 18), null);
+      _el$70 = _$createElement("text"),
+      _el$71 = _$createTextNode(`session `);
+    _$insertNode(_el$67, _el$68);
+    _$insertNode(_el$67, _el$70);
+    _$setProp(_el$67, "height", 2);
+    _$setProp(_el$67, "paddingX", 1);
+    _$setProp(_el$67, "flexDirection", "column");
+    _$insertNode(_el$68, _$createTextNode(`OC TPS / history`));
+    _$insertNode(_el$70, _el$71);
+    _$setProp(_el$70, "truncate", true);
+    _$setProp(_el$70, "wrapMode", "none");
+    _$insert(_el$70, () => shortTail(props.sessionID, 18), null);
     _$effect(_p$ => {
       var _v$38 = props.theme.current.backgroundPanel,
         _v$39 = props.theme.current.primary,
         _v$40 = props.theme.current.textMuted;
-      _v$38 !== _p$.e && (_p$.e = _$setProp(_el$65, "backgroundColor", _v$38, _p$.e));
-      _v$39 !== _p$.t && (_p$.t = _$setProp(_el$66, "fg", _v$39, _p$.t));
-      _v$40 !== _p$.a && (_p$.a = _$setProp(_el$68, "fg", _v$40, _p$.a));
+      _v$38 !== _p$.e && (_p$.e = _$setProp(_el$67, "backgroundColor", _v$38, _p$.e));
+      _v$39 !== _p$.t && (_p$.t = _$setProp(_el$68, "fg", _v$39, _p$.t));
+      _v$40 !== _p$.a && (_p$.a = _$setProp(_el$70, "fg", _v$40, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined
     });
-    return _el$65;
+    return _el$67;
   })();
 }
 function SummaryBlock(props) {
@@ -3303,30 +3416,30 @@ function SummaryBlock(props) {
     return [...summaryLines("Session only", rollup.direct.tokens, rollup.direct.cost, rollup.direct.responseCount), ...summaryLines("Including subagents", rollup.including.tokens, rollup.including.cost, rollup.including.responseCount)];
   });
   return (() => {
-    var _el$70 = _$createElement("box"),
-      _el$71 = _$createElement("text");
-    _$insertNode(_el$70, _el$71);
-    _$setProp(_el$70, "paddingX", 1);
-    _$setProp(_el$70, "flexDirection", "column");
-    _$insertNode(_el$71, _$createTextNode(`totals`));
-    _$insert(_el$70, () => lines().map(line => (() => {
-      var _el$73 = _$createElement("text");
-      _$setProp(_el$73, "wrapMode", "word");
-      _$insert(_el$73, line);
-      _$effect(_$p => _$setProp(_el$73, "fg", props.theme.current.text, _$p));
-      return _el$73;
+    var _el$72 = _$createElement("box"),
+      _el$73 = _$createElement("text");
+    _$insertNode(_el$72, _el$73);
+    _$setProp(_el$72, "paddingX", 1);
+    _$setProp(_el$72, "flexDirection", "column");
+    _$insertNode(_el$73, _$createTextNode(`totals`));
+    _$insert(_el$72, () => lines().map(line => (() => {
+      var _el$75 = _$createElement("text");
+      _$setProp(_el$75, "wrapMode", "word");
+      _$insert(_el$75, line);
+      _$effect(_$p => _$setProp(_el$75, "fg", props.theme.current.text, _$p));
+      return _el$75;
     })()), null);
     _$effect(_p$ => {
       var _v$41 = props.theme.current.background,
         _v$42 = props.theme.current.secondary;
-      _v$41 !== _p$.e && (_p$.e = _$setProp(_el$70, "backgroundColor", _v$41, _p$.e));
-      _v$42 !== _p$.t && (_p$.t = _$setProp(_el$71, "fg", _v$42, _p$.t));
+      _v$41 !== _p$.e && (_p$.e = _$setProp(_el$72, "backgroundColor", _v$41, _p$.e));
+      _v$42 !== _p$.t && (_p$.t = _$setProp(_el$73, "fg", _v$42, _p$.t));
       return _p$;
     }, {
       e: undefined,
       t: undefined
     });
-    return _el$70;
+    return _el$72;
   })();
 }
 function HistoryView(props) {
@@ -3335,23 +3448,25 @@ function HistoryView(props) {
     return recentRecords(props.store.records, props.sessionID, props.store);
   });
   return (() => {
-    var _el$74 = _$createElement("box"),
-      _el$75 = _$createElement("box"),
-      _el$76 = _$createElement("text"),
-      _el$78 = _$createElement("scrollbox");
-    _$insertNode(_el$74, _el$75);
-    _$insertNode(_el$74, _el$78);
-    _$setProp(_el$74, "flexDirection", "column");
-    _$setProp(_el$74, "flexGrow", 1);
-    _$insert(_el$74, _$createComponent(Header, {
+    var _el$76 = _$createElement("box"),
+      _el$77 = _$createElement("box"),
+      _el$78 = _$createElement("text"),
+      _el$80 = _$createElement("text"),
+      _el$82 = _$createElement("scrollbox");
+    _$insertNode(_el$76, _el$77);
+    _$insertNode(_el$76, _el$80);
+    _$insertNode(_el$76, _el$82);
+    _$setProp(_el$76, "flexDirection", "column");
+    _$setProp(_el$76, "flexGrow", 1);
+    _$insert(_el$76, _$createComponent(Header, {
       get theme() {
         return props.api.theme;
       },
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$75);
-    _$insert(_el$74, _$createComponent(SummaryBlock, {
+    }), _el$77);
+    _$insert(_el$76, _$createComponent(SummaryBlock, {
       get theme() {
         return props.api.theme;
       },
@@ -3361,51 +3476,57 @@ function HistoryView(props) {
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$75);
-    _$insertNode(_el$75, _el$76);
-    _$setProp(_el$75, "height", 1);
-    _$setProp(_el$75, "paddingX", 1);
-    _$insertNode(_el$76, _$createTextNode(`TIME SESSION MODEL OUT/REAS AVG MAX MIN TTFT DUR COST SPARK`));
-    _$setProp(_el$76, "truncate", true);
-    _$setProp(_el$76, "wrapMode", "none");
-    _$setProp(_el$78, "flexGrow", 1);
-    _$setProp(_el$78, "flexDirection", "column");
-    _$setProp(_el$78, "paddingX", 1);
-    _$setProp(_el$78, "stickyScroll", true);
-    _$setProp(_el$78, "stickyStart", "top");
-    _$insert(_el$78, (() => {
-      var _c$6 = _$memo(() => rows().length === 0);
-      return () => _c$6() ? (() => {
-        var _el$79 = _$createElement("text");
-        _$insertNode(_el$79, _$createTextNode(`No completed responses yet`));
-        _$effect(_$p => _$setProp(_el$79, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$79;
+    }), _el$77);
+    _$insertNode(_el$77, _el$78);
+    _$setProp(_el$77, "height", 1);
+    _$setProp(_el$77, "paddingX", 1);
+    _$insertNode(_el$78, _$createTextNode(`TIME SESSION MODEL OUT/REAS AVG BASIS MAX~ MIN~ TTFT DUR COST SPARK`));
+    _$setProp(_el$78, "truncate", true);
+    _$setProp(_el$78, "wrapMode", "none");
+    _$insertNode(_el$80, _$createTextNode(`AVG uses the shown basis; ~ is estimated. MAX/MIN are windowed arrival estimates; -- means unavailable.`));
+    _$setProp(_el$80, "paddingX", 1);
+    _$setProp(_el$80, "wrapMode", "word");
+    _$setProp(_el$82, "flexGrow", 1);
+    _$setProp(_el$82, "flexDirection", "column");
+    _$setProp(_el$82, "paddingX", 1);
+    _$setProp(_el$82, "stickyScroll", true);
+    _$setProp(_el$82, "stickyStart", "top");
+    _$insert(_el$82, (() => {
+      var _c$7 = _$memo(() => rows().length === 0);
+      return () => _c$7() ? (() => {
+        var _el$83 = _$createElement("text");
+        _$insertNode(_el$83, _$createTextNode(`No completed responses yet`));
+        _$effect(_$p => _$setProp(_el$83, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$83;
       })() : rows().map(record => (() => {
-        var _el$81 = _$createElement("text");
-        _$setProp(_el$81, "truncate", true);
-        _$setProp(_el$81, "wrapMode", "none");
-        _$insert(_el$81, () => formatHistoryRow(record));
-        _$effect(_$p => _$setProp(_el$81, "fg", props.api.theme.current.text, _$p));
-        return _el$81;
+        var _el$85 = _$createElement("text");
+        _$setProp(_el$85, "truncate", true);
+        _$setProp(_el$85, "wrapMode", "none");
+        _$insert(_el$85, () => formatHistoryRow(record));
+        _$effect(_$p => _$setProp(_el$85, "fg", props.api.theme.current.text, _$p));
+        return _el$85;
       })());
     })());
     _$effect(_p$ => {
       var _v$43 = props.api.theme.current.background,
         _v$44 = props.api.theme.current.backgroundElement,
         _v$45 = props.api.theme.current.textMuted,
-        _v$46 = props.api.theme.current.background;
-      _v$43 !== _p$.e && (_p$.e = _$setProp(_el$74, "backgroundColor", _v$43, _p$.e));
-      _v$44 !== _p$.t && (_p$.t = _$setProp(_el$75, "backgroundColor", _v$44, _p$.t));
-      _v$45 !== _p$.a && (_p$.a = _$setProp(_el$76, "fg", _v$45, _p$.a));
-      _v$46 !== _p$.o && (_p$.o = _$setProp(_el$78, "backgroundColor", _v$46, _p$.o));
+        _v$46 = props.api.theme.current.textMuted,
+        _v$47 = props.api.theme.current.background;
+      _v$43 !== _p$.e && (_p$.e = _$setProp(_el$76, "backgroundColor", _v$43, _p$.e));
+      _v$44 !== _p$.t && (_p$.t = _$setProp(_el$77, "backgroundColor", _v$44, _p$.t));
+      _v$45 !== _p$.a && (_p$.a = _$setProp(_el$78, "fg", _v$45, _p$.a));
+      _v$46 !== _p$.o && (_p$.o = _$setProp(_el$80, "fg", _v$46, _p$.o));
+      _v$47 !== _p$.i && (_p$.i = _$setProp(_el$82, "backgroundColor", _v$47, _p$.i));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined,
-      o: undefined
+      o: undefined,
+      i: undefined
     });
-    return _el$74;
+    return _el$76;
   })();
 }
 function PromptRight(props) {
@@ -3415,12 +3536,12 @@ function PromptRight(props) {
     return liveLabel(props.store, props.sessionID, props.options.bytesPerToken, Math.max(1, props.api.renderer.width), Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
   });
   return (() => {
-    var _el$82 = _$createElement("text");
-    _$setProp(_el$82, "truncate", true);
-    _$setProp(_el$82, "wrapMode", "none");
-    _$insert(_el$82, label);
-    _$effect(_$p => _$setProp(_el$82, "fg", props.api.theme.current.accent, _$p));
-    return _el$82;
+    var _el$86 = _$createElement("text");
+    _$setProp(_el$86, "truncate", true);
+    _$setProp(_el$86, "wrapMode", "none");
+    _$insert(_el$86, label);
+    _$effect(_$p => _$setProp(_el$86, "fg", props.api.theme.current.accent, _$p));
+    return _el$86;
   })();
 }
 function knownToolWaiting(api, store, sessionID) {
@@ -3507,114 +3628,114 @@ function BottomContent(props) {
     togglePulse(props.store);
   };
   return (() => {
-    var _el$83 = _$createElement("box"),
-      _el$84 = _$createElement("box"),
-      _el$85 = _$createElement("text"),
-      _el$86 = _$createElement("text");
-    _$insertNode(_el$83, _el$84);
-    _$insertNode(_el$83, _el$86);
-    _$setProp(_el$83, "flexDirection", "column");
-    _$setProp(_el$83, "width", "100%");
-    _$setProp(_el$83, "paddingTop", 1);
-    _$setProp(_el$83, "paddingX", 1);
-    _$setProp(_el$83, "overflow", "hidden");
-    _$setProp(_el$83, "flexShrink", 0);
-    _$insertNode(_el$84, _el$85);
-    _$setProp(_el$84, "focusable", true);
-    _$setProp(_el$84, "width", "100%");
-    _$setProp(_el$84, "height", 1);
-    _$setProp(_el$84, "paddingX", 1);
-    _$setProp(_el$84, "onMouseDown", onPulseMouseDown);
-    _$setProp(_el$85, "truncate", true);
-    _$setProp(_el$85, "wrapMode", "none");
-    _$insert(_el$85, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
-    _$setProp(_el$86, "width", "100%");
-    _$setProp(_el$86, "paddingX", 1);
-    _$setProp(_el$86, "truncate", true);
-    _$setProp(_el$86, "wrapMode", "none");
-    _$insert(_el$86, metricLabel);
-    _$insert(_el$83, (() => {
-      var _c$7 = _$memo(() => !!expanded());
-      return () => _c$7() && (!sessionID() ? (() => {
-        var _el$87 = _$createElement("text");
-        _$insertNode(_el$87, _$createTextNode(`No active session`));
-        _$setProp(_el$87, "paddingTop", 1);
-        _$setProp(_el$87, "truncate", true);
-        _$setProp(_el$87, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$87, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$87;
+    var _el$87 = _$createElement("box"),
+      _el$88 = _$createElement("box"),
+      _el$89 = _$createElement("text"),
+      _el$90 = _$createElement("text");
+    _$insertNode(_el$87, _el$88);
+    _$insertNode(_el$87, _el$90);
+    _$setProp(_el$87, "flexDirection", "column");
+    _$setProp(_el$87, "width", "100%");
+    _$setProp(_el$87, "paddingTop", 1);
+    _$setProp(_el$87, "paddingX", 1);
+    _$setProp(_el$87, "overflow", "hidden");
+    _$setProp(_el$87, "flexShrink", 0);
+    _$insertNode(_el$88, _el$89);
+    _$setProp(_el$88, "focusable", true);
+    _$setProp(_el$88, "width", "100%");
+    _$setProp(_el$88, "height", 1);
+    _$setProp(_el$88, "paddingX", 1);
+    _$setProp(_el$88, "onMouseDown", onPulseMouseDown);
+    _$setProp(_el$89, "truncate", true);
+    _$setProp(_el$89, "wrapMode", "none");
+    _$insert(_el$89, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
+    _$setProp(_el$90, "width", "100%");
+    _$setProp(_el$90, "paddingX", 1);
+    _$setProp(_el$90, "truncate", true);
+    _$setProp(_el$90, "wrapMode", "none");
+    _$insert(_el$90, metricLabel);
+    _$insert(_el$87, (() => {
+      var _c$8 = _$memo(() => !!expanded());
+      return () => _c$8() && (!sessionID() ? (() => {
+        var _el$91 = _$createElement("text");
+        _$insertNode(_el$91, _$createTextNode(`No active session`));
+        _$setProp(_el$91, "paddingTop", 1);
+        _$setProp(_el$91, "truncate", true);
+        _$setProp(_el$91, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$91, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$91;
       })() : [(() => {
-        var _el$89 = _$createElement("text"),
-          _el$90 = _$createTextNode(`session `);
-        _$insertNode(_el$89, _el$90);
-        _$setProp(_el$89, "paddingTop", 1);
-        _$setProp(_el$89, "truncate", true);
-        _$setProp(_el$89, "wrapMode", "none");
-        _$insert(_el$89, () => shortTail(sessionID(), 18), null);
-        _$effect(_$p => _$setProp(_el$89, "fg", props.api.theme.current.secondary, _$p));
-        return _el$89;
+        var _el$93 = _$createElement("text"),
+          _el$94 = _$createTextNode(`session `);
+        _$insertNode(_el$93, _el$94);
+        _$setProp(_el$93, "paddingTop", 1);
+        _$setProp(_el$93, "truncate", true);
+        _$setProp(_el$93, "wrapMode", "none");
+        _$insert(_el$93, () => shortTail(sessionID(), 18), null);
+        _$effect(_$p => _$setProp(_el$93, "fg", props.api.theme.current.secondary, _$p));
+        return _el$93;
       })(), _$memo(() => sections().map((section, index) => [_$createComponent(PulseSection, {
         get theme() {
           return props.api.theme;
         },
         section: section
       }), index === 0 && (() => {
-        var _el$94 = _$createElement("box"),
-          _el$95 = _$createElement("text"),
-          _el$96 = _$createElement("text");
-        _$insertNode(_el$94, _el$95);
-        _$insertNode(_el$94, _el$96);
-        _$setProp(_el$94, "flexDirection", "column");
-        _$setProp(_el$94, "width", "100%");
-        _$setProp(_el$94, "paddingX", 1);
-        _$setProp(_el$94, "flexShrink", 0);
-        _$setProp(_el$95, "wrapMode", "word");
-        _$setProp(_el$95, "flexShrink", 0);
-        _$insert(_el$95, () => average().label);
-        _$setProp(_el$96, "wrapMode", "word");
-        _$setProp(_el$96, "flexShrink", 0);
-        _$insert(_el$96, () => average().value);
-        _$insert(_el$94, (() => {
-          var _c$8 = _$memo(() => !!average().coverage);
-          return () => _c$8() && (() => {
-            var _el$97 = _$createElement("text");
-            _$setProp(_el$97, "wrapMode", "word");
-            _$setProp(_el$97, "flexShrink", 0);
-            _$insert(_el$97, () => average().coverage);
-            _$effect(_$p => _$setProp(_el$97, "fg", props.api.theme.current.textMuted, _$p));
-            return _el$97;
+        var _el$98 = _$createElement("box"),
+          _el$99 = _$createElement("text"),
+          _el$100 = _$createElement("text");
+        _$insertNode(_el$98, _el$99);
+        _$insertNode(_el$98, _el$100);
+        _$setProp(_el$98, "flexDirection", "column");
+        _$setProp(_el$98, "width", "100%");
+        _$setProp(_el$98, "paddingX", 1);
+        _$setProp(_el$98, "flexShrink", 0);
+        _$setProp(_el$99, "wrapMode", "word");
+        _$setProp(_el$99, "flexShrink", 0);
+        _$insert(_el$99, () => average().label);
+        _$setProp(_el$100, "wrapMode", "word");
+        _$setProp(_el$100, "flexShrink", 0);
+        _$insert(_el$100, () => average().value);
+        _$insert(_el$98, (() => {
+          var _c$9 = _$memo(() => !!average().coverage);
+          return () => _c$9() && (() => {
+            var _el$101 = _$createElement("text");
+            _$setProp(_el$101, "wrapMode", "word");
+            _$setProp(_el$101, "flexShrink", 0);
+            _$insert(_el$101, () => average().coverage);
+            _$effect(_$p => _$setProp(_el$101, "fg", props.api.theme.current.textMuted, _$p));
+            return _el$101;
           })();
         })(), null);
         _$effect(_p$ => {
-          var _v$50 = props.api.theme.current.textMuted,
-            _v$51 = props.api.theme.current.accent;
-          _v$50 !== _p$.e && (_p$.e = _$setProp(_el$95, "fg", _v$50, _p$.e));
-          _v$51 !== _p$.t && (_p$.t = _$setProp(_el$96, "fg", _v$51, _p$.t));
+          var _v$51 = props.api.theme.current.textMuted,
+            _v$52 = props.api.theme.current.accent;
+          _v$51 !== _p$.e && (_p$.e = _$setProp(_el$99, "fg", _v$51, _p$.e));
+          _v$52 !== _p$.t && (_p$.t = _$setProp(_el$100, "fg", _v$52, _p$.t));
           return _p$;
         }, {
           e: undefined,
           t: undefined
         });
-        return _el$94;
-      })()])), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
-        var _el$98 = _$createElement("text");
-        _$insertNode(_el$98, _$createTextNode(`No completed responses yet`));
-        _$setProp(_el$98, "paddingTop", 1);
-        _$setProp(_el$98, "truncate", true);
-        _$setProp(_el$98, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$98, "fg", props.api.theme.current.textMuted, _$p));
         return _el$98;
+      })()])), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
+        var _el$102 = _$createElement("text");
+        _$insertNode(_el$102, _$createTextNode(`No completed responses yet`));
+        _$setProp(_el$102, "paddingTop", 1);
+        _$setProp(_el$102, "truncate", true);
+        _$setProp(_el$102, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$102, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$102;
       })()), (() => {
-        var _el$91 = _$createElement("box"),
-          _el$92 = _$createElement("text");
-        _$insertNode(_el$91, _el$92);
-        _$setProp(_el$91, "flexDirection", "column");
-        _$setProp(_el$91, "width", "100%");
-        _$setProp(_el$91, "paddingTop", 1);
-        _$insertNode(_el$92, _$createTextNode(`SESSION RUN`));
-        _$setProp(_el$92, "truncate", true);
-        _$setProp(_el$92, "wrapMode", "none");
-        _$insert(_el$91, _$createComponent(PulseMetricGrid, {
+        var _el$95 = _$createElement("box"),
+          _el$96 = _$createElement("text");
+        _$insertNode(_el$95, _el$96);
+        _$setProp(_el$95, "flexDirection", "column");
+        _$setProp(_el$95, "width", "100%");
+        _$setProp(_el$95, "paddingTop", 1);
+        _$insertNode(_el$96, _$createTextNode(`SESSION RUN`));
+        _$setProp(_el$96, "truncate", true);
+        _$setProp(_el$96, "wrapMode", "none");
+        _$insert(_el$95, _$createComponent(PulseMetricGrid, {
           get theme() {
             return props.api.theme;
           },
@@ -3625,8 +3746,8 @@ function BottomContent(props) {
             }]];
           }
         }), null);
-        _$effect(_$p => _$setProp(_el$92, "fg", props.api.theme.current.accent, _$p));
-        return _el$91;
+        _$effect(_$p => _$setProp(_el$96, "fg", props.api.theme.current.accent, _$p));
+        return _el$95;
       })(), _$memo(() => _$memo(() => rows().length > 0)() && _$createComponent(ChildAgentRows, {
         get theme() {
           return props.api.theme;
@@ -3637,19 +3758,19 @@ function BottomContent(props) {
       }))]);
     })(), null);
     _$effect(_p$ => {
-      var _v$47 = props.api.theme.current.backgroundElement,
-        _v$48 = props.api.theme.current.primary,
-        _v$49 = props.api.theme.current.textMuted;
-      _v$47 !== _p$.e && (_p$.e = _$setProp(_el$84, "backgroundColor", _v$47, _p$.e));
-      _v$48 !== _p$.t && (_p$.t = _$setProp(_el$85, "fg", _v$48, _p$.t));
-      _v$49 !== _p$.a && (_p$.a = _$setProp(_el$86, "fg", _v$49, _p$.a));
+      var _v$48 = props.api.theme.current.backgroundElement,
+        _v$49 = props.api.theme.current.primary,
+        _v$50 = props.api.theme.current.textMuted;
+      _v$48 !== _p$.e && (_p$.e = _$setProp(_el$88, "backgroundColor", _v$48, _p$.e));
+      _v$49 !== _p$.t && (_p$.t = _$setProp(_el$89, "fg", _v$49, _p$.t));
+      _v$50 !== _p$.a && (_p$.a = _$setProp(_el$90, "fg", _v$50, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined
     });
-    return _el$83;
+    return _el$87;
   })();
 }
 export function createTuiSlotPlugin(api, store, options) {
@@ -3840,7 +3961,7 @@ const tui = async (api, rawOptions) => {
       }
       if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
       if (type === "message.part.updated") {
-        recordTuiPartMetadata(store, properties);
+        recordTuiPartMetadata(store, properties, event);
         return;
       }
       if (type === "message.part.delta") {
