@@ -460,13 +460,30 @@ test("total token count includes cache writes and collapsed pulse shows speed", 
   assert.equal(cacheHitRate(mixed), 2 / 12);
   assert.equal(cacheHitRate({ ...mixed, cacheWrite: 900 }), 2 / 912);
   assert.equal(formatCacheHitRate(cacheHitRate(mixed)), "17%");
-  assert.equal(formatPulseMetrics(counts, 293), "incl TPS ~293 · 937 total · cache 0%");
-  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, undefined), "incl TPS -- · 900 total · cache 0%");
-  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  incl TPS ~293 · 937 total · cache 0%");
-  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  incl TPS ~0 · 900 total · cache 0%");
-  assert.equal(formatPulseMetrics(counts, 293, 14), "incl TPS ~293");
-  assert.equal(formatPulseMetrics(counts, 57500, 14), "incl ~57.5k/s");
-  assert.equal(formatPulseMetrics(counts, undefined, 14), "incl TPS --");
+  assert.equal(formatPulseMetrics(counts, 293), "937 total · ~293 tok/s · cache 0% · time --");
+  assert.equal(formatPulseMetrics({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, undefined), "900 total · -- tok/s · cache 0% · time --");
+  assert.equal(formatPulseSummary(counts, 293), "+ Token Pulse  937 total · ~293 tok/s · cache 0% · time --");
+  assert.equal(formatPulseSummary({ ...counts, input: 0, output: 0, reasoning: 0, cacheRead: 0 }, 0), "+ Token Pulse  900 total · ~0 tok/s · cache 0% · time --");
+  assert.equal(formatPulseMetrics(counts, 293, 14), "937 total\n~293 tok/s\ncache 0%\ntime --");
+  assert.equal(formatPulseMetrics(counts, 57500, 14), "937 total\n~57.5k tok/s\ncache 0%\ntime --");
+  assert.equal(formatPulseMetrics(counts, undefined, 14), "937 total\n-- tok/s\ncache 0%\ntime --");
+});
+
+test("compact metrics preserve every whole value/unit field at actual sidebar widths and retain known task time", () => {
+  const counts = { input: 3_900_000, cacheRead: 6_100_000, output: 6_300_000, reasoning: 0, cacheWrite: 0 };
+  const elapsed = (123 * 3600 + 45 * 60 + 56) * 1000;
+  for (const width of [16, 20, 24, 28]) for (const speed of [57_500, undefined]) {
+    const text = formatPulseMetrics(counts, speed, width, elapsed);
+    for (const field of ["16.3M total", speed === undefined ? "-- tok/s" : "~57.5k tok/s", "cache 61%", "time 123h45m56s"]) {
+      assert.ok(text.split("\n").some((line) => line.includes(field)), `${width}: ${field} must remain whole`);
+    }
+    assert.ok(text.split("\n").every((line) => line.length <= width));
+    assert.doesNotMatch(text, /\.\.\.|…|incl TPS/);
+    assert.ok(text.split("\n").length <= 4);
+  }
+  assert.equal(formatPulseMetrics(counts, undefined, 0, undefined), "16.3M total\n-- tok/s\ncache 61%\ntime --");
+  assert.match(formatPulseMetrics(counts, undefined, 28, 0), /time 0ms/);
+  assert.match(formatPulseMetrics(counts, undefined, 28, Number.NaN), /time --/);
 });
 
 test("aggregate speed is generated-weighted instead of response-average", () => {
@@ -598,7 +615,8 @@ test("slot registration appends sidebar content without taking the footer or app
   assert.match(source, /focusable[\s\S]*onMouseDown/);
   assert.match(source, /\+ Token Pulse/);
   assert.match(source, /- Token Pulse/);
-  assert.match(source, /formatPulseMetrics\(summary\.tokens, summary\.speed, metricWidth\(\)\)/);
+  assert.match(source, /formatPulseMetrics\(summary\.tokens, summary\.speed, metricWidth\(\), taskWallTime\(\)\)/);
+  assert.doesNotMatch(source, /metricWidth.*renderer\.width/);
   assert.match(source, /displayedSessionID\(props\.store, props\.sessionID\)/);
   assert.doesNotMatch(source, /setFocusSession\(store, (sessionID|eventSessionID)\)/);
   assert.doesNotMatch(source, /focusSessionID \?\? props\.sessionID/);
@@ -1440,7 +1458,7 @@ test("main average uses ratio of cumulative sums and identifies partial estimate
   assert.deepEqual(sessionAverageDisplay(summary), { label: "Main avg TPS", value: "~18 tok/s", coverage: "Observed 2/3 calls" });
   const response = updateSpeedTotals(emptySpeedTotals(), { response: { generatedTokens: 150, durationMs: 3000, estimated: true } }, 1);
   store.totalsLedger.sessions.root = { tokens: tokens(150, 0), cost: 0, responseCount: 1, speed: response };
-  assert.deepEqual(sessionAverageDisplay(sessionUsageSummary(store, "root")), { label: "Main avg TPS", value: "--", coverage: "Observed 0/1 calls" });
+  assert.deepEqual(sessionAverageDisplay(sessionUsageSummary(store, "root")), { label: "Main avg TPS", value: "--", coverage: "Observed 0/1 calls", diagnostic: "No qualified generation timing." });
   assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "missing")).value, "--");
   store.disposeSignals();
 });

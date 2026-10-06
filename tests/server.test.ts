@@ -107,7 +107,7 @@ test("busy/user/historical/completed/reconnect snapshots cannot create metadata-
   await backend(async ({ path, send }) => {
     await send({ type: "session.status", timestamp: 0, properties: { sessionID: "s", status: "busy" } });
     await send(thinking("busy"));
-    await send(started("history", 0, 5000)); await send(thinking("history"));
+    await send(started("history", -1, 5000)); await send(thinking("history"));
     await send(started("snapshot", 0, 0, { source: "snapshot" })); await send(thinking("snapshot"));
     await send({ type: "message.updated", timestamp: 0, properties: { info: { id: "user", sessionID: "s", role: "user", time: { created: 0 } } } });
     await send(thinking("user"));
@@ -203,6 +203,100 @@ async function officialGeneration(send: (event: any) => Promise<void>, beforeDel
     type: "message.part.updated", timestamp: 1300, properties: { part: { id, type, messageID: "m", sessionID: "s", text, time: { end: 1300 } } } });
   await send(completed("m", 10, 6, 1500));
 }
+
+async function officialTextStart(send: (event: any) => Promise<void>, id: string, created = 0, received = created) {
+  await send(started(id, created, received));
+  await send({ type: "message.part.updated", timestamp: received, properties: { part: {
+    id: `${id}-step`, messageID: id, sessionID: "s", type: "step-start" } } });
+  await textSnapshot(send, id, "", received);
+}
+async function textSnapshot(send: (event: any) => Promise<void>, id: string, text: string, received: number, final = false) {
+  await send({ type: "message.part.updated", timestamp: received, properties: { part: {
+    id: `${id}-text`, messageID: id, sessionID: "s", type: "text", text,
+    ...(final ? { time: { end: received } } : {}) } } });
+}
+async function officialTextComplete(send: (event: any) => Promise<void>, id: string, output: number, created: number, end: number) {
+  const event = completed(id, output, 0, end);
+  await send({ ...event, properties: { info: { ...event.properties.info, time: { created, completed: end } } } });
+}
+
+test("official pending snapshots before corresponding deltas resolve without inventing boundaries", async () => {
+  await backend(async ({ path, send }) => {
+    await officialTextStart(send, "m");
+    await textSnapshot(send, "m", "hello", 50);
+    await send(delta("m", 100, "m-text", "hello"));
+    await textSnapshot(send, "m", "helloworld", 1100);
+    await send(delta("m", 1200, "m-text", "world"));
+    await textSnapshot(send, "m", "helloworld", 1300, true);
+    await officialTextComplete(send, "m", 10, 0, 1500);
+    const [record] = await records(path);
+    assert.equal(record.time.firstContent, 100);
+    assert.equal(record.speed?.generation?.durationMs, 1100);
+    assert.equal(record.speed?.generation?.generatedTokens, 5);
+    assert.equal(record.speed?.generationEvidence?.start, 100);
+    assert.equal(record.speed?.generationEvidence?.end, 1200);
+  });
+});
+
+test("official trimmed final trailing newline preserves raw arrival byte calibration", async () => {
+  await backend(async ({ path, send }) => {
+    await officialTextStart(send, "m");
+    await send(delta("m", 100, "m-text", "hello"));
+    await send(delta("m", 1200, "m-text", "world\n"));
+    await textSnapshot(send, "m", "helloworld", 1300, true);
+    await officialTextComplete(send, "m", 10, 0, 1500);
+    const [record] = await records(path);
+    assert.equal(record.speed?.generation?.durationMs, 1100);
+    assert.equal(record.speed?.generation?.generatedTokens, 60 / 11);
+    assert.equal(record.speed?.generation?.coverageGeneratedTokens, 10);
+    assert.deepEqual(record.speed?.generationEvidence?.bytes?.output, { total: 11, firstBatch: 5 });
+    assert.equal(record.samples.reduce((sum, sample) => sum + (sample.bytes ?? 0), 0), 11);
+  });
+});
+
+test("official clean assistant start delayed 1.5s remains eligible after the startup epoch", async () => {
+  await backend(async ({ path, send }) => {
+    await officialTextStart(send, "m", 0, 1500);
+    await send(delta("m", 1600, "m-text", "hello"));
+    await send(delta("m", 2700, "m-text", "world"));
+    await textSnapshot(send, "m", "helloworld", 2800, true);
+    await officialTextComplete(send, "m", 10, 0, 3000);
+    const [record] = await records(path);
+    assert.equal(record.speed?.generation?.durationMs, 1100);
+    assert.equal(record.speed?.generation?.generatedTokens, 5);
+    assert.equal(record.speed?.generationEvidence?.start, 1600);
+    assert.equal(record.speed?.generationEvidence?.end, 2700);
+  });
+});
+
+test("official tool-call message stays invalid, while independent final plain assistant qualifies without leaked taint", async () => {
+  await backend(async ({ path, send, restart }) => {
+    await send(started("tool-message"));
+    await send({ type: "message.part.updated", timestamp: 0, properties: { part: {
+      id: "tool-step", messageID: "tool-message", sessionID: "s", type: "step-start" } } });
+    await send({ type: "message.part.updated", timestamp: 0, properties: { part: {
+      id: "tool", messageID: "tool-message", sessionID: "s", type: "tool", state: { status: "pending", input: "" } } } });
+    for (const [timestamp, delta] of [[100, "{\"x\":"], [1200, "\"y\"}"]] as const) await send({ type: "message.part.delta", timestamp,
+      properties: { sessionID: "s", messageID: "tool-message", partID: "tool", field: "input", delta } });
+    await officialTextComplete(send, "tool-message", 8, 0, 1500);
+    await officialTextStart(send, "final-message", 1600);
+    await send(delta("final-message", 1700, "final-message-text", "hello"));
+    await send(delta("final-message", 2800, "final-message-text", "world"));
+    await textSnapshot(send, "final-message", "helloworld", 2900, true);
+    await officialTextComplete(send, "final-message", 10, 1600, 3000);
+    const stored = await records(path);
+    assert.equal(stored[0].speed?.generation, undefined);
+    assert.ok(stored[0].speed?.generationCoverage?.reasons.some((reason) => reason.includes("tool-usage-uncertain")));
+    assert.equal(stored[1].speed?.generation?.durationMs, 1100);
+    assert.equal(stored[1].speed?.generation?.generatedTokens, 5);
+    const totals = await createTotalsStorage({ historyPath: path }).read();
+    assert.equal(totals.sessions.s.tokens.output, 18);
+    assert.equal(totals.sessions.s.responseCount, 2);
+    assert.equal(totals.sessions.s.speed?.generation.responseCount, 1);
+    await restart(3100);
+    assert.deepEqual((await records(path))[0].speed?.generationCoverage, stored[0].speed?.generationCoverage);
+  });
+});
 
 test("official assistant/step-start/content/completion events qualify output plus reasoning v3", async () => {
   await backend(async ({ path, send }) => {
@@ -384,7 +478,8 @@ test("step identities deduplicate repeats, while distinct steps invalidate and u
 });
 
 test("complete snapshots cannot supply missing, historic or already-in-progress response ownership", async () => {
-  for (const ownership of ["missing", "historic", "in-progress"]) await backend(async ({ path, send }) => {
+  for (const ownership of ["missing", "historic", "in-progress"]) await backend(async ({ path, send: initialSend, restart }) => {
+    const send = ownership === "historic" ? await restart(1000) : initialSend;
     if (ownership === "historic") await send(started("m", 0, 5000));
     if (ownership === "in-progress") {
       const event = started("m");

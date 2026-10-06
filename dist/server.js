@@ -682,7 +682,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     // Old unfinished snapshots are not evidence of a new response in this runtime.
     if (metadata.completed.has(messageID) || isSnapshotIngress(event, properties)) return;
     const created = numberOrUndefined(info.time?.created ?? info.time?.start);
-    if (created === undefined || created < timestamp - 1000 || created > timestamp) return;
+    if (created === undefined || created < responseRuntime(active).observedSince || created > timestamp) return;
     if (active.get(messageID)?.liveAssistant === false) return;
     for (const candidate of active.values()) {
       if (candidate.sessionID !== sessionID || candidate.messageID === messageID || !candidate.liveAssistant) continue;
@@ -702,7 +702,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     if (state.observedFromStart === undefined) {
       const reportedUsage = tokenFields(info.tokens);
       const alreadyGenerating = [info.time?.firstToken, info.time?.firstContent, info.time?.firstResponse].some(hasNumber) || (reportedUsage.output ?? 0) > 0 || (reportedUsage.reasoning ?? 0) > 0 || ["in_progress", "in-progress", "recovering", "recovered"].includes(info.status);
-      state.observedFromStart = created >= receivedAt - 1000 && created <= receivedAt && created >= responseRuntime(active).observedSince && !alreadyGenerating && !state.legacy.hasData && !state.v2.hasData && ![...cached.parts.values()].some(part => part.snapshotBytes > 0 || part.deltaBytes > 0);
+      state.observedFromStart = created <= receivedAt && created >= responseRuntime(active).observedSince && !alreadyGenerating && !state.legacy.hasData && !state.v2.hasData && ![...cached.parts.values()].some(part => part.snapshotBytes > 0 || part.deltaBytes > 0);
       state.progress = mergeContentProgress(createContentProgress({
         fromCurrentStart: state.observedFromStart
       }), state.progress ?? cached);
@@ -904,7 +904,14 @@ function makeHistoryRecord(input) {
     });
   }
   record.time.ttft = timeToFirstToken(record);
-  record.speed = measureRecordSpeed(record, contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt, input.quality === "exact", numberOrUndefined(infoTime.start ?? infoTime.created) !== undefined && numberOrUndefined(infoTime.end ?? infoTime.completed) !== undefined, tokenFields(input.info?.tokens).reasoning !== undefined));
+  const observations = contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt, input.quality === "exact", numberOrUndefined(infoTime.start ?? infoTime.created) !== undefined && numberOrUndefined(infoTime.end ?? infoTime.completed) !== undefined, tokenFields(input.info?.tokens).reasoning !== undefined);
+  const speed = measureRecordSpeed(record, observations);
+  record.speed = {
+    ...speed,
+    ...(!speed.generation && observations.generationCoverage ? {
+      generationCoverage: observations.generationCoverage
+    } : {})
+  };
   return record;
 }
 function chooseSamples(state) {

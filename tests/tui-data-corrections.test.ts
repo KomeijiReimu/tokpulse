@@ -596,6 +596,32 @@ test("unlabelled recovered assistants predating observation cannot establish a c
   } finally { store.disposeSignals(); }
 });
 
+test("a delayed current assistant start can qualify after 1.5s, but cannot reclaim already observed or pre-epoch content", () => {
+  for (const guard of ["clean", "pre-epoch", "already-observed"] as const) {
+    const store = createRuntimeStore(1, guard === "pre-epoch" ? 1000 : 0);
+    try {
+      if (guard === "already-observed") {
+        send(store, snapshot("p", "m", "text"));
+        send(store, { type: "message.part.delta", timestamp: 100,
+          properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "earlier" } });
+      }
+      beginObserved(store, "m", 10, 1510);
+      assert.equal(store.active.get("m")?.observedFromStart, guard === "clean" ? true : guard === "pre-epoch" ? undefined : false);
+      send(store, snapshot("text", "m", "text"));
+      for (const timestamp of [1600, 2600]) send(store, { type: "message.part.delta", timestamp,
+        properties: { sessionID: "s", messageID: "m", partID: "text", field: "text", delta: "hello" } });
+      send(store, snapshot("text", "m", "text", 2700, "hellohello"));
+      send(store, completion("m", 10, 0, 10, 2800));
+      assert.equal(recordSpeedSummary(store.records[0]).available, guard === "clean", guard);
+      if (guard === "clean") {
+        assert.equal(store.records[0].speed?.generation?.durationMs, 1000);
+        assert.equal(store.records[0].speed?.generation?.generatedTokens, 5);
+        assert.equal(store.records[0].speed?.generation?.coverageGeneratedTokens, 10);
+      }
+    } finally { store.disposeSignals(); }
+  }
+});
+
 test("v3 live usage corrections rescale interval bytes, not full usage, and hidden categories invalidate", () => {
   const store = createRuntimeStore(1, 0);
   try {

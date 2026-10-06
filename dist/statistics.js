@@ -1,9 +1,26 @@
 import { MIN_ROLLING_OBSERVATION_MS } from "./core.js";
 import { createHash } from "node:crypto";
 export const GENERATION_BASIS_VERSION = 3;
+/** Stable rejection codes only: never persist event text, provider errors or
+ * reasoning content as a diagnostic. Bound both input inspection and output. */
+const GENERATION_REJECTION_REASONS = new Set(["unknown-coverage", "generation-invalidated", "invalid-v3-evidence", "missing-content-observation", "not-observed-from-current-start", "unknown-final-usage", "unknown-reasoning-usage", "unattributed-or-merged-deltas", "unknown-or-multiple-step-identities", "unknown-step-identity", "multiple-step-identities", "missing-receive-observations", "insufficient-receive-span", "unfinished-response", "tool-usage-uncertain", "snapshot-delta-gap", "snapshot-delta-mismatch", "missing-comparable-final-snapshot", "missing-byte-receive-timing", "hidden-reasoning", "unobserved-output", "receive-byte-mismatch", "invalid-arrival-bytes", "anonymous-or-tool-arrival", "invalid-receive-clock", "arrival-kind-mismatch", "mixed-streams", "duplicate-or-unparsed-arrival", "nonmonotonic-receive-clock", "merged-receive-streams", "merged-recovered-content", "merged-delta-streams", "unknown-merged-coverage", "anonymous-snapshot", "part-kind-changed", "anonymous-delta", "retry", "failed", "recovery", "disconnect", "transport-disruption", "recovered-content", "unobserved-response-start", "not-current-assistant", "superseded-assistant", "previous-response-disruption", "aborted", "cancelled"]);
+function coerceGenerationCoverage(value) {
+  if (!object(value) || !["complete", "unknown", "gap"].includes(value.status) || !Array.isArray(value.reasons)) return undefined;
+  const reasons = [];
+  for (const reason of value.reasons.slice(0, 64)) {
+    if (typeof reason === "string" && GENERATION_REJECTION_REASONS.has(reason) && !reasons.includes(reason)) reasons.push(reason);
+    if (reasons.length === 8) break;
+  }
+  return {
+    status: value.status,
+    reasons: value.status === "complete" ? [] : reasons.length ? reasons : ["unknown-coverage"]
+  };
+}
 export function measureRecordSpeed(record, observations = {}) {
   const generatedTokens = record.tokens.output + record.tokens.reasoning;
   const speed = {};
+  const coverage = coerceGenerationCoverage(observations.generationCoverage);
+  if (coverage && coverage.status !== "complete") speed.generationCoverage = coverage;
   if (!valid(record.tokens.output) || !valid(record.tokens.reasoning) || !valid(generatedTokens)) return speed;
   speed.response = deriveSafeResponseMeasurement(record, {
     rawTimingKnown: true,
@@ -17,8 +34,13 @@ export function measureRecordSpeed(record, observations = {}) {
     if (measurement) {
       speed.generation = measurement;
       speed.generationEvidence = evidence;
+      delete speed.generationCoverage;
     }
   }
+  if (generation?.complete && !speed.generation) speed.generationCoverage ??= {
+    status: "unknown",
+    reasons: ["invalid-v3-evidence"]
+  };
   return speed;
 }
 
@@ -198,7 +220,9 @@ export function coerceSpeedContribution(value) {
       } : {})
     };
   }
-  return result.generation || result.response ? result : undefined;
+  const coverage = coerceGenerationCoverage(value.generationCoverage);
+  if (coverage) result.generationCoverage = coverage;
+  return result.generation || result.response || result.generationCoverage ? result : undefined;
 }
 
 /** Compatible authoritative usage corrections rescale original v3 proportions.
@@ -213,16 +237,32 @@ export function mergeRecordSpeed(record, previous, generationStatus = "unobserve
   if (generationStatus === "invalidated") {
     delete next.generation;
     delete next.generationEvidence;
+    if (!next.generationCoverage || next.generationCoverage.status === "complete") next.generationCoverage = prior?.generationCoverage?.status !== "complete" && prior?.generationCoverage ? prior.generationCoverage : {
+      status: "unknown",
+      reasons: ["generation-invalidated"]
+    };
     return next;
   }
-  if (next.generation || !prior?.generation || !qualifiedGeneration(prior)) return next;
+  if (next.generation) {
+    delete next.generationCoverage;
+    return next;
+  }
+  if (!next.generationCoverage && prior?.generationCoverage && prior.generationCoverage.status !== "complete") next.generationCoverage = prior.generationCoverage;
+  if (!prior?.generation || !qualifiedGeneration(prior)) return next;
   const evidence = prior.generationEvidence;
   if (!isV3Evidence(evidence) || !valid(record.time.completed)) return next;
   const corrected = copyV3Evidence(evidence, record.tokens);
   const measurement = intervalMeasurement(corrected);
-  if (!measurement) return next;
+  if (!measurement) {
+    next.generationCoverage ??= {
+      status: "unknown",
+      reasons: [record.tokens.reasoning > 0 && evidence.bytes.reasoning.total === 0 ? "hidden-reasoning" : record.tokens.output > 0 && evidence.bytes.output.total === 0 ? "unobserved-output" : "unknown-final-usage"]
+    };
+    return next;
+  }
   next.generation = measurement;
   next.generationEvidence = corrected;
+  delete next.generationCoverage;
   return next;
 }
 export function coerceCompletionUpdate(value) {
@@ -554,17 +594,21 @@ export function mergeContentProgress(target, source) {
     const merged = previous ? {
       ...previous,
       deltaBytes: previous.deltaBytes + incoming.deltaBytes,
-      snapshotBytes: Math.max(previous.snapshotBytes, incoming.snapshotBytes),
+      snapshotBytes: incoming.snapshotDigest !== undefined ? incoming.snapshotBytes : previous.snapshotBytes,
       end: previous.end ?? incoming.end,
       start: previous.start ?? incoming.start,
       finalSnapshotBytes: incoming.finalSnapshotBytes ?? previous.finalSnapshotBytes,
       finalSnapshotDigest: incoming.finalSnapshotDigest ?? previous.finalSnapshotDigest,
+      snapshotDigest: incoming.snapshotDigest ?? previous.snapshotDigest,
       deltaHasher: previous.deltaBytes > 0 ? previous.deltaHasher?.copy() : incoming.deltaHasher?.copy(),
+      trimEndHasher: previous.deltaBytes > 0 ? previous.trimEndHasher?.copy() : incoming.trimEndHasher?.copy(),
+      trimEndBytes: previous.deltaBytes > 0 ? previous.trimEndBytes : incoming.trimEndBytes,
       receivedBytes: (previous.receivedBytes ?? 0) + (incoming.receivedBytes ?? 0),
       knownGap: previous.knownGap || incoming.knownGap
     } : {
       ...incoming,
-      deltaHasher: incoming.deltaHasher?.copy()
+      deltaHasher: incoming.deltaHasher?.copy(),
+      trimEndHasher: incoming.trimEndHasher?.copy()
     };
     target.parts.set(id, merged);
   }
@@ -577,7 +621,9 @@ export function mergeContentProgress(target, source) {
   }
   return target;
 }
-/** Snapshots establish type/progress only; they are not real-time generation. */
+/** Snapshots are pending facts, NOT ingress ordering or evidence of lost deltas.
+ * Even a final-part notification may precede delivery of its deltas. Evaluate
+ * only at actual response completion; preserve per-part final state on repeats. */
 export function notePartSnapshot(progress, properties) {
   const part = properties.part;
   if (!object(part) || typeof part.type !== "string") return;
@@ -595,30 +641,18 @@ export function notePartSnapshot(progress, properties) {
     ...previous,
     type: part.type,
     deltaBytes: previous?.deltaBytes ?? 0,
-    snapshotBytes: Math.max(previous?.snapshotBytes ?? 0, snapshotBytes ?? 0),
+    snapshotBytes: snapshotBytes ?? previous?.snapshotBytes ?? 0,
     start: valid(part.time?.start) ? part.time.start : previous?.start,
     end: part.type === "text" || part.type === "reasoning" ? valid(part.time?.end) ? part.time.end : previous?.end : part.type === "tool" && part.state?.status === "running" && valid(part.state?.time?.start) ? part.state.time.start : previous?.end
   };
-  // Comparing UTF-8 text snapshots to UTF-8 text deltas is meaningful; token
-  // calibration and tool JSON snapshots are not byte-coverage evidence.
+  // A midstream snapshot can legitimately be ahead of host delta delivery.
+  // Store hashes only: no permanent content taint until completion comparison.
   if (["text", "output", "reasoning"].includes(part.type) && snapshotBytes !== undefined) {
-    if (snapshotBytes > entry.deltaBytes) {
-      entry.knownGap = true;
-      taintContentProgress(progress, "snapshot-delta-gap");
-    }
     const snapshotDigest = createHash("sha256").update(part.text).digest("hex");
-    const deltaDigest = (entry.deltaHasher ?? createHash("sha256")).copy().digest("hex");
-    if (snapshotBytes === entry.deltaBytes && snapshotDigest !== deltaDigest) {
-      entry.knownGap = true;
-      taintContentProgress(progress, "snapshot-delta-mismatch");
-    }
+    entry.snapshotDigest = snapshotDigest;
     if (valid(part.time?.end) || properties.final === true) {
       entry.finalSnapshotBytes = snapshotBytes;
       entry.finalSnapshotDigest = snapshotDigest;
-      if (snapshotBytes !== entry.deltaBytes || entry.finalSnapshotDigest !== deltaDigest) {
-        entry.knownGap = true;
-        taintContentProgress(progress, "snapshot-delta-mismatch");
-      }
     }
   }
   progress.parts.set(part.id, entry);
@@ -651,9 +685,22 @@ export function parseModelDelta(progress, properties, event, stream, delta) {
       deltaBytes: 0,
       snapshotBytes: 0
     };
-    entry.deltaBytes += new TextEncoder().encode(delta).length;
     entry.deltaHasher ??= createHash("sha256");
-    entry.deltaHasher.update(delta);
+    if (entry.deltaBytes === 0) {
+      entry.trimEndHasher = createHash("sha256");
+      entry.trimEndBytes = 0;
+    }
+    // Whitespace from earlier chunks remains in the raw hash. If a later
+    // non-whitespace character arrives it becomes INTERNAL content, so its
+    // checkpoint includes that whitespace. No growing trailing-string buffer.
+    const prefix = delta.trimEnd();
+    if (prefix.length) {
+      entry.deltaHasher.update(prefix);
+      entry.trimEndHasher = entry.deltaHasher.copy();
+      entry.trimEndBytes = entry.deltaBytes + new TextEncoder().encode(prefix).length;
+    }
+    entry.deltaHasher.update(delta.slice(prefix.length));
+    entry.deltaBytes += new TextEncoder().encode(delta).length;
     progress.parts.set(partID, entry);
   } else taintContentProgress(progress, "anonymous-delta");
   return {
@@ -680,34 +727,40 @@ export function contentSpeedObservations(record, progress, firstOutput, usageExa
     responseTimingExact
   };
   const reject = (reason, status = "unknown") => {
-    observations.generationCoverage = {
+    observations.generationCoverage = coerceGenerationCoverage({
       status,
-      reasons: [reason]
-    };
+      reasons: Array.isArray(reason) ? reason : [reason]
+    });
     return observations;
   };
   // firstOutput is legacy compatibility input, deliberately NOT a v3 boundary.
   void firstOutput;
   if (!progress) return reject("missing-content-observation");
-  if (progress.taints?.size) return reject([...progress.taints].join(","), [...progress.taints].some(r => r.includes("snapshot-delta")) ? "gap" : "unknown");
+  if (progress.taints?.size) return reject([...progress.taints], [...progress.taints].some(r => r.includes("snapshot-delta")) ? "gap" : "unknown");
   if (progress.fromCurrentStart !== true) return reject("not-observed-from-current-start");
   if (!usageExact) return reject("unknown-final-usage");
   if (!reasoningUsageKnown) return reject("unknown-reasoning-usage");
   if (progress.unknownCoverage) return reject("unattributed-or-merged-deltas");
   if (progress.stepIdentities?.size !== 1) return reject("unknown-or-multiple-step-identities");
-  const receive = progress.receive;
-  if (!receive || !progress.selectedStream) return reject("missing-receive-observations");
-  if (receive.observationCount < 2 || receive.lastMono - receive.firstMono < MIN_ROLLING_OBSERVATION_MS) return reject("insufficient-receive-span");
   if (!valid(record.time.completed)) return reject("unfinished-response");
   const parts = [...new Set(progress.parts.values())];
   const contentParts = parts.filter(p => ["text", "output", "reasoning"].includes(p.type));
   if (parts.some(p => p.type === "tool")) return reject("tool-usage-uncertain");
-  if (contentParts.some(p => p.knownGap || p.finalSnapshotBytes !== undefined && p.finalSnapshotBytes !== p.deltaBytes)) return reject("snapshot-delta-gap", "gap");
+  if (contentParts.some(p => p.knownGap)) return reject("snapshot-delta-gap", "gap");
   if (!contentParts.length || contentParts.some(p => p.finalSnapshotBytes === undefined || p.finalSnapshotDigest === undefined)) return reject("missing-comparable-final-snapshot");
-  if (contentParts.some(p => p.finalSnapshotDigest !== (p.deltaHasher ?? createHash("sha256")).copy().digest("hex"))) {
-    taintContentProgress(progress, "snapshot-delta-mismatch");
-    return reject("snapshot-delta-mismatch", "gap");
+  for (const part of contentParts) {
+    const strict = part.finalSnapshotBytes === part.deltaBytes && part.finalSnapshotDigest === (part.deltaHasher ?? createHash("sha256")).copy().digest("hex");
+    const trailingRemoval = part.trimEndHasher !== undefined && part.finalSnapshotBytes === part.trimEndBytes && part.finalSnapshotDigest === part.trimEndHasher.copy().digest("hex");
+    if (!strict && !trailingRemoval) {
+      part.knownGap = true;
+      const reason = part.finalSnapshotBytes > part.deltaBytes ? "snapshot-delta-gap" : "snapshot-delta-mismatch";
+      taintContentProgress(progress, reason);
+      return reject(reason, "gap");
+    }
   }
+  const receive = progress.receive;
+  if (!receive || !progress.selectedStream) return reject("missing-receive-observations");
+  if (receive.observationCount < 2 || receive.lastMono - receive.firstMono < MIN_ROLLING_OBSERVATION_MS) return reject("insufficient-receive-span");
   if (contentParts.some(p => (p.receivedBytes ?? 0) !== p.deltaBytes)) {
     taintContentProgress(progress, "missing-byte-receive-timing");
     return reject("missing-byte-receive-timing");

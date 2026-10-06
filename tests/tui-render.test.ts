@@ -79,11 +79,124 @@ if (!nativeChild) {
     ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /5 pass/);
+    assert.match(output.stderr + output.stdout, /7 pass/);
   });
 }
 
 if (nativeChild) {
+test("actual narrow sidebar preserves full metric fields and task time without ellipses, independently of terminal width", async () => {
+  const ui = (await uiPromise)!;
+  const elapsed = (123 * 3600 + 45 * 60 + 56) * 1000;
+  const counts = { input: 3_900_000, cacheRead: 6_100_000, output: 6_300_000, reasoning: 0, cacheWrite: 0 };
+  const sessionID = "ses_eee872613ffeAXfSAWtXsJbYB4";
+  for (const speed of [57_500, undefined]) {
+    const store = ui.createRuntimeStore(1);
+    store.totalsLedger.sessions[sessionID] = { tokens: counts, cost: 1, responseCount: 100,
+      speed: updateSpeedTotals(emptySpeedTotals(), speed === undefined
+        ? { response: { generatedTokens: 6_300_000, durationMs: 1, estimated: false } }
+        : v3Generation(115_000), 1) };
+    const run = ui.createTaskWallRun(sessionID);
+    ui.transitionTaskWallRun(run, sessionID, "busy", 1000);
+    ui.transitionTaskWallRun(run, sessionID, "idle", elapsed + 1000);
+    store.taskRuns.set(sessionID, run);
+    const api = host(120, 160);
+    const sidebar = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!;
+    let panel!: BoxRenderable;
+    const rendered = await testRender(() => {
+      const renderer = useRenderer();
+      api.renderer = renderer;
+      panel = new BoxRenderable(renderer, { width: 20, flexDirection: "column", flexShrink: 0 });
+      panel.add(sidebar({ theme: api.theme }, { session_id: sessionID }) as unknown as Renderable);
+      return panel as unknown as JSX.Element;
+    }, { width: 120, height: 160 });
+    try {
+      for (const width of [20, 24, 28, 32]) {
+        panel.width = width;
+        await rendered.renderOnce();
+        await rendered.renderOnce(); // Settle the actual sidebar's measured width after resize.
+        const frame = rendered.captureCharFrame();
+        const visible = frame.split("\n").map((line) => line.slice(0, width).trim()).filter(Boolean);
+        assert.deepEqual(visible, ["+ Token Pulse", ...ui.formatPulseMetrics(counts, speed, width - 4, elapsed).split("\n")], `${width}: all visible cells must match whole fields`);
+        assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: metrics must not spill outside the sidebar`);
+        assert.doesNotMatch(frame, /\.\.\.|…|incl TPS|Main avg TPS|Observed/);
+        assert.ok(panel.getChildren()[0].height <= 6, `${width}: collapsed contains only toggle + at most four metric rows`);
+        for (const field of ["16.3M total", speed === undefined ? "-- tok/s" : "~57.5k tok/s", "cache 61%", "time 123h45m56s"]) {
+          assert.ok(visible.some((line) => line.includes(field)), `${width}: missing or clipped ${field}`);
+        }
+        ui.togglePulse(store);
+        await rendered.renderOnce();
+        const expanded = rendered.captureCharFrame().split("\n").map((line) => line.slice(0, width).trim()).join("\n");
+        const visibleGlyphs = expanded.replace(/\s+/g, "");
+        assert.ok(visibleGlyphs.includes(`session${sessionID}`), `${width}: wrapping must preserve every full session ID character`);
+        assert.doesNotMatch(expanded, /\.\.\.|…/);
+        if (speed === undefined) {
+          assert.match(expanded, /Main avg TPS\s+--/);
+          assert.match(expanded, /Observed 0\/100\s+calls/);
+          assert.match(expanded, /No\s+qualified\s+generation\s+timing\./);
+          assert.match(expanded.replace(/\s+/g, " "), /Compact usage and TPS include subagents\./);
+          assert.doesNotMatch(expanded, /hidden reasoning|tool waits caused|reconnect caused/);
+        } else {
+          assert.match(expanded, /Main avg TPS\s+~57\.5k tok\/s/);
+        }
+        ui.togglePulse(store);
+        await rendered.renderOnce();
+      }
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
+test("narrow child rows preserve full IDs, models, counts and TPS across wrapped visible cells", async () => {
+  const ui = (await uiPromise)!;
+  const sessionID = "ses_eee872613ffeAXfSAWtXsJbYB4";
+  const children = [
+    { id: "ses_eee872613ffeAXfSAWtXsJbYB5", parent: sessionID, model: "openai/gpt-5.4-thinking-extended", output: 4_200_000, calls: 1200, speed: v3Generation(200, 0, 2000), expectedRate: "~50 tok/s" },
+    { id: "ses_eee872613ffeAXfSAWtXsJbYB6", parent: "ses_eee872613ffeAXfSAWtXsJbYB5", model: "openrouter/x-ai/grok-4.1-fast-reasoning", output: 3_200_000, calls: 9000, speed: v3Generation(800, 0, 2000), expectedRate: "~200 tok/s" },
+    { id: "ses_fff872613ffeAXfSAWtXsJbYB7", parent: sessionID, model: "openrouter/x-ai/grok-4-without-generation-timing", output: 1_100_000, calls: 100_000, speed: undefined, expectedRate: "--" },
+  ];
+  for (const width of [20, 24, 28, 32]) {
+    const store = ui.createRuntimeStore(1);
+    const tokens = (output: number) => ({ input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 });
+    store.totalsLedger.sessions[sessionID] = { tokens: tokens(115_000), cost: 1, responseCount: 1,
+      speed: updateSpeedTotals(emptySpeedTotals(), v3Generation(115_000), 1) };
+    for (const child of children) {
+      store.totalsLedger.sessions[child.id] = { tokens: tokens(child.output), cost: 1, responseCount: child.calls,
+        speed: updateSpeedTotals(emptySpeedTotals(), child.speed, 1) };
+      store.sessionParents.set(child.id, child.parent);
+      store.totalsLedger.settled[`${child.id}-last`] = true;
+    }
+    store.records = children.map((child) => ({ version: 1, messageID: `${child.id}-last`, sessionID: child.id,
+      model: child.model, tokens: tokens(child.output), cost: 1, time: { start: 0, completed: 1 }, samples: [],
+      speed: { response: { generatedTokens: child.output, durationMs: 1, estimated: false } } }));
+    store.pulseExpanded = true;
+    const api = host(120, 180);
+    const sidebar = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!;
+    const rendered = await testRender(() => {
+      const renderer = useRenderer();
+      api.renderer = renderer;
+      const panel = new BoxRenderable(renderer, { width, flexDirection: "column", flexShrink: 0 });
+      panel.add(sidebar({ theme: api.theme }, { session_id: sessionID }) as unknown as Renderable);
+      return panel as unknown as JSX.Element;
+    }, { width: 120, height: 180 });
+    try {
+      await rendered.renderOnce();
+      await rendered.renderOnce();
+      const frame = rendered.captureCharFrame();
+      const visible = frame.split("\n").map((line) => line.slice(0, width).replace(/^[\s│┃┆┊┇┋]+/, "")).join("\n");
+      const glyphs = visible.replace(/\s+/g, "");
+      assert.doesNotMatch(visible, /\.\.\.|…/);
+      assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: child rows must stay within the sidebar`);
+      assert.ok(glyphs.includes(`session${sessionID}`));
+      assert.ok(glyphs.includes("MainavgTPS~57.5ktok/s"));
+      for (const child of children) {
+        assert.ok(glyphs.includes(`${child.id}${ui.formatCompactNumber(child.calls)}responses${ui.formatCompactNumber(child.output)}generated`), `${width}: full child ID, counts and units must survive wrapping`);
+        assert.ok(glyphs.includes(`model${child.model}${child.expectedRate.replace(/\s+/g, "")}`), `${width}: full model and direct TPS must survive wrapping`);
+      }
+      assert.ok(glyphs.indexOf(children[0].id) < glyphs.indexOf(children[1].id));
+      assert.ok(glyphs.indexOf(children[1].id) < glyphs.indexOf(children[2].id));
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
 test("native child rows show direct cumulative generation estimates or unavailable without response fallback", async () => {
   const ui = (await uiPromise)!;
   const store = ui.createRuntimeStore(1);
@@ -136,12 +249,13 @@ test("native sidebar stays compact when collapsed and shows direct average only 
     const rendered = await testRender(() => sidebar({ theme: api.theme }, { session_id: "root" }), { width, height: 45 });
     try {
       await rendered.renderOnce();
+      await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
       assert.match(frame, /\+ Token Pulse/);
       assert.doesNotMatch(frame, /(?:Main|Session) avg TPS|Observed \d|~30 tok\/s/);
-      assert.match(frame, /incl TPS ~40/); // Empty history; cumulative including differs from direct ~30.
+      assert.match(frame, /~40 tok\/s/); // Empty history; cumulative including differs from direct ~30.
       assert.doesNotMatch(frame, /SESSION ONLY/);
-      assert.ok(rendered.renderer.root.getChildren()[0].height <= 3, `${width}: collapsed sidebar must stay three rows`);
+      assert.ok(rendered.renderer.root.getChildren()[0].height <= (width === 80 ? 3 : 6), `${width}: compact whole-field rows only`);
       assert.equal(store.pulseExpanded, false);
       ui.togglePulse(store);
       await rendered.renderOnce();

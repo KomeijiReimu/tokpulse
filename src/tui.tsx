@@ -2583,7 +2583,7 @@ export function handleMessageUpdated(
     const created = infoTimeValue(info, ["start", "created"]);
     const existing = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
     // Do not infer a current response merely from an unfinished recovered record.
-    if (created === undefined || created < observations.observedSince || created < receivedAt - 1000 || created > receivedAt) return false;
+    if (created === undefined || created < observations.observedSince || created > receivedAt) return false;
     for (const candidate of store.active.values()) {
       if (candidate.sessionID !== sessionID || candidate.messageID === messageID || !observations.liveAssistantMessages.has(candidate.messageID)) continue;
       if (candidate.startedAt > created) return false;
@@ -3296,15 +3296,22 @@ export function formatCacheHitRate(rate: number | undefined): string {
   return `${Math.round(Math.max(0, Math.min(1, rate)) * 100)}%`;
 }
 
-export function formatPulseMetrics(tokens: TokenCounts, speed: number | undefined, width = Number.POSITIVE_INFINITY): string {
-  const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactNumber(speed)}` : "--";
-  // Keep the scope and primary speed visible before truncating secondary usage.
-  const primary = `incl TPS ${speedLabel}`;
-  const usage = `${primary} · ${formatCompactNumber(totalTokens(tokens))} total`;
-  const full = `${usage} · cache ${formatCacheHitRate(cacheHitRate(tokens))}`;
-  if (full.length <= width) return full;
-  if (usage.length <= width) return usage;
-  return primary.length <= width ? primary : `incl ${speedLabel}/s`;
+export function formatPulseMetrics(tokens: TokenCounts, speed: number | undefined, width = Number.POSITIVE_INFINITY, taskTimeMs?: number): string {
+  const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactRate(speed)}` : "-- tok/s";
+  const timeLabel = taskTimeMs !== undefined && Number.isFinite(taskTimeMs) && taskTimeMs >= 0
+    ? formatDuration(taskTimeMs).replace(/\s+/g, "") : "--";
+  const fields = [
+    `${formatCompactNumber(totalTokens(tokens))} total`, speedLabel,
+    `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`,
+  ];
+  const lines: string[] = [];
+  for (const field of fields) {
+    const previous = lines[lines.length - 1];
+    if (previous !== undefined && previous.length + 3 + field.length <= width) {
+      lines[lines.length - 1] = `${previous} · ${field}`;
+    } else lines.push(field);
+  }
+  return lines.join("\n");
 }
 
 export function formatPulseSummary(tokens: TokenCounts, speed: number): string {
@@ -3501,7 +3508,7 @@ function PulseMetricGrid(props: {
               <text fg={props.theme.current.textMuted} wrapMode="word">
                 {metric.label}
               </text>
-              <text fg={props.theme.current.text} truncate wrapMode="none">
+              <text fg={props.theme.current.text} wrapMode="word">
                 {metric.value}
               </text>
             </box>
@@ -3519,7 +3526,7 @@ function PulseSection(props: {
   const metrics = pulseMetricRows(props.section.tokens, props.section.cost, props.section.responseCount);
   return (
     <box flexDirection="column" width="100%" paddingTop={1}>
-      <text fg={props.theme.current.accent} truncate wrapMode="none">
+      <text fg={props.theme.current.accent} wrapMode="word" flexShrink={0}>
         {props.section.label}
       </text>
       <PulseMetricGrid
@@ -3553,11 +3560,11 @@ function ChildAgentRows(props: {
           border={["left"]}
           borderColor={props.theme.current.borderSubtle}
         >
-          <text fg={props.theme.current.info} truncate wrapMode="none">
-            {`${"  ".repeat(row.depth)}${shortTail(row.sessionID, 10)}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`}
+          <text fg={props.theme.current.info} wrapMode="word" flexShrink={0}>
+            {`${"  ".repeat(row.depth)}${row.sessionID}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`}
           </text>
-          <text fg={props.theme.current.textMuted} truncate wrapMode="none">
-            {`model ${truncateMiddle(row.model, 24)}  ${row.speedAvailable ? `~${formatCompactRate(row.speed)}` : "--"}`}
+          <text fg={props.theme.current.textMuted} wrapMode="word" flexShrink={0}>
+            {`model ${row.model}  ${row.speedAvailable ? `~${formatCompactRate(row.speed)}` : "--"}`}
           </text>
         </box>
       ))}
@@ -3671,13 +3678,15 @@ export function formatAverageRate(summary: AverageRateSummary): string {
 }
 
 export function sessionAverageDisplay(summary: SessionAverageSummary, isChild = false): {
-  label: string; value: string; coverage?: string;
+  label: string; value: string; coverage?: string; diagnostic?: string;
 } {
   const measured = summary.generation;
   return {
     label: isChild ? "Session avg TPS" : "Main avg TPS",
     value: measured.available && measured.rate !== undefined ? `~${formatCompactRate(measured.rate)}` : "--",
     coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls`,
+    ...(!measured.available && measured.coveredResponseCount === 0 && summary.totalResponseCount > 0
+      ? { diagnostic: "No qualified generation timing." } : {}),
   };
 }
 
@@ -4537,7 +4546,9 @@ function BottomContent(props: {
   store: RuntimeStore;
   sessionID: string;
 }): JSX.Element {
-  const [metricWidth, setMetricWidth] = createSignal(Math.max(1, props.api.renderer.width - 4));
+  // Start with whole fields on separate rows until Yoga measures this sidebar.
+  // Renderer width is the terminal, not the host sidebar's usable content width.
+  const [metricWidth, setMetricWidth] = createSignal(0);
   const sessionID = createMemo(() => {
     props.store.revision();
     return displayedSessionID(props.store, props.sessionID);
@@ -4587,7 +4598,7 @@ function BottomContent(props: {
   });
   const metricLabel = createMemo(() => {
     const summary = pulseSummary();
-    return formatPulseMetrics(summary.tokens, summary.speed, metricWidth());
+    return formatPulseMetrics(summary.tokens, summary.speed, metricWidth(), taskWallTime());
   });
   const taskWallTimeLabel = createMemo(() => {
     const wallTime = taskWallTime();
@@ -4622,18 +4633,20 @@ function BottomContent(props: {
           {expanded() ? "- Token Pulse" : "+ Token Pulse"}
         </text>
       </box>
-      <text fg={props.api.theme.current.textMuted} width="100%" paddingX={1} truncate wrapMode="none"
+      <box flexDirection="column" width="100%" paddingX={1} flexShrink={0}
         onSizeChange={function () { setMetricWidth(Math.max(1, this.width - 2)); }}>
-        {metricLabel()}
-      </text>
+        <text fg={props.api.theme.current.textMuted} width="100%" wrapMode="word" flexShrink={0}>
+          {metricLabel()}
+        </text>
+      </box>
       {expanded() && (!sessionID() ? (
         <text fg={props.api.theme.current.textMuted} paddingTop={1} truncate wrapMode="none">
           No active session
         </text>
       ) : (
         <>
-          <text fg={props.api.theme.current.secondary} paddingTop={1} truncate wrapMode="none">
-            session {shortTail(sessionID(), 18)}
+          <text fg={props.api.theme.current.secondary} paddingTop={1} wrapMode="word" flexShrink={0}>
+            session {sessionID()}
           </text>
           {sections().map((section, index) => (<>
             <PulseSection theme={props.api.theme} section={section} />
@@ -4641,6 +4654,8 @@ function BottomContent(props: {
               <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().label}</text>
               <text fg={props.api.theme.current.accent} wrapMode="word" flexShrink={0}>{average().value}</text>
               {average().coverage && <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().coverage}</text>}
+              {average().diagnostic && <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>{average().diagnostic}</text>}
+              <text fg={props.api.theme.current.textMuted} wrapMode="word" flexShrink={0}>Compact usage and TPS include subagents. Time is recorded task activity.</text>
             </box>}
           </>))}
           {!view().aggregate && !totalsHaveUsage(view().totals?.including) && (

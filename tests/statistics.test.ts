@@ -224,7 +224,8 @@ test("snapshot-first replay and final unequal byte counts cannot claim complete 
   notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello", time: { start: 100 } } });
   parseModelDelta(progress, { partID: "p" }, { type: "message.part.delta" }, "legacy", "hello");
   notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello", time: { start: 100, end: 1100 } } });
-  assert.equal(contentSpeedObservations(record(), progress, 100, true, true).generationCoverage?.status, "gap");
+  assert.deepEqual(contentSpeedObservations(record(), progress, 100, true, true).generationCoverage,
+    { status: "unknown", reasons: ["not-observed-from-current-start"] });
   const truncated = completeProgress();
   notePartSnapshot(truncated, { part: { id: "p", type: "text", text: "hell", time: { start: 100, end: 1100 } } });
   assert.equal(contentSpeedObservations(record(), truncated, 100, true, true).generationCoverage?.status, "gap");
@@ -393,7 +394,7 @@ test("same-byte-length replacement snapshots are rejected and digest mismatch is
   const intermediate = completeProgress();
   notePartSnapshot(intermediate, { part: { id: "p", type: "text", text: "world" } });
   notePartSnapshot(intermediate, { part: { id: "p", type: "text", text: "hello" }, final: true });
-  assert.equal(measured(record(), intermediate).generation, undefined);
+  assert.ok(measured(record(), intermediate).generation); // pending replacement is not a final content fact.
 });
 
 test("selected-stream mixing, anonymous data, missing timing and duplicate arrivals cannot qualify", () => {
@@ -470,4 +471,156 @@ test("coverageGeneratedTokens safely defaults to zero and sums independently of 
   assert.equal(summary.generation.rate, 12);
   assert.equal(summary.generation.coveredGeneratedTokens, 30);
   assert.equal(summary.generation.estimated, true);
+});
+
+test("current-start snapshot-first and ahead-of-delta notifications remain pending until matching completion", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" } });
+  assert.equal(progress.taints?.size, 0);
+  arrival(progress, "p", "h", 100);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" } });
+  assert.equal(progress.taints?.size, 0);
+  // Even part-final notifications are facts to compare at message completion,
+  // not proof that all deltas must already have been delivered at notification.
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello", time: { end: 1100 } } });
+  assert.equal(contentSpeedObservations({ ...record(), time: { start: 0 } }, progress, undefined, true, true).generationCoverage?.reasons[0], "unfinished-response");
+  arrival(progress, "p", "ello", 1100);
+  const speed = measured(record(), progress);
+  assert.equal(speed.generation?.generatedTokens, 80);
+  assert.equal(speed.generationCoverage, undefined);
+  assert.equal(progress.taints?.size, 0);
+  const finalDigest = progress.parts.get("p")?.finalSnapshotDigest;
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello", time: { end: 1100 } } });
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "earlier pending" } });
+  assert.equal(progress.parts.get("p")?.finalSnapshotDigest, finalDigest);
+  assert.equal(measured(record(), progress).generation?.generatedTokens, 80);
+});
+
+test("pending snapshot evidence does not establish or resurrect cache/recovery ownership", () => {
+  const recovered = createContentProgress();
+  noteStepIdentity(recovered, "step");
+  notePartSnapshot(recovered, { part: { id: "p", type: "text", text: "hello" } });
+  assert.equal(recovered.fromCurrentStart, false);
+  assert.equal(recovered.taints?.size, 0); // phase-unknown snapshot is pending, not a recovery guess.
+  arrival(recovered, "p", "h", 100);
+  arrival(recovered, "p", "ello", 1100);
+  notePartSnapshot(recovered, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  assert.equal(measured(record(), recovered).generation, undefined);
+  const fresh = createContentProgress({ fromCurrentStart: true });
+  assert.equal(measured(record(), mergeContentProgress(fresh, recovered)!).generation, undefined);
+});
+
+test("a genuine missing delta rejects at completion and persists a compact gap diagnostic", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" } });
+  arrival(progress, "p", "h", 100);
+  arrival(progress, "p", "ell", 1100);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  assert.equal(progress.taints?.size, 0);
+  const speed = measured(record(), progress);
+  assert.equal(speed.generation, undefined);
+  assert.deepEqual(speed.generationCoverage, { status: "gap", reasons: ["snapshot-delta-gap"] });
+  assert.deepEqual(coerceSpeedContribution(JSON.parse(JSON.stringify(speed)))?.generationCoverage, speed.generationCoverage);
+  assert.equal(selectSpeedMeasurement({ ...record(), speed }).available, false);
+  assert.ok(progress.taints?.has("snapshot-delta-gap"));
+});
+
+test("host trailing-whitespace removal accepts the same calibrated RAW byte proportions", () => {
+  const raw = "hello \n";
+  const progress = completeProgress("text", raw);
+  const strict = measured(record(100, 0), progress);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: raw.trimEnd() }, final: true });
+  const trimmed = measured(record(100, 0), progress);
+  assert.deepEqual(trimmed.generation, strict.generation);
+  assert.deepEqual(trimmed.generationEvidence, strict.generationEvidence);
+  assert.equal(trimmed.generation?.generatedTokens, 100 * (6 / 7));
+  assert.equal(trimmed.generation?.coverageGeneratedTokens, 100);
+  assert.deepEqual(trimmed.generationEvidence?.bytes?.output, { total: 7, firstBatch: 1 });
+  assert.equal(trimmed.generationEvidence?.version, 3);
+  assert.equal(trimmed.generation?.estimated, true);
+  assert.equal(trimmed.generationCoverage, undefined);
+  assert.equal(isQualifiedGenerationContribution(trimmed), true);
+  const corrected = mergeRecordSpeed({ ...record(200, 0), speed: measureRecordSpeed(record(200, 0)) }, { tokens: record().tokens, speed: trimmed });
+  assert.equal(corrected.generation?.generatedTokens, 200 * (6 / 7));
+  // Official zero reasoning and an empty completed metadata-only reasoning part
+  // do not create samples or invalidate a completely observed output stream.
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "", metadata: true }, final: true });
+  assert.equal(measured(record(100, 0), progress).generation?.generatedTokens, strict.generation?.generatedTokens);
+  assert.equal(measured(record(100, 1), progress).generation, undefined);
+});
+
+test("bounded canonical checkpoints retain internal whitespace across chunks and arbitrarily long whitespace tails", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  arrival(progress, "p", "h", 100);
+  arrival(progress, "p", "ello", 200);
+  arrival(progress, "p", " \n", 300);
+  arrival(progress, "p", "world", 1100);
+  for (let index = 0; index < 16; index++) arrival(progress, "p", " \t\n".repeat(1024), 1100);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello \nworld" }, final: true });
+  const part = progress.parts.get("p")!;
+  assert.equal(part.trimEndBytes, utf8ByteLength("hello \nworld"));
+  assert.equal(part.trimEndHasher?.copy().digest("hex").length, 64);
+  assert.equal(part.deltaHasher?.copy().digest("hex").length, 64);
+  assert.equal(part.deltaBytes, 12 + 16 * 3072);
+  assert.equal(measured(record(), progress).generation?.generatedTokens, 100 * ((part.deltaBytes - 1) / part.deltaBytes));
+  assert.equal(Object.values(part).some((value) => typeof value === "string" && value.length > 64), false);
+});
+
+test("canonical matching never trims both sides, removes internal text, accepts extra snapshot whitespace or redacts reasoning", () => {
+  for (const [raw, final] of [[" hello \n", "hello"], ["hello \n", "hello "], ["hello", "hello\n"],
+    ["hello \nworld \t", "helloworld"], ["hello\n", "world"], ["hello\u200b", "hello"]]) {
+    const progress = completeProgress("text", raw);
+    notePartSnapshot(progress, { part: { id: "p", type: "text", text: final }, final: true });
+    const speed = measured(record(), progress);
+    assert.equal(speed.generation, undefined, `${JSON.stringify(raw)} -> ${JSON.stringify(final)}`);
+    assert.equal(speed.generationCoverage?.status, "gap");
+  }
+  const reasoning = completeProgress("reasoning", "thinking\n");
+  notePartSnapshot(reasoning, { part: { id: "p", type: "reasoning", text: "[REDACTED]" }, final: true });
+  assert.equal(measured(record(0, 100), reasoning).generation, undefined);
+});
+
+test("tool uncertainty stays sticky for its message, without crossing into a fresh response", () => {
+  const old = completeProgress();
+  notePartSnapshot(old, { part: { id: "tool", type: "tool", state: { status: "completed" } } });
+  assert.deepEqual(measured(record(), old).generationCoverage, { status: "unknown", reasons: ["tool-usage-uncertain"] });
+  const fresh = completeProgress();
+  assert.equal(measured({ ...record(), messageID: "new-message" }, fresh).generation?.generatedTokens, 80);
+  assert.equal(fresh.taints?.size, 0);
+});
+
+test("persisted rejection diagnostics are allowlisted, deduplicated and bounded without raw event text", () => {
+  const reasons = ["snapshot-delta-gap", "snapshot-delta-gap", "secret provider/reasoning text", "retry", "failed", "recovery",
+    "disconnect", "hidden-reasoning", "tool-usage-uncertain", "mixed-streams", "insufficient-receive-span"];
+  const diagnostic = coerceSpeedContribution({ generationCoverage: { status: "gap", reasons } });
+  assert.equal(diagnostic?.generationCoverage?.reasons.length, 8);
+  assert.deepEqual(diagnostic?.generationCoverage?.reasons, ["snapshot-delta-gap", "retry", "failed", "recovery", "disconnect", "hidden-reasoning", "tool-usage-uncertain", "mixed-streams"]);
+  assert.deepEqual(coerceSpeedContribution({ generationCoverage: { status: "unknown", reasons: ["x".repeat(1024)] } }),
+    { generationCoverage: { status: "unknown", reasons: ["unknown-coverage"] } });
+  assert.equal(coerceSpeedContribution({ generationCoverage: { status: "bogus", reasons: ["retry"] } }), undefined);
+  assert.equal(coerceSpeedContribution({ generationCoverage: { status: "gap", reasons: "retry" } }), undefined);
+});
+
+test("qualified new/corrected generation clears old diagnostics, explicit invalidation keeps current meaningful reason", () => {
+  const bad = { status: "gap" as const, reasons: ["snapshot-delta-gap"] };
+  const observations = contentSpeedObservations(record(), completeProgress(), undefined, true, true);
+  const speed = measureRecordSpeed(record(), { ...observations, generationCoverage: bad });
+  assert.ok(speed.generation);
+  assert.equal(speed.generationCoverage, undefined);
+  const prior = { tokens: record().tokens, speed };
+  const incoming = { ...record(200), speed: { ...measureRecordSpeed(record(200)), generationCoverage: bad } };
+  const corrected = mergeRecordSpeed(incoming, prior);
+  assert.equal(corrected.generation?.generatedTokens, 160);
+  assert.equal(corrected.generationCoverage, undefined);
+  const invalidated = mergeRecordSpeed(incoming, prior, "invalidated");
+  assert.equal(invalidated.generation, undefined);
+  assert.deepEqual(invalidated.generationCoverage, bad);
+  const previousRejection = { tokens: record().tokens, speed: { generationCoverage: bad } };
+  assert.deepEqual(mergeRecordSpeed({ ...record(), speed: measureRecordSpeed(record()) }, previousRejection, "invalidated").generationCoverage, bad);
+  assert.deepEqual(mergeRecordSpeed(record(), prior, "invalidated").generationCoverage,
+    { status: "unknown", reasons: ["generation-invalidated"] });
+  assert.equal(mergeRecordSpeed({ ...record(), speed }, previousRejection).generationCoverage, undefined);
 });

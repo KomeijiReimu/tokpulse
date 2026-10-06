@@ -203,9 +203,11 @@ test("v3 evidence round trips and authoritative history corrections rescale inte
   const empty: MeasuredHistoryRecord = { ...revoked, speed: {}, update: { ...revoked.update!, sequence: 4, fingerprint: "empty", seenFingerprints: ["first", "second", "revoked", "empty"] } };
   const [normalizedEmpty] = parseHistoryJsonl(serializeHistoryJsonl([empty]));
   assert.deepEqual(normalizedEmpty.speed, {});
-  assert.deepEqual(mergeHistoryRecords([original], [normalizedEmpty])[0].speed, {});
+  assert.deepEqual(mergeHistoryRecords([original], [normalizedEmpty])[0].speed,
+    { generationCoverage: { status: "unknown", reasons: ["generation-invalidated"] } });
   await createHistoryStorage(path).upsert(empty);
-  assert.deepEqual((await createHistoryStorage(path).read())[0].speed, {});
+  assert.deepEqual((await createHistoryStorage(path).read())[0].speed,
+    { generationCoverage: { status: "unknown", reasons: ["generation-invalidated"] } });
 });
 
 async function makeTestDirectory(context: { after: (callback: () => Promise<void>) => void }): Promise<string> {

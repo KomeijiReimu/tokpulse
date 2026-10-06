@@ -1649,7 +1649,7 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     const created = infoTimeValue(info, ["start", "created"]);
     const existing = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
     // Do not infer a current response merely from an unfinished recovered record.
-    if (created === undefined || created < observations.observedSince || created < receivedAt - 1000 || created > receivedAt) return false;
+    if (created === undefined || created < observations.observedSince || created > receivedAt) return false;
     for (const candidate of store.active.values()) {
       if (candidate.sessionID !== sessionID || candidate.messageID === messageID || !observations.liveAssistantMessages.has(candidate.messageID)) continue;
       if (candidate.startedAt > created) return false;
@@ -2185,15 +2185,18 @@ export function formatCacheHitRate(rate) {
   if (rate === undefined || !Number.isFinite(rate)) return "--";
   return `${Math.round(Math.max(0, Math.min(1, rate)) * 100)}%`;
 }
-export function formatPulseMetrics(tokens, speed, width = Number.POSITIVE_INFINITY) {
-  const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactNumber(speed)}` : "--";
-  // Keep the scope and primary speed visible before truncating secondary usage.
-  const primary = `incl TPS ${speedLabel}`;
-  const usage = `${primary} · ${formatCompactNumber(totalTokens(tokens))} total`;
-  const full = `${usage} · cache ${formatCacheHitRate(cacheHitRate(tokens))}`;
-  if (full.length <= width) return full;
-  if (usage.length <= width) return usage;
-  return primary.length <= width ? primary : `incl ${speedLabel}/s`;
+export function formatPulseMetrics(tokens, speed, width = Number.POSITIVE_INFINITY, taskTimeMs) {
+  const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactRate(speed)}` : "-- tok/s";
+  const timeLabel = taskTimeMs !== undefined && Number.isFinite(taskTimeMs) && taskTimeMs >= 0 ? formatDuration(taskTimeMs).replace(/\s+/g, "") : "--";
+  const fields = [`${formatCompactNumber(totalTokens(tokens))} total`, speedLabel, `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`];
+  const lines = [];
+  for (const field of fields) {
+    const previous = lines[lines.length - 1];
+    if (previous !== undefined && previous.length + 3 + field.length <= width) {
+      lines[lines.length - 1] = `${previous} · ${field}`;
+    } else lines.push(field);
+  }
+  return lines.join("\n");
 }
 export function formatPulseSummary(tokens, speed) {
   return `+ Token Pulse  ${formatPulseMetrics(tokens, speed)}`;
@@ -2353,8 +2356,7 @@ function PulseMetricGrid(props) {
         _$setProp(_el$3, "minWidth", 0);
         _$setProp(_el$4, "wrapMode", "word");
         _$insert(_el$4, () => metric.label);
-        _$setProp(_el$5, "truncate", true);
-        _$setProp(_el$5, "wrapMode", "none");
+        _$setProp(_el$5, "wrapMode", "word");
         _$insert(_el$5, () => metric.value);
         _$effect(_p$ => {
           var _v$ = props.theme.current.textMuted,
@@ -2382,8 +2384,8 @@ function PulseSection(props) {
     _$setProp(_el$6, "flexDirection", "column");
     _$setProp(_el$6, "width", "100%");
     _$setProp(_el$6, "paddingTop", 1);
-    _$setProp(_el$7, "truncate", true);
-    _$setProp(_el$7, "wrapMode", "none");
+    _$setProp(_el$7, "wrapMode", "word");
+    _$setProp(_el$7, "flexShrink", 0);
     _$insert(_el$7, () => props.section.label);
     _$insert(_el$6, _$createComponent(PulseMetricGrid, {
       get theme() {
@@ -2419,12 +2421,12 @@ function ChildAgentRows(props) {
       _$setProp(_el$1, "paddingTop", 1);
       _$setProp(_el$1, "paddingLeft", 1);
       _$setProp(_el$1, "border", ["left"]);
-      _$setProp(_el$10, "truncate", true);
-      _$setProp(_el$10, "wrapMode", "none");
-      _$insert(_el$10, () => `${"  ".repeat(row.depth)}${shortTail(row.sessionID, 10)}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`);
-      _$setProp(_el$11, "truncate", true);
-      _$setProp(_el$11, "wrapMode", "none");
-      _$insert(_el$11, () => `model ${truncateMiddle(row.model, 24)}  ${row.speedAvailable ? `~${formatCompactRate(row.speed)}` : "--"}`);
+      _$setProp(_el$10, "wrapMode", "word");
+      _$setProp(_el$10, "flexShrink", 0);
+      _$insert(_el$10, () => `${"  ".repeat(row.depth)}${row.sessionID}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`);
+      _$setProp(_el$11, "wrapMode", "word");
+      _$setProp(_el$11, "flexShrink", 0);
+      _$insert(_el$11, () => `model ${row.model}  ${row.speedAvailable ? `~${formatCompactRate(row.speed)}` : "--"}`);
       _$effect(_p$ => {
         var _v$3 = props.theme.current.borderSubtle,
           _v$4 = props.theme.current.info,
@@ -2515,7 +2517,10 @@ export function sessionAverageDisplay(summary, isChild = false) {
   return {
     label: isChild ? "Session avg TPS" : "Main avg TPS",
     value: measured.available && measured.rate !== undefined ? `~${formatCompactRate(measured.rate)}` : "--",
-    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls`
+    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls`,
+    ...(!measured.available && measured.coveredResponseCount === 0 && summary.totalResponseCount > 0 ? {
+      diagnostic: "No qualified generation timing."
+    } : {})
   };
 }
 function averageCoverage(summary, total) {
@@ -3697,7 +3702,9 @@ export function togglePulse(store) {
   return store.pulseExpanded;
 }
 function BottomContent(props) {
-  const [metricWidth, setMetricWidth] = createSignal(Math.max(1, props.api.renderer.width - 4));
+  // Start with whole fields on separate rows until Yoga measures this sidebar.
+  // Renderer width is the terminal, not the host sidebar's usable content width.
+  const [metricWidth, setMetricWidth] = createSignal(0);
   const sessionID = createMemo(() => {
     props.store.revision();
     return displayedSessionID(props.store, props.sessionID);
@@ -3743,7 +3750,7 @@ function BottomContent(props) {
   });
   const metricLabel = createMemo(() => {
     const summary = pulseSummary();
-    return formatPulseMetrics(summary.tokens, summary.speed, metricWidth());
+    return formatPulseMetrics(summary.tokens, summary.speed, metricWidth(), taskWallTime());
   });
   const taskWallTimeLabel = createMemo(() => {
     const wallTime = taskWallTime();
@@ -3761,7 +3768,8 @@ function BottomContent(props) {
     var _el$90 = _$createElement("box"),
       _el$91 = _$createElement("box"),
       _el$92 = _$createElement("text"),
-      _el$93 = _$createElement("text");
+      _el$93 = _$createElement("box"),
+      _el$94 = _$createElement("text");
     _$insertNode(_el$90, _el$91);
     _$insertNode(_el$90, _el$93);
     _$setProp(_el$90, "flexDirection", "column");
@@ -3779,96 +3787,119 @@ function BottomContent(props) {
     _$setProp(_el$92, "truncate", true);
     _$setProp(_el$92, "wrapMode", "none");
     _$insert(_el$92, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
+    _$insertNode(_el$93, _el$94);
+    _$setProp(_el$93, "flexDirection", "column");
     _$setProp(_el$93, "width", "100%");
     _$setProp(_el$93, "paddingX", 1);
-    _$setProp(_el$93, "truncate", true);
-    _$setProp(_el$93, "wrapMode", "none");
+    _$setProp(_el$93, "flexShrink", 0);
     _$setProp(_el$93, "onSizeChange", function () {
       setMetricWidth(Math.max(1, this.width - 2));
     });
-    _$insert(_el$93, metricLabel);
+    _$setProp(_el$94, "width", "100%");
+    _$setProp(_el$94, "wrapMode", "word");
+    _$setProp(_el$94, "flexShrink", 0);
+    _$insert(_el$94, metricLabel);
     _$insert(_el$90, (() => {
       var _c$8 = _$memo(() => !!expanded());
       return () => _c$8() && (!sessionID() ? (() => {
-        var _el$94 = _$createElement("text");
-        _$insertNode(_el$94, _$createTextNode(`No active session`));
-        _$setProp(_el$94, "paddingTop", 1);
-        _$setProp(_el$94, "truncate", true);
-        _$setProp(_el$94, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$94, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$94;
+        var _el$95 = _$createElement("text");
+        _$insertNode(_el$95, _$createTextNode(`No active session`));
+        _$setProp(_el$95, "paddingTop", 1);
+        _$setProp(_el$95, "truncate", true);
+        _$setProp(_el$95, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$95, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$95;
       })() : [(() => {
-        var _el$96 = _$createElement("text"),
-          _el$97 = _$createTextNode(`session `);
-        _$insertNode(_el$96, _el$97);
-        _$setProp(_el$96, "paddingTop", 1);
-        _$setProp(_el$96, "truncate", true);
-        _$setProp(_el$96, "wrapMode", "none");
-        _$insert(_el$96, () => shortTail(sessionID(), 18), null);
-        _$effect(_$p => _$setProp(_el$96, "fg", props.api.theme.current.secondary, _$p));
-        return _el$96;
+        var _el$97 = _$createElement("text"),
+          _el$98 = _$createTextNode(`session `);
+        _$insertNode(_el$97, _el$98);
+        _$setProp(_el$97, "paddingTop", 1);
+        _$setProp(_el$97, "wrapMode", "word");
+        _$setProp(_el$97, "flexShrink", 0);
+        _$insert(_el$97, sessionID, null);
+        _$effect(_$p => _$setProp(_el$97, "fg", props.api.theme.current.secondary, _$p));
+        return _el$97;
       })(), _$memo(() => sections().map((section, index) => [_$createComponent(PulseSection, {
         get theme() {
           return props.api.theme;
         },
         section: section
       }), index === 0 && (() => {
-        var _el$101 = _$createElement("box"),
-          _el$102 = _$createElement("text"),
-          _el$103 = _$createElement("text");
-        _$insertNode(_el$101, _el$102);
-        _$insertNode(_el$101, _el$103);
-        _$setProp(_el$101, "flexDirection", "column");
-        _$setProp(_el$101, "width", "100%");
-        _$setProp(_el$101, "paddingX", 1);
-        _$setProp(_el$101, "flexShrink", 0);
-        _$setProp(_el$102, "wrapMode", "word");
+        var _el$102 = _$createElement("box"),
+          _el$103 = _$createElement("text"),
+          _el$104 = _$createElement("text"),
+          _el$105 = _$createElement("text");
+        _$insertNode(_el$102, _el$103);
+        _$insertNode(_el$102, _el$104);
+        _$insertNode(_el$102, _el$105);
+        _$setProp(_el$102, "flexDirection", "column");
+        _$setProp(_el$102, "width", "100%");
+        _$setProp(_el$102, "paddingX", 1);
         _$setProp(_el$102, "flexShrink", 0);
-        _$insert(_el$102, () => average().label);
         _$setProp(_el$103, "wrapMode", "word");
         _$setProp(_el$103, "flexShrink", 0);
-        _$insert(_el$103, () => average().value);
-        _$insert(_el$101, (() => {
+        _$insert(_el$103, () => average().label);
+        _$setProp(_el$104, "wrapMode", "word");
+        _$setProp(_el$104, "flexShrink", 0);
+        _$insert(_el$104, () => average().value);
+        _$insert(_el$102, (() => {
           var _c$9 = _$memo(() => !!average().coverage);
           return () => _c$9() && (() => {
-            var _el$104 = _$createElement("text");
-            _$setProp(_el$104, "wrapMode", "word");
-            _$setProp(_el$104, "flexShrink", 0);
-            _$insert(_el$104, () => average().coverage);
-            _$effect(_$p => _$setProp(_el$104, "fg", props.api.theme.current.textMuted, _$p));
-            return _el$104;
+            var _el$107 = _$createElement("text");
+            _$setProp(_el$107, "wrapMode", "word");
+            _$setProp(_el$107, "flexShrink", 0);
+            _$insert(_el$107, () => average().coverage);
+            _$effect(_$p => _$setProp(_el$107, "fg", props.api.theme.current.textMuted, _$p));
+            return _el$107;
           })();
-        })(), null);
+        })(), _el$105);
+        _$insert(_el$102, (() => {
+          var _c$0 = _$memo(() => !!average().diagnostic);
+          return () => _c$0() && (() => {
+            var _el$108 = _$createElement("text");
+            _$setProp(_el$108, "wrapMode", "word");
+            _$setProp(_el$108, "flexShrink", 0);
+            _$insert(_el$108, () => average().diagnostic);
+            _$effect(_$p => _$setProp(_el$108, "fg", props.api.theme.current.textMuted, _$p));
+            return _el$108;
+          })();
+        })(), _el$105);
+        _$insertNode(_el$105, _$createTextNode(`Compact usage and TPS include subagents. Time is recorded task activity.`));
+        _$setProp(_el$105, "wrapMode", "word");
+        _$setProp(_el$105, "flexShrink", 0);
         _$effect(_p$ => {
           var _v$52 = props.api.theme.current.textMuted,
-            _v$53 = props.api.theme.current.accent;
-          _v$52 !== _p$.e && (_p$.e = _$setProp(_el$102, "fg", _v$52, _p$.e));
-          _v$53 !== _p$.t && (_p$.t = _$setProp(_el$103, "fg", _v$53, _p$.t));
+            _v$53 = props.api.theme.current.accent,
+            _v$54 = props.api.theme.current.textMuted;
+          _v$52 !== _p$.e && (_p$.e = _$setProp(_el$103, "fg", _v$52, _p$.e));
+          _v$53 !== _p$.t && (_p$.t = _$setProp(_el$104, "fg", _v$53, _p$.t));
+          _v$54 !== _p$.a && (_p$.a = _$setProp(_el$105, "fg", _v$54, _p$.a));
           return _p$;
         }, {
           e: undefined,
-          t: undefined
+          t: undefined,
+          a: undefined
         });
-        return _el$101;
+        return _el$102;
       })()])), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
-        var _el$105 = _$createElement("text");
-        _$insertNode(_el$105, _$createTextNode(`No completed responses yet`));
-        _$setProp(_el$105, "paddingTop", 1);
-        _$setProp(_el$105, "truncate", true);
-        _$setProp(_el$105, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$105, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$105;
+        var _el$109 = _$createElement("text");
+        _$insertNode(_el$109, _$createTextNode(`No completed responses yet`));
+        _$setProp(_el$109, "paddingTop", 1);
+        _$setProp(_el$109, "truncate", true);
+        _$setProp(_el$109, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$109, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$109;
       })()), (() => {
-        var _el$98 = _$createElement("box"),
-          _el$99 = _$createElement("text");
-        _$insertNode(_el$98, _el$99);
-        _$setProp(_el$98, "flexDirection", "column");
-        _$setProp(_el$98, "width", "100%");
-        _$setProp(_el$98, "paddingTop", 1);
-        _$insertNode(_el$99, _$createTextNode(`SESSION RUN`));
-        _$setProp(_el$99, "truncate", true);
-        _$setProp(_el$99, "wrapMode", "none");
-        _$insert(_el$98, _$createComponent(PulseMetricGrid, {
+        var _el$99 = _$createElement("box"),
+          _el$100 = _$createElement("text");
+        _$insertNode(_el$99, _el$100);
+        _$setProp(_el$99, "flexDirection", "column");
+        _$setProp(_el$99, "width", "100%");
+        _$setProp(_el$99, "paddingTop", 1);
+        _$insertNode(_el$100, _$createTextNode(`SESSION RUN`));
+        _$setProp(_el$100, "truncate", true);
+        _$setProp(_el$100, "wrapMode", "none");
+        _$insert(_el$99, _$createComponent(PulseMetricGrid, {
           get theme() {
             return props.api.theme;
           },
@@ -3879,8 +3910,8 @@ function BottomContent(props) {
             }]];
           }
         }), null);
-        _$effect(_$p => _$setProp(_el$99, "fg", props.api.theme.current.accent, _$p));
-        return _el$98;
+        _$effect(_$p => _$setProp(_el$100, "fg", props.api.theme.current.accent, _$p));
+        return _el$99;
       })(), _$memo(() => _$memo(() => rows().length > 0)() && _$createComponent(ChildAgentRows, {
         get theme() {
           return props.api.theme;
@@ -3896,7 +3927,7 @@ function BottomContent(props) {
         _v$51 = props.api.theme.current.textMuted;
       _v$49 !== _p$.e && (_p$.e = _$setProp(_el$91, "backgroundColor", _v$49, _p$.e));
       _v$50 !== _p$.t && (_p$.t = _$setProp(_el$92, "fg", _v$50, _p$.t));
-      _v$51 !== _p$.a && (_p$.a = _$setProp(_el$93, "fg", _v$51, _p$.a));
+      _v$51 !== _p$.a && (_p$.a = _$setProp(_el$94, "fg", _v$51, _p$.a));
       return _p$;
     }, {
       e: undefined,
