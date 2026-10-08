@@ -13,7 +13,8 @@ import { readFile } from "node:fs/promises";
 import { watch, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
+import { createEffect, createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
+import { BoxRenderable, TextareaRenderable, TextRenderable, LayoutEvents, RenderableEvents, Yoga } from "@opentui/core";
 import { createBindingLookup } from "@opencode-ai/plugin/tui";
 import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calculateSpeedStats, calibrateResponseSamples, bytesToTokens, durationOf, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, measureRollingTokenRate, timeToFirstToken, utf8ByteLength } from "./core.js";
 import { replayActivity, resolveRootSessionID } from "./activity.js";
@@ -3777,7 +3778,10 @@ export function responseMeasurementStatus(record) {
   return "No qualified generation timing.";
 }
 export function liveLabel(store, sessionID, bytesPerToken, width, now = Date.now(), toolWaiting = false) {
-  if (!scopeEligible(store, sessionID)) return "";
+  return wrapMetricFields(promptMetricFields(store, sessionID, bytesPerToken, now, toolWaiting), width);
+}
+function promptMetricFields(store, sessionID, bytesPerToken, now, toolWaiting) {
+  if (!scopeEligible(store, sessionID)) return [];
   const runtime = store.sessionRuntime.get(sessionID);
   const state = latestActive(store, sessionID, runtime?.activeMessageID);
   const stats = activeStats(state, now, bytesPerToken);
@@ -3785,16 +3789,16 @@ export function liveLabel(store, sessionID, bytesPerToken, width, now = Date.now
   if (state) {
     const hasContent = selectedSamples(state).length > 0;
     const rate = toolWaiting ? "WAIT TOOL --" : !hasContent ? "WAITING --" : stats.status === "inactive" ? "WAIT --" : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
-    return wrapMetricFields([rate, `gen ${hasContent ? `~${formatCompactNumber(stats.generated)}` : "--"}`, `ttft ${formatOptionalDuration(stats.ttft)}`, `elapsed ${formatDuration(stats.elapsed)}`, `total ${formatCompactNumber(runGenerated)}`], width);
+    return [rate, `gen ${hasContent ? `~${formatCompactNumber(stats.generated)}` : "--"}`, `ttft ${formatOptionalDuration(stats.ttft)}`, `elapsed ${formatDuration(stats.elapsed)}`, `total ${formatCompactNumber(runGenerated)}`];
   }
   const last = store.lastCompletedBySession.get(sessionID);
   if (last && scopeEligible(store, sessionID, last.record.messageID)) {
     const prefix = last.estimated ? "LAST ~" : "LAST ";
     const rate = last.available === false ? "LAST --" : `${prefix}${formatCompactRate(last.rate)} ${last.basis ?? ""}`.trimEnd();
     const totalGenerated = runtime && runtime.runResponseCount > 0 ? runGenerated : last.generated;
-    return wrapMetricFields([rate, ...(last.observationQuality === "short" ? ["short, low confidence"] : []), `gen ${formatCompactNumber(last.generated)}`, `ttft ${formatOptionalDuration(last.ttft)}`, `measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)}`, `total ${formatCompactNumber(totalGenerated)}`, ...(last.available === false ? [responseMeasurementStatus(last.record)] : [])], width);
+    return [rate, ...(last.observationQuality === "short" ? ["short, low confidence"] : []), `gen ${formatCompactNumber(last.generated)}`, `ttft ${formatOptionalDuration(last.ttft)}`, `measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)}`, `total ${formatCompactNumber(totalGenerated)}`, ...(last.available === false ? [responseMeasurementStatus(last.record)] : [])];
   }
-  return runtime?.status === "busy" || runtime?.status === "retry" ? "TASK BUSY" : "IDLE";
+  return [runtime?.status === "busy" || runtime?.status === "retry" ? "TASK BUSY" : "IDLE"];
 }
 function currentSessionID(api) {
   const route = api.route.current;
@@ -3978,23 +3982,286 @@ function HistoryView(props) {
     return _el$82;
   })();
 }
+
+// These leases belong only to the official prompt's metadata/right wrappers,
+// never the textarea, model row, sidebar, or an arbitrary custom slot parent.
+
+const promptLayoutLeases = new WeakMap();
+function samePromptValue(a, b) {
+  return a.unit === b.unit && Object.is(a.value, b.value);
+}
+function ownPromptStyle(node, read, write, equal = Object.is) {
+  const original = read();
+  let last = original;
+  let lost = false;
+  return {
+    baseline() {
+      const current = read();
+      return !lost && equal(current, last) ? original : current;
+    },
+    borrow() {
+      if (node.isDestroyed || lost) return () => {};
+      const current = read();
+      if (!equal(current, last)) return () => {};
+      write(original);
+      return () => {
+        if (!node.isDestroyed && equal(read(), original)) write(current);else lost = true;
+      };
+    },
+    set(value) {
+      if (node.isDestroyed || lost) return;
+      if (!equal(read(), last)) {
+        lost = true;
+        return;
+      }
+      if (equal(last, value)) return;
+      write(value);
+      last = read();
+      node.requestRender();
+    },
+    restore() {
+      if (!node.isDestroyed && !lost && equal(read(), last)) {
+        write(original);
+        node.requestRender();
+      }
+    }
+  };
+}
+function officialPromptWrappers(node) {
+  const right = node.parent,
+    row = right?.parent,
+    body = row?.parent;
+  if (!(right instanceof BoxRenderable) || !(row instanceof BoxRenderable) || !(body instanceof BoxRenderable)) return;
+  const r = right.getLayoutNode(),
+    m = row.getLayoutNode(),
+    b = body.getLayoutNode();
+  const point = (value, expected) => value.unit === Yoga.Unit.Point && value.value === expected;
+  const gap = layout => {
+    const column = layout.getGap(Yoga.Gutter.Column);
+    return column.unit === Yoga.Unit.Undefined ? layout.getGap(Yoga.Gutter.All) : column;
+  };
+  if (r.getFlexDirection() !== Yoga.FlexDirection.Row || r.getAlignItems() !== Yoga.Align.Center || !point(gap(r), 1) || m.getFlexDirection() !== Yoga.FlexDirection.Row || m.getJustifyContent() !== Yoga.Justify.SpaceBetween || !point(m.getPadding(Yoga.Edge.Top), 1) || !point(gap(m), 1) || b.getFlexDirection() !== Yoga.FlexDirection.Column || !point(b.getPadding(Yoga.Edge.Left), 2) || !point(b.getPadding(Yoga.Edge.Right), 2) || !point(b.getPadding(Yoga.Edge.Top), 1)) return;
+  const [textarea, metadata] = body.getChildren(),
+    [left, trailing] = row.getChildren();
+  if (!(textarea instanceof TextareaRenderable) || metadata !== row || body.getChildrenCount() !== 2 || !(left instanceof BoxRenderable) || trailing !== right || row.getChildrenCount() !== 2 || left.getLayoutNode().getFlexDirection() !== Yoga.FlexDirection.Row) return;
+  const [agent, ...prefix] = left.getChildren();
+  if (!(agent instanceof TextRenderable)) return;
+  if (prefix[0] instanceof TextRenderable && prefix[0].plainText === "auto") prefix.shift();
+  const models = prefix[0];
+  if (prefix.length === 0 ? agent.plainText !== "Shell" : prefix.length !== 1 || !(models instanceof BoxRenderable) || models.getLayoutNode().getFlexDirection() !== Yoga.FlexDirection.Row || !(models.getChildren()[0] instanceof TextRenderable) || models.getChildren()[0].plainText !== "·" || !(models.getChildren()[1] instanceof TextRenderable) || models.getChildren()[1].getLayoutNode().getFlexShrink() !== 0) return;
+  const border = body.parent,
+    anchor = border?.parent;
+  const fullWidth = item => {
+    const width = item.getLayoutNode().getWidth();
+    return width.unit === Yoga.Unit.Percent && width.value === 100;
+  };
+  if (!(border instanceof BoxRenderable) || !(anchor instanceof BoxRenderable) || !Array.isArray(border.border) || border.border.length !== 1 || border.border[0] !== "left" || anchor.getLayoutNode().getFlexDirection() !== Yoga.FlexDirection.Column || !fullWidth(textarea) || !fullWidth(body) || !fullWidth(border) || !fullWidth(anchor)) return;
+  return {
+    right,
+    row
+  };
+}
+function leasePromptLayout(node, minimum) {
+  const wrappers = officialPromptWrappers(node);
+  if (!wrappers) return;
+  const {
+    right,
+    row
+  } = wrappers;
+  let lease = promptLayoutLeases.get(right);
+  if (!lease) {
+    const r = right.getLayoutNode(),
+      m = row.getLayoutNode();
+    const left = row.getChildren()[0];
+    const leftNode = left.getLayoutNode();
+    const leftMax = ownPromptStyle(left, () => leftNode.getMaxWidth(), value => leftNode.setMaxWidth(value), samePromptValue);
+    const wrap = ownPromptStyle(row, () => m.getFlexWrap(), value => m.setFlexWrap(value));
+    const grow = ownPromptStyle(right, () => r.getFlexGrow(), value => r.setFlexGrow(value));
+    const basis = ownPromptStyle(right, () => r.getFlexBasis(), value => r.setFlexBasis(value), samePromptValue);
+    const min = ownPromptStyle(right, () => r.getMinWidth(), value => r.setMinWidth(value), samePromptValue);
+    const members = new Map();
+    const observed = new Set();
+    let updating = false;
+    let baselineKey = "",
+      baselineLeft = 0;
+    const update = () => {
+      if (updating || row.isDestroyed || right.isDestroyed) return;
+      updating = true;
+      try {
+        const children = right.getChildren().filter(item => !item.isDestroyed && item.visible);
+        const leftTree = item => item instanceof TextRenderable ? [item] : [item, ...item.getChildren().flatMap(leftTree)];
+        const needed = new Set([row, right, ...children, ...leftTree(left)]);
+        for (const item of observed) if (!needed.has(item)) {
+          item.off(LayoutEvents.RESIZED, update);
+          item.off(LayoutEvents.LAYOUT_CHANGED, update);
+          observed.delete(item);
+        }
+        for (const item of needed) if (!observed.has(item)) {
+          item.on(LayoutEvents.RESIZED, update);
+          item.on(LayoutEvents.LAYOUT_CHANGED, update);
+          observed.add(item);
+        }
+        const budget = Math.max(1, row.width);
+        const gaps = Math.max(0, children.length - 1); // matched official right gap = 1
+        const others = children.filter(item => !members.has(item));
+        const otherWidth = others.reduce((sum, item) => {
+          const width = item.getLayoutNode().getWidth();
+          return sum + (width.unit === Yoga.Unit.Point ? width.value : item.width);
+        }, 0);
+        const activeMembers = children.filter(item => members.has(item));
+        // Ask Yoga for the existing absent layout, not an approximation of its
+        // shrink rules. Only this metadata subtree is measured, synchronously;
+        // no paint, input/visibility property, timer or history work is involved.
+        const texts = item => item instanceof TextRenderable ? item.chunks.map(chunk => chunk.text).join("") : item.getChildren().map(texts).join("\0");
+        const key = JSON.stringify([budget, texts(left), others.map(item => [item.num, item.width, item.getLayoutNode().getWidth()]), wrap.baseline(), grow.baseline(), basis.baseline(), min.baseline(), leftMax.baseline()]);
+        if (key !== baselineKey) {
+          const restore = [leftMax, wrap, grow, basis, min].map(style => style.borrow());
+          const displays = activeMembers.map(item => [item.getLayoutNode(), item.getLayoutNode().getDisplay()]);
+          // Prompt's hasRightContent() removes this wrapper entirely when the
+          // slot is absent and no other right content exists.
+          if (others.length === 0) displays.push([r, r.getDisplay()]);
+          try {
+            for (const [layout] of displays) layout.setDisplay(Yoga.Display.None);
+            m.calculateLayout(budget, undefined, Yoga.Direction.LTR);
+            baselineLeft = leftNode.getComputedWidth();
+            baselineKey = key;
+          } finally {
+            for (const [layout, display] of displays) layout.setDisplay(display);
+            for (const undo of restore.reverse()) undo();
+          }
+        }
+        leftMax.set({
+          unit: Yoga.Unit.Point,
+          value: Math.max(0, baselineLeft)
+        });
+        const share = Math.max(1, (budget - otherWidth - gaps) / Math.max(1, activeMembers.length));
+        let total = otherWidth + gaps;
+        for (const item of activeMembers) {
+          const member = members.get(item);
+          const width = Math.min(member.minimum, share);
+          member.minimumStyle.set({
+            unit: Yoga.Unit.Point,
+            value: width
+          });
+          total += width;
+        }
+        wrap.set(Yoga.Wrap.Wrap);
+        grow.set(1);
+        basis.set({
+          unit: Yoga.Unit.Point,
+          value: 0
+        });
+        min.set({
+          unit: Yoga.Unit.Point,
+          value: Math.min(budget, total)
+        });
+      } finally {
+        updating = false;
+      }
+    };
+    lease = {
+      members,
+      update,
+      release() {
+        for (const item of observed) {
+          item.off(LayoutEvents.RESIZED, update);
+          item.off(LayoutEvents.LAYOUT_CHANGED, update);
+        }
+        observed.clear();
+        min.restore();
+        basis.restore();
+        grow.restore();
+        wrap.restore();
+        leftMax.restore();
+        promptLayoutLeases.delete(right);
+      }
+    };
+    promptLayoutLeases.set(right, lease);
+  }
+  const n = node.getLayoutNode();
+  const width = ownPromptStyle(node, () => n.getWidth(), value => {
+    node.width = value.unit === Yoga.Unit.Point ? value.value : value.unit === Yoga.Unit.Percent ? `${value.value}%` : "auto";
+  }, samePromptValue);
+  const grow = ownPromptStyle(node, () => n.getFlexGrow(), value => n.setFlexGrow(value));
+  const basis = ownPromptStyle(node, () => n.getFlexBasis(), value => n.setFlexBasis(value), samePromptValue);
+  const min = ownPromptStyle(node, () => n.getMinWidth(), value => n.setMinWidth(value), samePromptValue);
+  width.set({
+    unit: Yoga.Unit.Auto,
+    value: Number.NaN
+  });
+  grow.set(1);
+  basis.set({
+    unit: Yoga.Unit.Point,
+    value: 0
+  });
+  const member = {
+    minimum,
+    minimumStyle: min,
+    restore: [min.restore, basis.restore, grow.restore, width.restore]
+  };
+  lease.members.set(node, member);
+  lease.update();
+  let released = false;
+  return {
+    update(value) {
+      if (!released) {
+        member.minimum = value;
+        lease.update();
+      }
+    },
+    release() {
+      if (released) return;
+      released = true;
+      lease.members.delete(node);
+      for (const restore of member.restore) restore();
+      if (lease.members.size === 0) lease.release();else lease.update();
+    }
+  };
+}
 function PromptRight(props) {
   rememberVisibleSession(props.store, props.sessionID);
   const [width, setWidth] = createSignal(0);
-  const label = createMemo(() => {
+  let node;
+  let layout;
+  const fields = createMemo(() => {
     props.store.revision();
     props.store.clockRevision();
-    return liveLabel(props.store, props.sessionID, props.options.bytesPerToken, width(), Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
+    return promptMetricFields(props.store, props.sessionID, props.options.bytesPerToken, Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
+  });
+  const minimum = () => Math.max(1, ...fields().map(field => field.length));
+  const label = createMemo(() => wrapMetricFields(fields(), width()));
+  const attach = () => {
+    if (!node || node.isDestroyed) return;
+    layout ??= leasePromptLayout(node, minimum());
+    layout?.update(minimum());
+  };
+  const release = () => {
+    layout?.release();
+    layout = undefined;
+  };
+  onMount(attach);
+  createEffect(() => {
+    fields();
+    attach();
+  });
+  onCleanup(() => {
+    node?.off(RenderableEvents.DESTROYED, release);
+    release();
   });
   return (() => {
     var _el$92 = _$createElement("box"),
       _el$93 = _$createElement("text");
     _$insertNode(_el$92, _el$93);
+    _$use(value => {
+      node = value;
+      node.once(RenderableEvents.DESTROYED, release);
+    }, _el$92);
     _$setProp(_el$92, "flexDirection", "column");
     _$setProp(_el$92, "width", "100%");
     _$setProp(_el$92, "flexShrink", 0);
     _$setProp(_el$92, "onSizeChange", function () {
       setWidth(Math.max(1, this.width));
+      attach();
     });
     _$setProp(_el$93, "wrapMode", "word");
     _$setProp(_el$93, "flexShrink", 0);

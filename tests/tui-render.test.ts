@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable, TextRenderable } from "@opentui/core";
+import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, TextareaRenderable, Yoga, LayoutEvents } from "@opentui/core";
 import { testRender, useRenderer } from "@opentui/solid";
 import type { JSX } from "@opentui/solid";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
@@ -90,11 +90,215 @@ if (!nativeChild) {
     ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /14 pass/);
+    assert.match(output.stderr + output.stdout, /17 pass/);
   });
 }
 
 if (nativeChild) {
+type PromptPhase = "WAITING" | "WARMUP" | "LIVE" | "LAST" | "SHORT" | "UNAVAILABLE";
+const promptPhases: PromptPhase[] = ["WAITING", "WARMUP", "LIVE", "LAST", "SHORT", "UNAVAILABLE"];
+const promptSID = "ses_input11_retained_session_complete_identifier_0000000000000000";
+async function promptFixture(budget: number, long = false, sidebar = false, options: { absent?: boolean; extras?: number; plugins?: number; custom?: boolean; terminal?: boolean; auto?: boolean } = {}) {
+  const ui = (await uiPromise)!;
+  const store = ui.createRuntimeStore(1, 0);
+  const api = host(320, 96);
+  api.state = { session: { get: () => ({ id: promptSID, agent: "build" }) }, part: () => [] } as unknown as TuiPluginApi["state"];
+  let serial = 0;
+  const phase = (value: PromptPhase) => {
+    store.active.clear(); store.sessionRuntime.delete(promptSID); store.lastCompletedBySession.delete(promptSID);
+    if (["LAST", "SHORT", "UNAVAILABLE"].includes(value)) {
+      const short = value === "SHORT", output = short ? 6 : 2000;
+      const speed = v3Generation(output, 0, short ? 150 : 2000, 27000);
+      if (short && speed.generation && speed.generationEvidence?.version === 3) {
+        speed.generation.observationQuality = "short";
+        speed.generationEvidence.observationQuality = "short";
+        speed.generationEvidence.clockSource = "performance.now"; speed.generationEvidence.clockResolutionMs = 1;
+      }
+      store.lastCompletedBySession.set(promptSID, ui.makeLastCompletedSnapshot({ version: 1, messageID: `last-${++serial}`, sessionID: promptSID,
+        tokens: { input: 1, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
+        time: { start: 0, firstToken: 26700, completed: 30000 }, samples: [], ...(value === "UNAVAILABLE" ? {} : { speed }) }));
+    } else {
+      const id = `live-${++serial}`;
+      ui.handleMessageUpdated(store, api, { info: { id, sessionID: promptSID, role: "assistant", time: { created: 0 } } }, { type: "message.updated", timestamp: 0 }, 4, 0);
+      const state = store.active.get(id)!;
+      state.selectedSource = "legacy"; state.firstTokenAt = 1000;
+      if (value !== "WAITING") {
+        state.legacy.hasData = true;
+        state.legacy.samples = value === "WARMUP" ? [{ timestamp: 57100, tokens: 5000 }]
+          : [{ timestamp: 56300, tokens: 1250 }, { timestamp: 57300, tokens: 3750 }];
+      }
+    }
+    store.bump();
+  };
+  phase("LIVE");
+  let allocation!: BoxRenderable, body!: BoxRenderable, textarea!: Renderable, row!: BoxRenderable, left!: BoxRenderable, model!: TextRenderable, right!: BoxRenderable;
+  const plugins: Renderable[] = [], extras: TextRenderable[] = [];
+  let originals: unknown;
+  const style = () => ({ wrap: row.getLayoutNode().getFlexWrap(), grow: right.getLayoutNode().getFlexGrow(),
+    basis: right.getLayoutNode().getFlexBasis(), min: right.getLayoutNode().getMinWidth(), leftMax: left.getLayoutNode().getMaxWidth() });
+  const rendered = await testRender(() => {
+    api.renderer = useRenderer();
+    const color = RGBA.fromHex("#eeeeee");
+    const box = (id: string, props: ConstructorParameters<typeof BoxRenderable>[1] = {}) => new BoxRenderable(api.renderer, { id, ...props });
+    const text = (id: string, content: string, props: ConstructorParameters<typeof TextRenderable>[1] = {}) => new TextRenderable(api.renderer, { id, content, fg: color, ...props });
+    allocation = box("session-layout", { width: options.terminal ? budget : budget + 9 + (sidebar ? 42 : 0), height: 96, flexDirection: "row", minHeight: 0 });
+    const main = box("main", { flexGrow: 1, minHeight: 0, paddingBottom: 1, paddingLeft: 2, paddingRight: 2, gap: 1 }); allocation.add(main);
+    main.add(box("messages", { flexGrow: 1, minHeight: 0 }));
+    const anchor = box("prompt", { width: "100%" }); main.add(anchor);
+    const border = box("prompt-border", { width: "100%", border: ["left"], borderColor: color }); anchor.add(border);
+    body = box("prompt-body", { paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexShrink: 0, flexGrow: 1, width: "100%" }); border.add(body);
+    textarea = options.custom ? text("not-a-textarea", "Custom input", { width: "100%" })
+      : new TextareaRenderable(api.renderer, { id: "prompt-textarea", width: "100%", minHeight: 1, maxHeight: 16, initialValue: "Input area - no request", textColor: color });
+    body.add(textarea);
+    row = box("prompt-metadata", { flexDirection: "row", flexShrink: 0, paddingTop: 1, gap: 1, justifyContent: "space-between" }); body.add(row);
+    left = box("agent-model", { flexDirection: "row", gap: 1 }); row.add(left);
+    left.add(text("agent", long ? "Build assistant" : "Build"));
+    if (options.auto) left.add(text("permission-mode", "auto"));
+    const models = box("models", { flexDirection: "row", gap: 1 }); left.add(models);
+    models.add(text("separator", "·"));
+    model = text("model", long ? "torchai-gpt/gpt-6.1-sol-extended-reasoning-model" : "gpt-5.4", { flexShrink: 0 }); models.add(model);
+    models.add(text("provider", "OpenAI")); models.add(text("variant-separator", "·")); models.add(text("variant", "thinking"));
+    right = box("prompt-right", { flexDirection: "row", gap: 1, alignItems: "center" });
+    if (!options.absent || options.extras) row.add(right);
+    for (let i = 0; i < (options.extras ?? 0); i++) { const extra = text(`extra-${i}`, "quota ready", { width: 12, flexShrink: 0 }); right.add(extra); extras.push(extra); }
+    originals = style();
+    if (!options.absent) for (let i = 0; i < (options.plugins ?? 1); i++) {
+      const plugin = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots.session_prompt_right!({ theme: api.theme }, { session_id: promptSID }) as unknown as Renderable;
+      plugins.push(plugin); right.add(plugin);
+    }
+    anchor.add(box("lower-border", { height: 1, border: ["left"], borderColor: color }));
+    const footer = box("prompt-controls", { width: "100%", flexDirection: "row", justifyContent: "space-between" }); anchor.add(footer);
+    footer.add(text("escape", "esc interrupt")); footer.add(text("commands", "tab agents  ctrl+p commands"));
+    if (sidebar) {
+      const overlay = options.terminal && budget <= 120;
+      const side = box("sidebar", { width: 42, height: "100%", paddingLeft: 2, paddingRight: 2, ...(overlay ? { position: "absolute", right: 0, top: 0 } : {}) });
+      allocation.add(side); side.add(text("sidebar-title", "Sidebar fixture"));
+    }
+    return allocation as unknown as JSX.Element;
+  }, { width: options.terminal ? budget : 320, height: 96 });
+  const settle = async () => { for (let i = 0; i < 8; i++) await rendered.renderOnce(); };
+  const frame = (node: Renderable) => rendered.captureCharFrame().split("\n").slice(node.y, node.y + node.height).map(line => line.slice(node.x, node.x + node.width).trimEnd());
+  const assertFields = () => {
+    for (const plugin of plugins.filter(node => !node.isDestroyed)) {
+      const fields = (plugin.getChildren()[0] as TextRenderable).plainText.split(/\n| · /);
+      const lines = frame(plugin);
+      for (const field of fields) {
+        if (field.length <= plugin.width) assert.ok(lines.some(line => line.includes(field)), `${field}: ${JSON.stringify(lines)}`);
+        else assert.ok(lines.join("").replace(/\s/g, "").includes(field.replace(/\s/g, "")), `physical wrap dropped ${field}: ${JSON.stringify(lines)}`);
+      }
+      assert.ok(!lines.some(line => /\.\.\.|…/.test(line)));
+      assert.ok(plugin.x >= row.x && plugin.x + plugin.width <= row.x + row.width);
+    }
+  };
+  await settle();
+  return { store, rendered, allocation, textarea, body, row, left, model, right, plugins, extras, originals, style, phase, settle, frame, assertFields,
+    dispose() { rendered.renderer.destroy(); store.disposeSignals(); } };
+}
+
+test("native prompt parent budget preserves textarea and model across six widths and states", { timeout: 20000 }, async () => {
+  const now = Date.now; Date.now = () => 57300;
+  try {
+    for (const sidebar of [false, true]) for (const long of [true, false]) for (const budget of [160, 120, 100, 80, 60, 40]) {
+      const absent = await promptFixture(budget, long, sidebar, { absent: true });
+      const present = await promptFixture(budget, long, sidebar);
+      try { for (const phase of promptPhases) {
+        present.phase(phase); await present.settle();
+        assert.equal(present.textarea.x, absent.textarea.x); assert.equal(present.textarea.width, budget);
+        assert.equal(present.textarea.width, absent.textarea.width); assert.equal(present.row.width, budget);
+        assert.equal(present.model.width, absent.model.width, `${budget}/${phase}: model stolen`);
+        assert.equal(present.left.width, absent.left.width, `${budget}/${phase}: left stolen`);
+        assert.equal(present.textarea.width, present.body.width - 4);
+        const plugin = present.plugins[0]; assert.equal(plugin.width, present.right.width);
+        assert.equal(present.right.x + present.right.width, present.row.x + present.row.width);
+        present.assertFields();
+        if (long && sidebar && budget === 40) reportFrame(`INPUT11-40-${phase}`, present.frame(present.row).join("\n"));
+      } } finally { present.dispose(); absent.dispose(); }
+    }
+    // Real viewport budgets too: narrow official sidebar is an overlay, not a
+    // fictional 42-column deduction from a 40-column terminal.
+    for (const sidebar of [false, true]) for (const width of [160, 120, 100, 80, 60, 40]) {
+      const absent = await promptFixture(width, true, sidebar, { absent: true, terminal: true });
+      const present = await promptFixture(width, true, sidebar, { terminal: true });
+      try {
+        assert.equal(present.textarea.x, absent.textarea.x); assert.equal(present.textarea.width, absent.textarea.width);
+        assert.equal(present.model.width, absent.model.width); present.assertFields();
+      } finally { present.dispose(); absent.dispose(); }
+    }
+  } finally { Date.now = now; }
+});
+
+test("native prompt remaining budget preserves another right sibling and resizes both ways", async () => {
+  const now = Date.now; Date.now = () => 57300;
+  const fixture = await promptFixture(160, true, false, { extras: 1 });
+  try {
+    for (const budget of [160, 120, 80, 40, 20, 40, 80, 120, 160]) {
+      fixture.allocation.width = budget + 9;
+      for (const phase of promptPhases) {
+        fixture.phase(phase); await fixture.settle();
+        const absent = await promptFixture(budget, true, false, { absent: true, extras: 1 });
+        try {
+          assert.equal(fixture.textarea.width, absent.textarea.width); assert.equal(fixture.textarea.x, absent.textarea.x);
+          assert.equal(fixture.model.width, absent.model.width, `${budget}/${phase}: model ${fixture.model.width}/${absent.model.width}, left ${fixture.left.width}/${absent.left.width}, max ${JSON.stringify(fixture.left.getLayoutNode().getMaxWidth())}`); assert.equal(fixture.extras[0].width, 12);
+          assert.ok(fixture.frame(fixture.extras[0]).join("").includes("quota ready"));
+          assert.equal(fixture.plugins[0].width + 13, fixture.right.width); fixture.assertFields();
+        } finally { absent.dispose(); }
+      }
+    }
+    const layoutChanges = fixture.row.listenerCount(LayoutEvents.RESIZED);
+    const comparison = await promptFixture(160, true, false, { absent: true, extras: 1 });
+    try {
+      for (const model of ["gpt-5.4", "torchai-gpt/gpt-6.1-sol-extended-reasoning-model"]) {
+        fixture.model.content = model; comparison.model.content = model; fixture.store.tick(); await fixture.settle(); await comparison.settle();
+        assert.equal(fixture.model.width, comparison.model.width); assert.equal(fixture.left.width, comparison.left.width);
+      }
+    } finally { comparison.dispose(); }
+    const node = fixture.row.getLayoutNode(), calculate = node.calculateLayout.bind(node);
+    let measurements = 0;
+    node.calculateLayout = (...args: Parameters<typeof calculate>) => { measurements++; return calculate(...args); };
+    const minimum = fixture.right.getLayoutNode().getMinWidth();
+    for (let i = 0; i < 16; i++) { fixture.store.bump(); fixture.store.tick(); await fixture.rendered.renderOnce(); }
+    assert.deepEqual(fixture.right.getLayoutNode().getMinWidth(), minimum);
+    assert.equal(fixture.row.listenerCount(LayoutEvents.RESIZED), layoutChanges);
+    assert.equal(measurements, 0, "unchanged data/frames must not re-measure the baseline");
+    reportFrame("INPUT11-extra-sibling", fixture.frame(fixture.row).join("\n"));
+  } finally { fixture.dispose(); Date.now = now; }
+});
+
+test("native prompt leases clean up, share ownership, respect foreign styles and reject custom hosts", async () => {
+  const now = Date.now; Date.now = () => 57300;
+  try {
+    const shared = await promptFixture(120, false, false, { plugins: 2, extras: 1 });
+    try {
+      shared.assertFields(); assert.equal(shared.extras[0].width, 12);
+      shared.plugins[0].destroyRecursively(); await shared.settle();
+      assert.equal(shared.row.getLayoutNode().getFlexWrap(), Yoga.Wrap.Wrap); shared.assertFields();
+      shared.plugins[1].destroyRecursively(); await shared.settle();
+      assert.deepEqual(shared.style(), shared.originals);
+      assert.equal(shared.row.listenerCount(LayoutEvents.RESIZED), 0); assert.equal(shared.right.listenerCount(LayoutEvents.LAYOUT_CHANGED), 0);
+    } finally { shared.dispose(); }
+    const foreign = await promptFixture(120);
+    try {
+      foreign.row.flexWrap = "wrap-reverse"; foreign.right.flexGrow = 3; foreign.right.flexBasis = 9; foreign.right.minWidth = 17; foreign.left.maxWidth = 23;
+      const changed = foreign.style(); foreign.phase("SHORT"); await foreign.settle();
+      assert.deepEqual(foreign.style(), changed);
+      foreign.plugins[0].destroyRecursively(); await foreign.settle();
+      assert.deepEqual(foreign.style(), changed);
+    } finally { foreign.dispose(); }
+    const custom = await promptFixture(120, true, false, { custom: true });
+    try {
+      assert.deepEqual(custom.style(), custom.originals);
+      custom.phase("SHORT"); await custom.settle(); assert.deepEqual(custom.style(), custom.originals);
+      assert.equal(custom.row.listenerCount(LayoutEvents.RESIZED), 0);
+    } finally { custom.dispose(); }
+    const auto = await promptFixture(80, true, false, { auto: true });
+    const absentAuto = await promptFixture(80, true, false, { auto: true, absent: true });
+    try {
+      assert.equal(auto.model.width, absentAuto.model.width); assert.equal(auto.left.width, absentAuto.left.width);
+      auto.assertFields();
+    } finally { auto.dispose(); absentAuto.dispose(); }
+  } finally { Date.now = now; }
+});
+
 function reportFrame(name: string, frame: string): void {
   if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`FRAME ${name}\n${frame.split("\n").map((line) => line.trimEnd()).filter(Boolean).join("\n")}\nEND FRAME`);
 }
