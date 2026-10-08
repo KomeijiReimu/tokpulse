@@ -6,9 +6,234 @@ import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, conte
 import { createHistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
+import { RECEIVE_CLOCK_RESOLUTION_MS } from "./statistics.js";
+import { createScopeRegistry, coerceScopeEvidence } from "./scope.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
 const PARENT_LOOKUP_TIMEOUT_MS = 200;
+const QUERY_CONCURRENCY = 4;
+const QUERY_RETRY_MS = 30_000;
+const QUERY_CACHE_LIMIT = 2048;
+const PENDING_PERSISTENCE_LIMIT = 128;
+const PENDING_PERSISTENCE_BYTES = 4 * 1024 * 1024;
+const PERSISTENCE_RETRY_BATCH = 4;
+const PERSISTENCE_RETRY_LIMIT = 3;
+const sourcesByRuntime = new WeakMap();
+function runDeferred(runtime, job, prioritize = false) {
+  if (prioritize) runtime.jobs.unshift(job);else runtime.jobs.push(job);
+  const pump = () => {
+    while (runtime.workers < QUERY_CONCURRENCY && runtime.jobs.length) {
+      runtime.workers++;
+      const next = runtime.jobs.shift();
+      void Promise.resolve().then(next).catch(error => warn("background reconciliation failed", error)).finally(() => {
+        runtime.workers--;
+        pump();
+      });
+    }
+  };
+  pump();
+}
+async function persistScopeRegistry(runtime, totals) {
+  for (const [id, proof] of Object.entries(runtime.scopes.serialize())) {
+    const key = JSON.stringify(proof);
+    if (runtime.persistedScopes.get(id) === key) continue;
+    await totals.setSessionScope(id, proof);
+    runtime.persistedScopes.set(id, key);
+  }
+}
+function retireResponse(active, messageID, sessionID) {
+  const runtime = responseRuntime(active);
+  active.delete(messageID);
+  if (!runtime.current.has(sessionID) || runtime.current.get(sessionID) === messageID) {
+    active.delete(pendingKey(sessionID));
+    runtime.current.delete(sessionID);
+    runtime.closed.add(sessionID);
+    runtime.pendingTaints.delete(sessionID);
+  }
+  runtimeContentMetadata(active).completed.add(messageID);
+}
+function eligibleSession(runtime, sessionID) {
+  // ScopeRegistry delegates inherited identity to the shared scope helper.
+  return !runtime.scopes.isExcluded(sessionID);
+}
+function forgetPendingPersistence(source, messageID) {
+  const pending = source.pendingPersistence.get(messageID);
+  if (pending) source.pendingBytes -= pending.bytes;
+  source.pendingPersistence.delete(messageID);
+}
+function discardExcludedPersistence(source) {
+  for (const [id, pending] of source.pendingPersistence) {
+    if (!eligibleSession(source, pending.record.sessionID) || source.messageScopes.has(id) || ["magic-message", "magic-session"].includes(pending.record.scope?.sourceScope ?? "")) {
+      forgetPendingPersistence(source, id);
+    }
+  }
+}
+function retainPendingPersistence(source, record) {
+  const prior = source.pendingPersistence.get(record.messageID);
+  const bytes = utf8ByteLength(JSON.stringify(record));
+  if (!prior && source.pendingPersistence.size >= PENDING_PERSISTENCE_LIMIT || source.pendingBytes - (prior?.bytes ?? 0) + bytes > PENDING_PERSISTENCE_BYTES) {
+    // Finite in-memory retry, not a new durable journal. Never silently evict an
+    // exact record or restore it as LIVE/provisional under persistent failure.
+    warn(`pending completion capacity exceeded; unpersisted message ${record.messageID}`);
+    return;
+  }
+  const sameUpdate = prior?.record?.update?.fingerprint === record.update?.fingerprint;
+  forgetPendingPersistence(source, record.messageID);
+  source.pendingPersistence.set(record.messageID, {
+    record,
+    bytes,
+    retries: sameUpdate ? prior?.retries ?? 0 : 0
+  });
+  source.pendingBytes += bytes;
+}
+async function persistCompletedRecord(source, storage, totals, record) {
+  const wrote = await safeUpsert(storage, totals, record);
+  if (wrote) forgetPendingPersistence(source, record.messageID);else retainPendingPersistence(source, record);
+  return wrote;
+}
+async function retryPendingPersistence(source, storage, totals, sessionID) {
+  discardExcludedPersistence(source);
+  let attempted = 0;
+  for (const [id, pending] of source.pendingPersistence) {
+    if (pending.record.sessionID !== sessionID || pending.retries >= PERSISTENCE_RETRY_LIMIT) continue;
+    if (attempted++ >= PERSISTENCE_RETRY_BATCH) break;
+    pending.retries++;
+    if (await safeUpsert(storage, totals, pending.record)) forgetPendingPersistence(source, id);else if (pending.retries === PERSISTENCE_RETRY_LIMIT) {
+      warn(`completion retry budget exhausted; retaining non-LIVE message ${id}`);
+    }
+  }
+}
+function scheduleIdleReconciliation(input, source, activity, active, sessionID, messageID, info, epoch) {
+  const sessionClient = input.client?.session;
+  const status = sessionClient?.status;
+  // A tool-call/next-loop completion is never a final-answer candidate.
+  if (typeof status !== "function" || !["stop", "end_turn"].includes(info.finish) || source.reconciled.has(messageID) || !eligibleSession(source, sessionID)) return;
+  // A status result closes only the queried participant. Children keep their
+  // own activity intervals; they never suppress an authoritative parent idle.
+  const activeOwn = () => [...active.values()].some(state => state.sessionID === sessionID) || [...source.tools.values()].some(tool => tool.pending && tool.sessionID === sessionID);
+  const fresh = () => (source.epochs.get(sessionID) ?? 0) === epoch && source.responses.get(sessionID) === messageID && eligibleSession(source, sessionID) && !activeOwn();
+  if (!fresh()) return;
+  source.reconciled.add(messageID);
+  runDeferred(source, async () => {
+    if (!fresh()) return;
+    const controller = new AbortController();
+    try {
+      const directory = typeof input.directory === "string" && input.directory.length ? input.directory : undefined;
+      // One deadline covers status and (only for a missing SID) fresh existence
+      // proof. No polling, cached existence, or second independent 200ms wait.
+      const confirmed = await withTimeout((async () => {
+        const v2 = status.length >= 2;
+        const response = await (v2 ? status.call(sessionClient, {
+          directory
+        }, {
+          signal: controller.signal
+        }) : status.call(sessionClient, {
+          query: {
+            directory
+          },
+          signal: controller.signal
+        }));
+        const receivedAt = Date.now();
+        const receivedMono = performance.now();
+        if (controller.signal.aborted || !fresh() || !isRecord(response) || response.error !== undefined) return;
+        const envelope = ["data", "error", "request", "response"].some(key => Object.prototype.hasOwnProperty.call(response, key));
+        const states = plainSDKRecord(envelope ? response.data : response);
+        if (!states) return;
+        if (Object.prototype.hasOwnProperty.call(states, sessionID)) {
+          const names = statusNames(states[sessionID]);
+          if (!names.includes("idle") || names.includes("busy") || names.includes("retry")) return;
+          // Keep successful legacy explicit-idle fixtures without HTTP fields.
+          if (response.response !== undefined && response.response?.status !== 200) return;
+        } else {
+          // Official status.list is ACTIVE-ONLY: a missing SID is default-idle
+          // only with successful scoped HTTP evidence and fresh same-dir get.
+          if (!directory || response.response?.status !== 200 || !Object.values(states).every(value => ["busy", "retry", "idle"].includes(plainSDKRecord(value)?.type)) || reconciliationRequestDirectory(response, directory) !== directory) return;
+          const get = sessionClient?.get;
+          if (typeof get !== "function" || controller.signal.aborted || !fresh()) return;
+          const sessionResponse = await (get.length >= 2 ? get.call(sessionClient, {
+            sessionID,
+            directory
+          }, {
+            signal: controller.signal
+          }) : get.call(sessionClient, {
+            path: {
+              id: sessionID
+            },
+            query: {
+              directory
+            },
+            signal: controller.signal
+          }));
+          if (controller.signal.aborted || !fresh() || !isRecord(sessionResponse) || sessionResponse.error !== undefined || sessionResponse.response?.status !== 200) return;
+          const session = plainSDKRecord(sessionResponse.data);
+          if (!session || session.id !== sessionID || plainSDKRecord(session.location)?.directory !== directory || reconciliationRequestDirectory(sessionResponse, directory) !== directory) return;
+          // This get is existence proof only, not a second metadata classifier.
+          // Existing gated metadata resolution remains the owner of scope facts.
+        }
+        // Fresh get proves scope/existence only; its wait is not user task time.
+        return {
+          receivedAt,
+          receivedMono
+        };
+      })(), PARENT_LOOKUP_TIMEOUT_MS);
+      if (!confirmed) return;
+      const {
+        receivedAt,
+        receivedMono
+      } = confirmed;
+      await source.enqueue(async () => {
+        if (!fresh()) return;
+        // Only an authoritative query boundary closes task activity. Part-end
+        // timestamps are not generation-end evidence. This is participant idle,
+        // not a force-close of the root's independently active descendants.
+        source.states.set(sessionID, "idle");
+        await captureActivityForEvent(activity, "session.status", {
+          sessionID,
+          status: {
+            type: "idle"
+          },
+          observedAt: receivedAt,
+          lastObservedAt: receivedAt
+        }, {}, receivedAt);
+        await source.retryPersistence(sessionID);
+        void receivedMono;
+      });
+    } catch {/* Unknown/failure/timeout leaves lifecycle unchanged. */} finally {
+      controller.abort();
+    }
+  }, true);
+}
+function plainSDKRecord(value) {
+  if (!isRecord(value)) return;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null ? value : undefined;
+}
+
+/** Verify the effective request scope, never infer a directory from cwd.
+ * An explicit supplied query is fallback proof only if request fields are absent. */
+function reconciliationRequestDirectory(result, suppliedDirectory) {
+  if (result.request === undefined) return suppliedDirectory;
+  const request = asRecord(result.request);
+  if (!request || typeof request.url !== "string") return;
+  try {
+    const url = new URL(request.url);
+    if ([...url.searchParams.keys()].some(key => key.toLowerCase().includes("workspace"))) return;
+    const headers = new Headers(request.headers);
+    if ([...headers.keys()].some(key => key.toLowerCase().includes("workspace"))) return;
+    if (url.searchParams.has("directory")) {
+      const directories = url.searchParams.getAll("directory");
+      if (directories.length !== 1 || !directories[0]) return;
+      // GET rewrite can place an already percent-encoded SDK header into query,
+      // so URLSearchParams removes only the outer URL-serialization layer.
+      // Preserve a matching plaintext directory (including literal '%' names).
+      return directories[0] === suppliedDirectory ? directories[0] : decodeURIComponent(directories[0]);
+    }
+    const header = headers.get("x-opencode-directory");
+    return header ? decodeURIComponent(header) || undefined : undefined;
+  } catch {
+    return;
+  }
+}
 const activityInitializationQueues = new Map();
 const contentMetadataByRuntime = new WeakMap();
 const responsesByRuntime = new WeakMap();
@@ -17,6 +242,7 @@ function responseRuntime(active) {
   if (!runtime) {
     runtime = {
       current: new Map(),
+      closed: new Set(),
       pendingTaints: new Map(),
       tainted: new Set(),
       connected: false,
@@ -144,13 +370,125 @@ export const server = async (input, pluginOptions) => {
     metadata.completed.add(id);
   }
   const parentSessionCache = new Map();
+  const source = {
+    scopes: createScopeRegistry(persisted?.sessionScopes),
+    persistedScopes: new Map(Object.entries(persisted?.sessionScopes ?? {}).map(([id, proof]) => [id, JSON.stringify(proof)])),
+    messageScopes: new Map(),
+    metadataGeneration: new Map(),
+    queried: new Map(),
+    outstanding: new Set(),
+    jobs: [],
+    workers: 0,
+    epochs: new Map(),
+    responses: new Map(),
+    pendingPersistence: new Map(),
+    pendingBytes: 0,
+    states: new Map(),
+    tools: new Map(),
+    reconciled: new Set(),
+    retryPersistence: sessionID => retryPendingPersistence(source, storage, totals, sessionID),
+    enqueue: job => {
+      const next = eventQueue.then(job).catch(error => warn("reconciliation apply failed", error));
+      eventQueue = next;
+      return next;
+    },
+    requestMetadata: (sessionID, prioritize = true) => {
+      const sessionClient = input.client?.session;
+      const get = sessionClient?.get;
+      if (typeof get !== "function" || source.scopes.isExcluded(sessionID) || source.outstanding.has(sessionID)) return;
+      const now = performance.now();
+      if (now - (source.queried.get(sessionID) ?? -Infinity) < QUERY_RETRY_MS) return;
+      source.queried.delete(sessionID);
+      source.queried.set(sessionID, now);
+      while (source.queried.size > QUERY_CACHE_LIMIT) source.queried.delete(source.queried.keys().next().value);
+      source.outstanding.add(sessionID);
+      const generation = source.metadataGeneration.get(sessionID) ?? 0;
+      runDeferred(source, async () => {
+        const controller = new AbortController();
+        try {
+          // SDK v1's generated get(options) takes path.id. SDK v2's generated
+          // get(parameters, options) takes sessionID; raw fields remain intact.
+          const v2 = get.length >= 2;
+          const response = await withTimeout(Promise.resolve().then(() => v2 ? get.call(sessionClient, {
+            sessionID
+          }, {
+            signal: controller.signal
+          }) : get.call(sessionClient, {
+            path: {
+              id: sessionID
+            },
+            signal: controller.signal
+          })), PARENT_LOOKUP_TIMEOUT_MS);
+          const arrivedAt = Date.now();
+          if (!response || response.error) return;
+          const raw = asRecord(response.data) ?? asRecord(response);
+          const session = asRecord(raw?.session) ?? raw;
+          if (!session || session.id !== sessionID) return;
+          await source.enqueue(async () => {
+            if ((source.metadataGeneration.get(sessionID) ?? 0) !== generation) return;
+            source.scopes.observeSessionMetadata(sessionID, session);
+            discardExcludedPersistence(source);
+            const parent = source.scopes.getEvidence(sessionID)?.parentSessionID;
+            if (parent) {
+              parentSessionCache.set(sessionID, parent);
+              await safeRecordParentFact(activity, "session.metadata.resolved", sessionID, parent, arrivedAt, {}, {});
+              source.requestMetadata(parent);
+              // Late ancestry is a separate canonical fact in sessionScopes
+              // and runs. Do not forge a newer completion to rewrite history.
+            }
+            await persistScopeRegistry(source, totals);
+          });
+        } catch {/* SDK failure/404 is unknown, never negative source proof. */} finally {
+          controller.abort();
+          source.outstanding.delete(sessionID);
+        }
+      }, prioritize);
+    }
+  };
+  sourcesByRuntime.set(active, source);
+  for (const [id, raw] of Object.entries(persisted?.messageScopes ?? {})) {
+    const proof = coerceScopeEvidence(raw);
+    if (proof?.sourceScope === "magic-message") source.messageScopes.set(id, proof);
+  }
+  for (const [id, contribution] of Object.entries({
+    ...persisted?.settled,
+    ...persisted?.open
+  })) {
+    const proof = contribution !== true ? coerceScopeEvidence(contribution.excluded) : undefined;
+    if (proof?.sourceScope === "magic-message") source.messageScopes.set(id, proof);
+  }
+  for (const [id, proof] of Object.entries(source.scopes.serialize())) {
+    if (proof.parentSessionID) parentSessionCache.set(id, proof.parentSessionID);
+  }
+  // Bootstrap old retained identities with the same bounded background workers;
+  // startup and the serial event queue never wait for a thousand SDK requests.
+  for (const id of Object.keys(persisted?.sessions ?? {})) source.requestMetadata(id, false);
   // Establish the epoch when ingress is ready, not before asynchronous startup.
   responseRuntime(active).observedSince = Date.now();
   const event = payload => {
     const rawEvent = payload?.event;
     const receivedAt = Date.now();
     const receivedMonotonic = performance.now();
-    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic)).catch(error => {
+    const incoming = unwrapIncomingEvent(rawEvent);
+    let ingressEpoch = 0;
+    if (incoming) {
+      const properties = asRecord(incoming.properties) ?? asRecord(incoming.data) ?? {};
+      const sid = readSessionIDFromEvent(incoming.type, properties, incoming);
+      if (sid && eligibleSession(source, sid)) {
+        const info = eventInfo(properties, incoming);
+        const id = readMessageID(properties, info ?? {});
+        const live = !isSnapshotIngress(incoming, properties);
+        const assistantWork = live && info?.role === "assistant" && id && !metadata.completed.has(id);
+        const deltaWork = live && (incoming.type.endsWith(".delta") || incoming.type.startsWith("session.next.step.")) && (id ? !metadata.completed.has(id) : responseRuntime(active).current.has(sid));
+        const toolWork = live && properties.part?.type === "tool" && !["completed", "error"].includes(properties.part.state?.status);
+        if (assistantWork) source.responses.set(sid, id);
+        if (assistantWork || deltaWork || toolWork || lifecycleStateForEvent(incoming.type, properties, incoming)) {
+          source.epochs.set(sid, (source.epochs.get(sid) ?? 0) + 1);
+        }
+        ingressEpoch = source.epochs.get(sid) ?? 0;
+      }
+    }
+    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic, ingressEpoch)).catch(error => {
       warn("event handling failed", error);
     });
     eventQueue = next;
@@ -434,7 +772,7 @@ function readSessionIDFromEvent(type, properties, event) {
   if (direct) return direct;
   const sessionObjectID = readStringFrom([asRecord(properties.session), asRecord(event.session), asRecord(properties.event), asRecord(event.event)], ["id"]);
   if (sessionObjectID) return sessionObjectID;
-  const nested = [asRecord(properties.session), asRecord(properties.event), asRecord(event.session), asRecord(event.event), asRecord(properties.info), asRecord(event.info)];
+  const nested = [asRecord(properties.part), asRecord(event.part), asRecord(properties.session), asRecord(properties.event), asRecord(event.session), asRecord(event.event), asRecord(properties.info), asRecord(event.info)];
   const sessionID = readStringFrom(nested, ["sessionID", "sessionId", "session.id"]);
   if (sessionID) return sessionID;
   if (type === "session.status" || type.startsWith("session.")) {
@@ -543,12 +881,87 @@ function unwrapIncomingEvent(value) {
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
-async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic) {
+async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic, ingressEpoch) {
   try {
     const event = unwrapIncomingEvent(rawEvent);
     if (!event) return;
     const type = typeof event.type === "string" ? event.type : "";
     const properties = asRecord(event.properties) ?? asRecord(event.data) ?? {};
+    const source = sourcesByRuntime.get(active);
+    const sessionID = readSessionIDFromEvent(type, properties, event);
+    const info = eventInfo(properties, event);
+    let messageProof;
+    let scopeChanged = false;
+    if (sessionID) {
+      const before = source.scopes.revision;
+      const parent = readParentSessionIDFromEvent(type, properties, event);
+      if (parent) {
+        parentSessionCache.set(sessionID, parent);
+        source.scopes.observeSessionMetadata(sessionID, {
+          parentSessionID: parent
+        });
+      }
+      for (const raw of [asRecord(properties.session), asRecord(event.session)]) {
+        if (raw) source.scopes.observeSessionMetadata(sessionID, raw);
+      }
+      if (type === "session.created" || type === "session.updated") {
+        // Observe the raw SDK entity (including fields absent from SDK typings).
+        for (const raw of [properties, event, asRecord(properties.session), asRecord(event.session), info]) {
+          if (raw) source.scopes.observeSessionMetadata(sessionID, raw);
+        }
+        source.metadataGeneration.set(sessionID, (source.metadataGeneration.get(sessionID) ?? 0) + 1);
+      }
+      if (info?.role === "assistant") {
+        messageProof = source.scopes.observeMessageMetadata(sessionID, info);
+        const id = readMessageID(properties, info);
+        if (id && messageProof.sourceScope === "magic-message") {
+          source.messageScopes.set(id, messageProof);
+          await totals.excludeMessage(id, messageProof);
+          const old = (await storage.read()).find(record => record.messageID === id);
+          if (old) {
+            const annotated = {
+              ...old,
+              scope: messageProof
+            };
+            await storage.upsert(annotated);
+          }
+          retireResponse(active, id, sessionID);
+          completedMessageIDs.add(id);
+        }
+      }
+      scopeChanged = source.scopes.revision !== before;
+      if (scopeChanged) source.metadataGeneration.set(sessionID, (source.metadataGeneration.get(sessionID) ?? 0) + 1);
+      discardExcludedPersistence(source);
+      source.requestMetadata(sessionID);
+      if (parent) source.requestMetadata(parent);
+    }
+    const messageID = readMessageID(properties, info ?? {});
+    const excluded = sessionID && (!eligibleSession(source, sessionID) || messageID && source.messageScopes.has(messageID));
+    if (excluded) {
+      if (scopeChanged) await persistScopeRegistry(source, totals);
+      if (messageID && sessionID) {
+        retireResponse(active, messageID, sessionID);
+        completedMessageIDs.add(messageID);
+      }
+      // Known hidden activity never extends the user task or creates counters.
+      return;
+    }
+    if (type === "message.part.delta" || type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
+      // Capture counters with the paired ingress clocks before any disk/SDK I/O.
+      recordDelta(active, properties, event, receivedAt, type === "message.part.delta" ? "legacy" : "v2", bytesPerToken, receivedMonotonic);
+      if (scopeChanged) await persistScopeRegistry(source, totals);
+      return;
+    }
+    if (scopeChanged) await persistScopeRegistry(source, totals);
+    const lifecycle = lifecycleStateForEvent(type, properties, event);
+    if (sessionID && lifecycle) source.states.set(sessionID, lifecycle);
+    const part = asRecord(properties.part);
+    if (part?.type === "tool" && typeof part.id === "string" && sessionID) {
+      source.tools.set(part.id, {
+        sessionID,
+        pending: !["completed", "error"].includes(part.state?.status)
+      });
+    }
     recordResponseLifecycle(active, type, properties, event, receivedAt);
     const explicitTimestamp = explicitEventTimestamp(event, properties);
     const rawKey = explicitTimestamp === undefined && needsActivityIdentity(type, properties, event) ? rawEventKey(type, event) : undefined;
@@ -562,16 +975,17 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
       recordPartMetadata(active, properties, timestamp, event);
       return;
     }
-    if (type === "message.part.delta") {
-      recordDelta(active, properties, event, receivedAt, "legacy", bytesPerToken, receivedMonotonic);
-      return;
-    }
-    if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
-      recordDelta(active, properties, event, receivedAt, "v2", bytesPerToken, receivedMonotonic);
-      return;
-    }
     if (type === "message.updated") {
-      await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt);
+      try {
+        await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt);
+      } finally {
+        if (info?.role === "assistant" && messageID && sessionID && !isSnapshotIngress(event, properties) && isCompleted(info, properties, event)) {
+          // Lifecycle ownership is independent of accepting a usage correction.
+          retireResponse(active, messageID, sessionID);
+          completedMessageIDs.add(messageID);
+          scheduleIdleReconciliation(input, source, activity, active, sessionID, messageID, info, ingressEpoch);
+        }
+      }
       return;
     }
     if (type === "session.next.step.started") {
@@ -584,6 +998,10 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
     }
     if (isIdleEvent(type, properties, event)) {
       await flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken);
+      // An authoritative terminal event retires only this session's tool
+      // ownership. A still-busy legitimate child remains independently active.
+      for (const [id, tool] of source.tools) if (tool.sessionID === sessionID) source.tools.delete(id);
+      await retryPendingPersistence(source, storage, totals, sessionID);
     }
   } catch (error) {
     warn("event parsing failed", error);
@@ -595,6 +1013,7 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
   const messageID = readMessageID(properties);
   const metadata = runtimeContentMetadata(active);
   if (isSnapshotIngress(event, properties)) return;
+  if (!messageID && responseRuntime(active).closed.has(sessionID)) return;
   if (messageID && (metadata.completed.has(messageID) || metadata.roles.has(messageID) && metadata.roles.get(messageID) !== "assistant")) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
@@ -625,6 +1044,9 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
     receivedAt: timestamp,
     receivedMono: receivedMonotonic,
     stream
+  }, {
+    clockSource: "performance.now",
+    clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS
   });
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample = {
@@ -642,6 +1064,7 @@ function recordResponseStep(active, properties, event, timestamp) {
   const sessionID = readSessionIDFromEvent(event.type, properties, event);
   const messageID = readMessageID(properties);
   if (!sessionID || messageID && runtimeContentMetadata(active).completed.has(messageID)) return;
+  if (!messageID && responseRuntime(active).closed.has(sessionID)) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   bindPendingTaint(active, state);
   const id = properties.stepID ?? properties.stepId ?? properties.step?.id ?? properties.part?.id ?? properties.id;
@@ -654,6 +1077,7 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   if (!sessionID) return;
   const messageID = readMessageID(properties);
   if (messageID && completedMessageIDs.has(messageID)) return;
+  if (!messageID && responseRuntime(active).closed.has(sessionID)) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
   state.progress ??= cachedContentProgress(runtimeContentMetadata(active), messageID ?? pendingKey(sessionID));
@@ -710,11 +1134,20 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     }
     bindPendingTaint(active, state);
     responseRuntime(active).current.set(sessionID, messageID);
+    responseRuntime(active).closed.delete(sessionID);
     active.set(messageID, state);
     return;
   }
   if (isSnapshotIngress(event, properties)) return;
-  const previous = (await storage.read()).find(record => record.messageID === messageID);
+  const source = sourcesByRuntime.get(active);
+  // A failed history write must not prevent building the full completion from
+  // LIVE evidence. A retained non-LIVE candidate also survives partial/replayed
+  // completion facts without regenerating its calibrated samples or clocks.
+  const retained = await storage.read().catch(error => {
+    warn("history read failed", error);
+    return [];
+  });
+  const previous = source.pendingPersistence.get(messageID)?.record ?? retained.find(record => record.messageID === messageID);
   const ledger = await totals.read().catch(() => undefined);
   const snapshot = ledger?.open[messageID] ?? ledger?.settled[messageID];
   if (snapshot === true) {
@@ -722,6 +1155,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     // or manufacture speed coverage from an already-accounted old response.
     completedMessageIDs.add(messageID);
     metadata.completed.add(messageID);
+    forgetPendingPersistence(source, messageID);
     active.delete(messageID);
     return;
   }
@@ -751,7 +1185,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
   if (!isNewerCompletionUpdate(update, priorUpdate)) {
     // A history write may have succeeded while its totals write failed. Replay
     // repairs that single-writer projection rather than dropping the retry.
-    const repaired = previous ? await safeUpsert(storage, totals, previous) : snapshot !== undefined;
+    const repaired = previous ? await persistCompletedRecord(source, storage, totals, previous) : snapshot !== undefined;
     if (repaired) {
       completedMessageIDs.add(messageID);
       metadata.completed.add(messageID);
@@ -782,7 +1216,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     output: tokens.output,
     reasoning: tokens.reasoning
   });
-  const parentSessionID = await resolveParentSessionID(input, parentSessionCache, sessionID, "message.updated", properties, event);
+  const parentSessionID = resolveParentSessionID(input, parentSessionCache, sessionID, "message.updated", properties, event);
   await safeRecordParentFact(activity, "message.updated", sessionID, parentSessionID, timestamp, properties, event);
   const record = makeHistoryRecord({
     messageID,
@@ -814,16 +1248,17 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
   record.time.ttft = timeToFirstToken(record);
   record.speed = mergeRecordSpeed(record, prior, responseRuntime(active).tainted.has(messageID) || state && chooseSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
   record.update = update;
-  if (await safeUpsert(storage, totals, record)) {
+  if (await persistCompletedRecord(source, storage, totals, record)) {
     completedMessageIDs.add(messageID);
     metadata.completed.add(messageID);
-  } else if (state) active.set(messageID, state);
+  }
 }
 async function flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
   if (!sessionID) return;
   responseRuntime(active).pendingTaints.delete(sessionID);
   responseRuntime(active).current.delete(sessionID);
+  responseRuntime(active).closed.add(sessionID);
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
     active.delete(key);
@@ -838,7 +1273,7 @@ async function flushIdleStates(input, storage, totals, activity, active, complet
       cacheRead: state.fallbackTokens.cacheRead ?? 0,
       cacheWrite: state.fallbackTokens.cacheWrite ?? 0
     };
-    const parentSessionID = await resolveParentSessionID(input, parentSessionCache, sessionID, "session.idle", properties, event);
+    const parentSessionID = resolveParentSessionID(input, parentSessionCache, sessionID, "session.idle", properties, event);
     await safeRecordParentFact(activity, "session.idle", sessionID, parentSessionID, timestamp, properties, event);
     const record = makeHistoryRecord({
       messageID: state.messageID,
@@ -937,7 +1372,7 @@ function estimateStateTokens(state, bytesPerToken) {
 }
 function takeState(active, messageID, sessionID, timestamp) {
   const direct = active.get(messageID);
-  const pending = active.get(pendingKey(sessionID));
+  const pending = runtimeContentMetadata(active).completed.has(messageID) ? undefined : active.get(pendingKey(sessionID));
   if (direct && pending && direct !== pending) {
     mergeStates(direct, pending);
     active.delete(pendingKey(sessionID));
@@ -1068,40 +1503,15 @@ function isIdleEvent(type, properties, event) {
   const state = lifecycleStateForEvent(type, properties, event);
   return state !== undefined && !isActiveState(state);
 }
-async function resolveParentSessionID(input, cache, sessionID, type, properties, event) {
+function resolveParentSessionID(input, cache, sessionID, type, properties, event) {
   const direct = readParentSessionIDFromEvent(type, properties, event);
   if (direct && direct !== sessionID) {
     cache.set(sessionID, direct);
     return direct;
   }
-  if (cache.has(sessionID)) return cache.get(sessionID);
-  const client = input.client;
-  const get = client?.session?.get;
-  const sessionClient = client?.session;
-  if (typeof get === "function" && sessionClient) {
-    try {
-      const response = await withTimeout(Promise.resolve().then(() => get.call(sessionClient, {
-        path: {
-          id: sessionID
-        }
-      })), PARENT_LOOKUP_TIMEOUT_MS);
-      if (response === undefined) {
-        cache.set(sessionID, undefined);
-        return undefined;
-      }
-      const session = asRecord(response?.data) ?? asRecord(response);
-      const parent = readStringFrom([session, asRecord(session?.session)], ["parentID", "parentSessionID", "parentSessionId", "parent.id", "session.parentID", "session.parentSessionID", "session.parentSessionId"]);
-      const resolved = parent && parent !== sessionID ? parent : undefined;
-      cache.set(sessionID, resolved);
-      return resolved;
-    } catch {
-      cache.set(sessionID, undefined);
-      return undefined;
-    }
-  }
-  const fallback = direct && direct !== sessionID ? direct : undefined;
-  cache.set(sessionID, fallback);
-  return fallback;
+  // Metadata I/O is owned by the deferred worker. Serial completion/receipt
+  // processing can only consume already-observed authoritative ancestry.
+  return cache.get(sessionID);
 }
 async function withTimeout(promise, timeoutMs) {
   let timer;

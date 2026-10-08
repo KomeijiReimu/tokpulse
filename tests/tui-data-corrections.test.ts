@@ -13,7 +13,9 @@ import {
   recordDelta, recordStepStarted, recordStepFallback, recordTuiPartMetadata, recordTuiObservationLifecycle, reloadHistory, sessionUsageSummary,
   liveLabel, recordSpeedSummary, makeLastCompletedSnapshot, formatResponseTimingDetails,
   sessionAverageDisplay,
+  hydrateHistoryState, cacheSessionParentFromEvent, childRows, buildSessionDetailsTree, taskWallTimeForSession, reloadActivity,
 } from "../src/tui.js";
+import { createScopeRegistry } from "../src/scope.js";
 
 const api = { state: { session: { get: () => undefined } }, ui: { toast: () => undefined } } as unknown as TuiPluginApi;
 async function testDirectory(prefix: string): Promise<string> {
@@ -99,6 +101,178 @@ test("TUI live corrections allow explicit zero, smaller usage and shorter durati
     const evidenceOnly = { ...corrected, update: { ...(corrected as MeasuredHistoryRecord).update!, sequence: 99 } };
     assert.equal(historyRecordsEquivalent(corrected, evidenceOnly), false);
   } finally { store.disposeSignals(); }
+});
+
+test("rejected completion usage still retires its live direct and owned pending without closing the next response", () => {
+  for (const rejection of ["missing-reasoning", "stale-revision", "settled-tombstone"] as const) {
+    const store = createRuntimeStore(5, 0);
+    try {
+      const prior = { sessionID: "s", quality: "exact" as const, tokens: { input: 1, output: 10, reasoning: 3, cacheRead: 0, cacheWrite: 0 }, cost: 1,
+        update: { source: "live" as const, instanceID: "prior", sequence: 2, receivedAt: 2, revision: 5, fingerprint: "prior", seenFingerprints: ["prior"] } };
+      beginObserved(store);
+      store.totalsLedger = { ...store.totalsLedger, sessions: { s: { tokens: prior.tokens, cost: 1, responseCount: 1 } },
+        settled: { m: rejection === "settled-tombstone" ? true : prior } };
+      const pending = createActiveState("__pending__:s", "s", 30);
+      pending.ownerMessageID = "m";
+      pending.responseEpoch = store.active.get("m")!.responseEpoch;
+      store.active.set(pending.messageID, pending);
+      const event = completion("m", 5, 0);
+      if (rejection === "missing-reasoning") delete (event.properties.info.tokens as { reasoning?: number }).reasoning;
+      if (rejection === "stale-revision") Object.assign(event, { revision: 4 });
+      assert.equal(send(store, event), false, rejection);
+      assert.equal(store.active.size, 0, rejection);
+      assert.equal(store.sessionRuntime.get("s")!.activeMessageID, undefined);
+      assert.equal(store.totalsLedger.sessions.s.tokens.reasoning, 3);
+      send(store, { type: "message.part.delta", timestamp: 1300, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" } });
+      assert.equal(store.active.size, 0, "closed IDs do not resurrect");
+      beginObserved(store, "next", 1300, 1310);
+      send(store, event, 1400);
+      assert.equal(store.sessionRuntime.get("s")!.activeMessageID, "next");
+      assert.equal(store.active.has("next"), true);
+    } finally { store.disposeSignals(); }
+  }
+});
+
+test("authoritative hydrate closes same-ID live overlap and late content cannot hide LAST; anonymous content is not LIVE", () => {
+  const store = createRuntimeStore(5, 0);
+  try {
+    beginObserved(store);
+    const record = { version: 1 as const, messageID: "m", sessionID: "s", tokens: { input: 1, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
+      time: { start: 0, completed: 100 }, samples: [], quality: "exact" as const };
+    hydrateHistoryState(store, [record]);
+    assert.equal(store.active.size, 0);
+    assert.match(liveLabel(store, "s", 4, 24, 100), /^LAST --/);
+    send(store, { type: "message.part.delta", timestamp: 200, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" } });
+    send(store, { type: "session.next.step.started", timestamp: 210, properties: { sessionID: "s", stepID: "unknown" } });
+    assert.match(liveLabel(store, "s", 4, 24, 50000), /^LAST --/);
+    assert.doesNotMatch(liveLabel(store, "s", 4, 24, 50000), /elapsed|LIVE|WARMUP|gen ~0/);
+  } finally { store.disposeSignals(); }
+});
+
+test("invalidated usage reload still retires an observed authoritative completion, never a newer response", async () => {
+  const directory = await testDirectory("tui-invalidated-completion-");
+  const path = join(directory, "history.jsonl");
+  const record = { version: 1, messageID: "m", sessionID: "s", quality: "exact", tokens: { input: 1, output: 6, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: 0, time: { start: 0, completed: 100 }, samples: [] };
+  await writeFile(path, JSON.stringify(record) + "\n");
+  try {
+    for (const newer of [false, true]) {
+      const store = createRuntimeStore(5, 0);
+      try {
+        beginObserved(store);
+        if (newer) beginObserved(store, "next", 200, 210);
+        store.historyGeneration = 2;
+        const ledger = store.totalsLedger;
+        await reloadHistory(store, api, path, join(directory, "totals.json"), 5, 1);
+        assert.equal(store.completedMessageIDs.has("m"), true, "seen completion is a lifecycle fact even when usage generation is obsolete");
+        assert.equal(store.active.has("m"), false);
+        assert.equal(store.active.has("next"), newer);
+        assert.equal(store.sessionRuntime.get("s")!.activeMessageID, newer ? "next" : undefined);
+        send(store, { type: "message.part.delta", timestamp: 300, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" } });
+        assert.equal(store.active.has("m"), false);
+        assert.equal(store.totalsLedger, ledger, "stale generation cannot commit its usage ledger");
+        assert.equal(store.records.length, 0, "latest drain still owns history/usage application");
+      } finally { store.disposeSignals(); }
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("task busy and anonymous compatibility events cannot invent an owned generation timer", () => {
+  const store = createRuntimeStore(1, 0);
+  try {
+    send(store, { type: "session.status", timestamp: 0, properties: { sessionID: "s", status: "busy" } });
+    send(store, { type: "session.next.step.started", timestamp: 10, properties: { sessionID: "s", stepID: "unknown" } });
+    assert.equal(liveLabel(store, "s", 4, 20, 57000), "TASK BUSY");
+    assert.equal(taskWallTimeForSession(store, "s", 57000), 57000, "real task activity still has its own clock");
+    send(store, { type: "session.idle", timestamp: 1000, properties: { sessionID: "s" } });
+    assert.equal(hasLiveTaskWallActivity(store), false);
+    assert.equal(taskWallTimeForSession(store, "s", 57000), 1000);
+  } finally { store.disposeSignals(); }
+});
+
+test("late maintenance session identity projects usage, descendants, history, LAST, active unions and details without altering raw ledger", () => {
+  const store = createRuntimeStore(10, 0);
+  try {
+    generatedText(store, "user");
+    const rawUser = store.records[0];
+    const hidden = { ...rawUser, messageID: "hidden", sessionID: "mc", parentSessionID: "s" };
+    const nested = { ...hidden, messageID: "nested", sessionID: "mc-child", parentSessionID: "mc" };
+    store.records = [rawUser, hidden, nested];
+    store.diskRecords = [...store.records];
+    const direct = { tokens: rawUser.tokens, cost: rawUser.cost, responseCount: 1, speed: updateSpeedTotals(undefined, rawUser.speed, 1) };
+    store.totalsLedger = { ...store.totalsLedger, sessions: { s: direct, mc: direct, "mc-child": direct }, settled: { user: true, hidden: true, nested: true } };
+    store.sessionParents = new Map([["mc", "s"], ["mc-child", "mc"]]);
+    const raw = structuredClone(store.totalsLedger);
+    for (const [sid, at] of [["s", 0], ["mc", 100], ["mc-child", 200]] as const) send(store, { type: "session.status", timestamp: at, properties: { sessionID: sid, status: "busy" } });
+    send(store, { type: "session.idle", timestamp: 1200, properties: { sessionID: "s" } });
+    cacheSessionParentFromEvent(store, { type: "session.updated", properties: { info: { id: "mc", title: "Magic Context dreamer", parentID: "s" } } });
+    assert.deepEqual(store.records.map((r) => r.messageID), ["user"]);
+    assert.equal(sessionUsageSummary(store, "s").totalGeneratedTokens, 10);
+    assert.equal(sessionUsageSummary(store, "s").totalResponseCount, 1);
+    assert.deepEqual(childRows(store.records, "s", store), []);
+    assert.deepEqual(buildSessionDetailsTree(store, "s").nodes.map((n) => n.sessionID), ["s"]);
+    assert.equal(liveLabel(store, "mc", 4, 80), "");
+    assert.equal(taskWallTimeForSession(store, "s", 60000), 1200);
+    assert.equal(hasLiveTaskWallActivity(store), false);
+    assert.ok([...store.taskRuns.values()].every((run) => !run.activeSessions.has("mc") && !run.activeSessions.has("mc-child")));
+    assert.deepEqual(store.totalsLedger, raw);
+  } finally { store.disposeSignals(); }
+});
+
+test("same-SID compaction tombstones filter history and LAST but leave the user's other usage intact", () => {
+  for (const legacy of [false, true]) {
+    const store = createRuntimeStore(5, 0);
+    try {
+      generatedText(store, "user");
+      const user = store.records[0];
+      const compact = { ...user, messageID: "compact", tokens: { ...user.tokens, output: 1000 }, time: { ...user.time, completed: 2000 } };
+      const registry = createScopeRegistry();
+      const proof = registry.observeMessageMetadata("s", { role: "assistant", agent: "compaction" });
+      store.totalsLedger = { ...store.totalsLedger, settled: { user: true, compact: legacy ? true : { sessionID: "s", quality: "exact", tokens: compact.tokens, cost: compact.cost, excluded: proof } },
+        ...(legacy ? { messageScopes: { compact: proof } } : {}), sessions: { s: { tokens: user.tokens, cost: user.cost, responseCount: 1, speed: updateSpeedTotals(undefined, user.speed, 1) } } };
+      hydrateHistoryState(store, [user, compact]);
+      assert.equal(store.lastCompletedBySession.get("s")!.record.messageID, "user");
+      assert.equal(sessionUsageSummary(store, "s").totalGeneratedTokens, 10);
+      assert.equal(buildSessionDetailsTree(store, "s").nodes.length, 1);
+      assert.equal(projectSessionTotals(store.totalsLedger, [user, compact], new Map(), "s").direct.tokens.output, 10);
+    } finally { store.disposeSignals(); }
+  }
+});
+
+test("canonical current SDK idle closes only its local epoch while real child work and newer epochs continue", async () => {
+  const directory = await testDirectory("tui-canonical-idle-");
+  const store = createRuntimeStore(5, 0);
+  const path = join(directory, "runs.jsonl");
+  try {
+    cacheSessionParentFromEvent(store, { type: "session.created", properties: { info: { id: "child", parentID: "s" } } });
+    send(store, { type: "session.status", timestamp: 100, properties: { sessionID: "s", status: "busy" } });
+    send(store, { type: "session.status", timestamp: 200, properties: { sessionID: "child", status: "busy" } });
+    const facts = [{ version: 1, kind: "lifecycle", sessionID: "s", state: "busy", timestamp: 100, observedAt: 100, instanceID: "current" },
+      { version: 1, kind: "lifecycle", sessionID: "s", state: "idle", timestamp: 500, observedAt: 500, instanceID: "current" }];
+    await writeFile(path, facts.map((fact) => JSON.stringify(fact)).join("\n") + "\n");
+    await reloadActivity(store, api, path);
+    assert.equal(store.sessionRuntime.get("s")!.status, "idle");
+    assert.equal(hasLiveTaskWallActivity(store), true, "the genuine child is still busy");
+    assert.equal(taskWallTimeForSession(store, "s", 1000), 900);
+    send(store, { type: "session.idle", timestamp: 1100, properties: { sessionID: "child" } });
+    assert.equal(hasLiveTaskWallActivity(store), false);
+    assert.equal(taskWallTimeForSession(store, "s", 60000), 1000);
+    send(store, { type: "session.status", timestamp: 2000, properties: { sessionID: "s", status: "busy" } });
+    await reloadActivity(store, api, path);
+    assert.equal(store.sessionRuntime.get("s")!.status, "busy", "old SDK idle cannot freeze the new epoch");
+    assert.equal(taskWallTimeForSession(store, "s", 2500), 1500);
+    beginObserved(store, "tool-response", 2000, 2010);
+    let toolRunning = true;
+    const toolApi = { ...api, state: { ...api.state, part: () => [{ type: "tool", state: { status: toolRunning ? "running" : "completed", time: { start: 2100 } } }] } } as unknown as TuiPluginApi;
+    await writeFile(path, [{ ...facts[0], timestamp: 2000, observedAt: 2000 }, { ...facts[1], timestamp: 2200, observedAt: 2200 }].map((fact) => JSON.stringify(fact)).join("\n") + "\n");
+    await reloadActivity(store, toolApi, path);
+    assert.equal(store.sessionRuntime.get("s")!.status, "busy", "a real running tool is not retracted by an older terminal overlay");
+    assert.equal(hasLiveTaskWallActivity(store), true);
+    toolRunning = false;
+    await reloadActivity(store, toolApi, path);
+    assert.equal(store.sessionRuntime.get("s")!.status, "idle");
+    assert.equal(hasLiveTaskWallActivity(store), false);
+  } finally { store.disposeSignals(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("TUI envelope revisions reject stale updates and authorize a newer return to previously seen facts", () => {
@@ -286,7 +460,7 @@ test("live metadata Thinking sets first response without tokens and preserves se
       assert.equal(state.firstContentAt, undefined);
       assert.equal(state.legacy.samples.length + state.v2.samples.length, 0);
       assert.deepEqual(state.fallbackTokens, {});
-      assert.match(liveLabel(store, "s", 4, 70, 200), /gen ~0 ttft 100ms/);
+      assert.match(liveLabel(store, "s", 4, 70, 200), /WAITING -- · gen -- · ttft 100ms/);
       const revision = store.revision();
       send(store, thinking);
       assert.equal(store.revision(), revision);

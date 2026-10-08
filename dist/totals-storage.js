@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { addTokenCounts, emptyTokenCounts, normalizeTokenCounts } from "./core.js";
 import { GENERATION_BASIS_VERSION, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, emptySpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { coerceScopeEvidence, isSessionScopeExcluded, mergeScopeEvidence } from "./scope.js";
 export const TOTALS_VERSION = 1;
 export { GENERATION_BASIS_VERSION } from './statistics.js';
 export const DEFAULT_TOTALS_FILENAME = "totals.json";
@@ -55,6 +56,21 @@ export function createTotalsStorage(pathOrOptions) {
       return cloneLedger(ledger);
     }),
     read: () => enqueuePath(path, () => loadLedger(path)),
+    setSessionScope: (sessionID, evidence) => enqueuePath(path, async () => {
+      const proof = coerceScopeEvidence(evidence);
+      if (!sessionID || !proof || proof.sourceScope === "magic-message") throw new TypeError("Invalid session scope");
+      const ledger = await loadLedger(path);
+      ledger.sessionScopes ??= {};
+      ledger.sessionScopes[sessionID] = mergeScopeEvidence(ledger.sessionScopes[sessionID], proof);
+      return persistLedger(path, ledger);
+    }),
+    excludeMessage: (messageID, scopeProof) => enqueuePath(path, async () => {
+      const proof = coerceScopeEvidence(scopeProof);
+      if (!messageID || !proof || !["magic-message", "magic-session"].includes(proof.sourceScope)) throw new TypeError("Invalid message exclusion");
+      const ledger = await loadLedger(path);
+      excludeContribution(ledger, messageID, proof);
+      return persistLedger(path, ledger);
+    }),
     quarantine: () => enqueuePath(path, () => quarantineFile(path))
   };
 }
@@ -140,8 +156,14 @@ function applyRecord(ledger, record, options = {}) {
 }
 function applyOpenRecord(ledger, record) {
   const messageID = requireMessageID(record);
+  const proof = coerceScopeEvidence(record.scope);
+  if (proof?.sourceScope === "magic-message" || proof?.sourceScope === "magic-session") {
+    excludeContribution(ledger, messageID, proof);
+    return;
+  }
   const previous = ledger.open[messageID];
   const prior = ledger.settled[messageID] ?? previous;
+  if (prior && prior !== true && prior.excluded) return;
   const contribution = contributionFromRecord(record, prior === true ? undefined : prior);
   if (prior && prior !== true && prior.quality === "exact" && contribution.quality === "provisional") return;
   if (prior && prior !== true) {
@@ -168,6 +190,24 @@ function applyOpenRecord(ledger, record) {
     ledger.open[messageID] = contribution;
   }
 }
+function excludeContribution(ledger, messageID, proof) {
+  const prior = ledger.settled[messageID] ?? ledger.open[messageID];
+  if (prior && prior !== true && !prior.excluded) {
+    const session = ledger.sessions[prior.sessionID];
+    if (session) subtractContribution(session, prior);
+    ledger.settled[messageID] = {
+      ...cloneContribution(prior),
+      excluded: proof
+    };
+  } else if (!prior || prior === true) {
+    // The existing per-message settled scheme is the replay guard; no separate
+    // unbounded event cache, and no fabricated amount for legacy true markers.
+    ledger.settled[messageID] = true;
+    ledger.messageScopes ??= {};
+    ledger.messageScopes[messageID] = mergeScopeEvidence(ledger.messageScopes[messageID], proof);
+  }
+  delete ledger.open[messageID];
+}
 
 /** Reset the observation epoch without touching usage or response throughput.
  * The caller persists the marker and reset together with an atomic rename. */
@@ -183,6 +223,39 @@ function migrateGenerationBasis(ledger) {
 export function projectTotalsGenerationBasis(ledger) {
   const projected = cloneLedger(ledger);
   if (projected.generationBasisVersion !== GENERATION_BASIS_VERSION) clearGenerationMeasurements(projected);
+  return projected;
+}
+const scopeProjectionCache = new WeakMap();
+const messageExclusionCache = new WeakMap();
+/** Compact tombstone IDs for history projection, never infer exclusion from
+ * an ordinary legacy settled:true marker lacking positive source proof. */
+export function getExcludedMessageIDs(ledger) {
+  const cached = messageExclusionCache.get(ledger);
+  if (cached) return cached;
+  const ids = new Set(Object.keys(ledger.messageScopes ?? {}));
+  for (const [id, contribution] of Object.entries(ledger.settled)) {
+    if (contribution !== true && contribution.excluded) ids.add(id);
+  }
+  messageExclusionCache.set(ledger, ids);
+  return ids;
+}
+/** Read-only projection. Inputs must be immutable snapshots (including parents).
+ * Raw session usage, speed, contributions and generation epoch are untouched. */
+export function projectTotalsMeasurementScope(ledger, parents) {
+  const cached = scopeProjectionCache.get(ledger);
+  if (cached && cached.parents === parents) return cached.projected;
+  const sessions = {};
+  for (const [id, session] of Object.entries(ledger.sessions)) {
+    if (!isSessionScopeExcluded(id, ledger.sessionScopes, parents)) sessions[id] = cloneSession(session);
+  }
+  const projected = {
+    ...ledger,
+    sessions
+  };
+  scopeProjectionCache.set(ledger, {
+    parents,
+    projected
+  });
   return projected;
 }
 function clearGenerationMeasurements(ledger) {
@@ -336,7 +409,13 @@ function cloneLedger(ledger) {
     } : {}),
     sessions,
     open,
-    settled: cloneSettled(ledger.settled)
+    settled: cloneSettled(ledger.settled),
+    ...(ledger.sessionScopes ? {
+      sessionScopes: cloneSessionScopes(ledger.sessionScopes)
+    } : {}),
+    ...(ledger.messageScopes ? {
+      messageScopes: cloneMessageScopes(ledger.messageScopes, ledger.settled)
+    } : {})
   };
 }
 function cloneSession(session) {
@@ -370,6 +449,9 @@ function cloneContribution(contribution) {
         version: 1,
         source: "server"
       }
+    } : {}),
+    ...(contribution.excluded ? {
+      excluded: coerceScopeEvidence(contribution.excluded)
     } : {})
   };
 }
@@ -396,6 +478,7 @@ function coerceLedger(value) {
   for (const [messageID, contributionValue] of Object.entries(value.open)) {
     open[messageID] = coerceContribution(contributionValue);
   }
+  const settled = coerceSettled(value.settled);
   return {
     version: TOTALS_VERSION,
     ...(value.generationBasisVersion === GENERATION_BASIS_VERSION ? {
@@ -403,8 +486,34 @@ function coerceLedger(value) {
     } : {}),
     sessions,
     open,
-    settled: coerceSettled(value.settled)
+    settled,
+    ...(value.sessionScopes !== undefined ? {
+      sessionScopes: cloneSessionScopes(value.sessionScopes)
+    } : {}),
+    ...(value.messageScopes !== undefined ? {
+      messageScopes: cloneMessageScopes(value.messageScopes, settled)
+    } : {})
   };
+}
+function cloneSessionScopes(value) {
+  if (!isPlainObject(value)) throw new TypeError("Invalid totals ledger");
+  const scopes = {};
+  for (const [id, raw] of Object.entries(value)) {
+    const proof = coerceScopeEvidence(raw);
+    if (!id || !proof || proof.sourceScope === "magic-message") throw new TypeError("Invalid totals ledger");
+    scopes[id] = proof;
+  }
+  return scopes;
+}
+function cloneMessageScopes(value, settled) {
+  if (!isPlainObject(value)) throw new TypeError("Invalid totals ledger");
+  const scopes = {};
+  for (const [id, raw] of Object.entries(value)) {
+    const proof = coerceScopeEvidence(raw);
+    if (!id || !proof || !["magic-message", "magic-session"].includes(proof.sourceScope) || settled[id] !== true) throw new TypeError("Invalid totals ledger");
+    scopes[id] = proof;
+  }
+  return scopes;
 }
 function coerceSettled(value) {
   if (value === undefined) return {};
@@ -455,6 +564,9 @@ function coerceContribution(value) {
         version: 1,
         source: "server"
       }
+    } : {}),
+    ...(coerceScopeEvidence(value.excluded) ? {
+      excluded: coerceScopeEvidence(value.excluded)
     } : {})
   };
 }

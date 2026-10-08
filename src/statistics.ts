@@ -3,8 +3,13 @@ import { MIN_ROLLING_OBSERVATION_MS } from "./core.js";
 import { createHash, type Hash } from "node:crypto";
 
 export const GENERATION_BASIS_VERSION = 3;
+/** Runtime ingress declaration, never an implicit default for old observations. */
+export const RECEIVE_CLOCK_RESOLUTION_MS = 1;
+export const MIN_COMPLETED_OBSERVATION_MS = 100;
+export type ObservationQuality = "short" | "standard";
+export interface ReceiveClockContext { clockSource: "performance.now"; clockResolutionMs: number }
 export type ContentStream = "legacy" | "v2";
-export interface RateMeasurement { generatedTokens: number; durationMs: number; estimated: boolean; coverageGeneratedTokens?: number }
+export interface RateMeasurement { generatedTokens: number; durationMs: number; estimated: boolean; coverageGeneratedTokens?: number; observationQuality?: ObservationQuality }
 export type GenerationCoverage = "complete" | "unknown" | "gap";
 export interface GenerationCoverageDiagnostics { status: GenerationCoverage; reasons: string[] }
 /** Stable rejection codes only: never persist event text, provider errors or
@@ -13,7 +18,7 @@ const GENERATION_REJECTION_REASONS = new Set([
   "unknown-coverage", "generation-invalidated", "invalid-v3-evidence", "missing-content-observation",
   "not-observed-from-current-start", "unknown-final-usage", "unknown-reasoning-usage",
   "unattributed-or-merged-deltas", "unknown-or-multiple-step-identities", "unknown-step-identity", "multiple-step-identities",
-  "missing-receive-observations", "insufficient-receive-span", "unfinished-response", "tool-usage-uncertain",
+  "missing-receive-observations", "insufficient-receive-span", "unknown-receive-clock", "unfinished-response", "tool-usage-uncertain",
   "snapshot-delta-gap", "snapshot-delta-mismatch", "missing-comparable-final-snapshot", "missing-byte-receive-timing",
   "hidden-reasoning", "unobserved-output", "receive-byte-mismatch", "invalid-arrival-bytes", "anonymous-or-tool-arrival",
   "invalid-receive-clock", "arrival-kind-mismatch", "mixed-streams", "duplicate-or-unparsed-arrival", "nonmonotonic-receive-clock",
@@ -42,6 +47,7 @@ export interface GenerationEvidence {
   selectedStream?: ContentStream; stepID?: string;
   bytes?: { output: CategoryByteEvidence; reasoning: CategoryByteEvidence };
   usage?: { output: number; reasoning: number };
+  clockSource?: "performance.now"; clockResolutionMs?: number; observationQuality?: ObservationQuality;
 }
 export interface V3GenerationEvidence extends GenerationEvidence {
   version: 3; coverage: "complete";
@@ -64,7 +70,7 @@ export interface CompletionUpdate {
   fingerprint: string;
   seenFingerprints: string[];
 }
-export interface RateAccumulator { generatedTokens: number; durationMs: number; responseCount: number; estimatedResponseCount: number; coverageGeneratedTokens?: number }
+export interface RateAccumulator { generatedTokens: number; durationMs: number; responseCount: number; estimatedResponseCount: number; coverageGeneratedTokens?: number; shortResponseCount?: number }
 export interface SessionSpeedTotals { generation: RateAccumulator; response: RateAccumulator }
 export type MeasuredHistoryRecord = HistoryRecord & { speed?: SpeedContribution; update?: CompletionUpdate };
 export interface SpeedObservations {
@@ -82,6 +88,7 @@ export interface AverageRateSummary {
   coveredResponseCount: number;
   estimatedResponseCount: number;
   durationMs: number;
+  shortResponseCount?: number;
 }
 export interface SessionAverageSummary {
   generation: AverageRateSummary;
@@ -153,13 +160,28 @@ export function selectResponseMeasurement(record: HistoryRecord): SelectedSpeedM
       durationMs: available ? measurement!.durationMs : 0 } };
 }
 
+function trustedReceiveClock(value: unknown): value is ReceiveClockContext {
+  return object(value) && value.clockSource === "performance.now" && valid(value.clockResolutionMs) && value.clockResolutionMs > 0;
+}
+
+function completedSpanQualified(span: number, clock: { clockSource?: unknown; clockResolutionMs?: unknown }): boolean {
+  if (!valid(span) || span < MIN_COMPLETED_OBSERVATION_MS) return false;
+  const declared = clock.clockSource !== undefined || clock.clockResolutionMs !== undefined;
+  if (span < MIN_ROLLING_OBSERVATION_MS || declared) {
+    return trustedReceiveClock(clock) && span >= Math.max(MIN_COMPLETED_OBSERVATION_MS, 10 * clock.clockResolutionMs);
+  }
+  return true; // Existing long v3 evidence predates explicit clock declarations.
+}
+
 function isV3Evidence(value: unknown): value is V3GenerationEvidence {
   if (!object(value) || value.version !== 3 || value.coverage !== "complete" || value.fromCurrentStart !== true
     || value.timeSource !== "receive-monotonic" || !["legacy", "v2"].includes(value.selectedStream)
     || typeof value.stepID !== "string" || !value.stepID.trim() || !valid(value.start) || !valid(value.end)
     || !valid(value.firstReceiveMono) || !valid(value.lastReceiveMono)
-    || value.lastReceiveMono - value.firstReceiveMono < MIN_ROLLING_OBSERVATION_MS || !Number.isInteger(value.observationCount) || value.observationCount < 2
+    || !completedSpanQualified(value.lastReceiveMono - value.firstReceiveMono, value) || !Number.isInteger(value.observationCount) || value.observationCount < 2
     || !object(value.bytes) || !object(value.usage)) return false;
+  const quality = value.lastReceiveMono - value.firstReceiveMono < MIN_ROLLING_OBSERVATION_MS ? "short" : "standard";
+  if ((quality === "short" || value.observationQuality !== undefined) && value.observationQuality !== quality) return false;
   for (const kind of ["output", "reasoning"] as const) {
     const bytes = value.bytes[kind];
     if (!object(bytes) || !Number.isSafeInteger(bytes.total) || bytes.total < 0 || !Number.isSafeInteger(bytes.firstBatch) || bytes.firstBatch < 0 || bytes.firstBatch > bytes.total
@@ -175,7 +197,10 @@ function copyV3Evidence(e: V3GenerationEvidence, usage = e.usage): V3GenerationE
   return { start: e.start, end: e.end, version: 3, coverage: "complete", firstReceiveMono: e.firstReceiveMono,
     lastReceiveMono: e.lastReceiveMono, observationCount: e.observationCount, timeSource: "receive-monotonic", fromCurrentStart: true,
     selectedStream: e.selectedStream, stepID: e.stepID, outputObserved: e.outputObserved, reasoningObserved: e.reasoningObserved,
-    bytes: { output: { ...e.bytes.output }, reasoning: { ...e.bytes.reasoning } }, usage: { output: usage.output, reasoning: usage.reasoning } };
+    bytes: { output: { ...e.bytes.output }, reasoning: { ...e.bytes.reasoning } }, usage: { output: usage.output, reasoning: usage.reasoning },
+    ...(e.clockSource !== undefined ? { clockSource: e.clockSource } : {}),
+    ...(e.clockResolutionMs !== undefined ? { clockResolutionMs: e.clockResolutionMs } : {}),
+    ...(e.observationQuality !== undefined ? { observationQuality: e.observationQuality } : {}) };
 }
 
 /** Full usage is coverage, NOT the interval numerator. Every global-first-mono
@@ -190,7 +215,8 @@ function intervalMeasurement(e: V3GenerationEvidence): RateMeasurement | undefin
   const coverageGeneratedTokens = e.usage.output + e.usage.reasoning;
   const durationMs = e.lastReceiveMono - e.firstReceiveMono;
   if (!valid(generatedTokens) || !valid(coverageGeneratedTokens) || !valid(durationMs)) return undefined;
-  return { generatedTokens, coverageGeneratedTokens, durationMs, estimated: true };
+  return { generatedTokens, coverageGeneratedTokens, durationMs, estimated: true,
+    observationQuality: durationMs < MIN_ROLLING_OBSERVATION_MS ? "short" : "standard" };
 }
 
 export function isQualifiedGenerationContribution(speed: SpeedContribution | undefined): boolean {
@@ -202,14 +228,16 @@ function qualifiedGeneration(speed: SpeedContribution | undefined, record?: Hist
   if (!speed?.generation || !isV3Evidence(evidence)) return false;
   const expected = intervalMeasurement(evidence);
   if (!expected || speed.generation.estimated !== true || speed.generation.durationMs !== expected.durationMs
-    || speed.generation.generatedTokens !== expected.generatedTokens || speed.generation.coverageGeneratedTokens !== expected.coverageGeneratedTokens) return false;
+    || speed.generation.generatedTokens !== expected.generatedTokens || speed.generation.coverageGeneratedTokens !== expected.coverageGeneratedTokens
+    || ((expected.observationQuality === "short" || speed.generation.observationQuality !== undefined)
+      && speed.generation.observationQuality !== expected.observationQuality)) return false;
   if (!record) return true;
   return valid(record.time.completed) && evidence.usage.output === record.tokens.output && evidence.usage.reasoning === record.tokens.reasoning;
 }
 
 export function emptySpeedTotals(): SessionSpeedTotals {
   const zero = (): RateAccumulator => ({ generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0, coverageGeneratedTokens: 0 });
-  return { generation: zero(), response: zero() };
+  return { generation: { ...zero(), shortResponseCount: 0 }, response: zero() };
 }
 export function coerceSpeedContribution(value: unknown): SpeedContribution | undefined {
   if (!object(value)) return undefined;
@@ -219,6 +247,10 @@ export function coerceSpeedContribution(value: unknown): SpeedContribution | und
     if (object(m) && valid(m.generatedTokens) && valid(m.durationMs) && m.durationMs > 0 && typeof m.estimated === "boolean") {
       result[kind] = { generatedTokens: m.generatedTokens, durationMs: m.durationMs, estimated: m.estimated };
       if (valid(m.coverageGeneratedTokens)) result[kind]!.coverageGeneratedTokens = m.coverageGeneratedTokens;
+      if (m.observationQuality !== undefined) {
+        if (m.observationQuality !== "short" && m.observationQuality !== "standard") { delete result[kind]; continue; }
+        result[kind]!.observationQuality = m.observationQuality;
+      }
     }
   }
   const evidence = value.generationEvidence;
@@ -295,6 +327,10 @@ export function coerceSpeedTotals(value: unknown): SessionSpeedTotals | undefine
     result[kind] = { generatedTokens: m.generatedTokens, durationMs: m.durationMs,
       responseCount: m.responseCount, estimatedResponseCount: m.estimatedResponseCount,
       coverageGeneratedTokens: valid(m.coverageGeneratedTokens) ? m.coverageGeneratedTokens : 0 };
+    if (kind === "generation") {
+      if (m.shortResponseCount !== undefined && (!Number.isInteger(m.shortResponseCount) || !valid(m.shortResponseCount) || m.shortResponseCount > m.responseCount)) return undefined;
+      result.generation.shortResponseCount = m.shortResponseCount ?? 0;
+    }
   }
   return result;
 }
@@ -313,6 +349,7 @@ export function updateSpeedTotals(current: SessionSpeedTotals | undefined, contr
     a.durationMs = Math.max(0, a.durationMs + sign * m.durationMs);
     a.responseCount = Math.max(0, a.responseCount + sign);
     a.estimatedResponseCount = Math.max(0, a.estimatedResponseCount + sign * Number(m.estimated));
+    if (kind === "generation") a.shortResponseCount = Math.max(0, (a.shortResponseCount ?? 0) + sign * Number(m.observationQuality === "short"));
     a.coverageGeneratedTokens = Math.max(0, (a.coverageGeneratedTokens ?? 0)
       + sign * (kind === "generation" ? m.coverageGeneratedTokens! : m.generatedTokens));
   }
@@ -326,6 +363,7 @@ export function addSpeedTotals(left: SessionSpeedTotals | undefined, right: Sess
     for (const field of ["generatedTokens", "durationMs", "responseCount", "estimatedResponseCount"] as const) result[kind][field] += incoming[kind][field];
     result[kind].coverageGeneratedTokens = (result[kind].coverageGeneratedTokens ?? 0) + (incoming[kind].coverageGeneratedTokens ?? 0);
   }
+  result.generation.shortResponseCount = (result.generation.shortResponseCount ?? 0) + (incoming.generation.shortResponseCount ?? 0);
   return result;
 }
 export function sameSpeedContribution(left: SpeedContribution | undefined, right: SpeedContribution | undefined): boolean {
@@ -338,7 +376,7 @@ export function getSessionAverageSummary(directTotals: { tokens: TokenCounts; re
     estimated: a.estimatedResponseCount > 0, coveredGeneratedTokens: a.coverageGeneratedTokens ?? 0,
     coveredResponseCount: a.responseCount, estimatedResponseCount: a.estimatedResponseCount, durationMs: a.durationMs });
   const generation = summary(speed.generation);
-  return { generation: { ...generation, estimated: generation.available || generation.estimated }, response: { ...summary(speed.response), includesTTFT: true, mayIncludeToolWait: true },
+  return { generation: { ...generation, estimated: generation.available || generation.estimated, shortResponseCount: speed.generation.shortResponseCount ?? 0 }, response: { ...summary(speed.response), includesTTFT: true, mayIncludeToolWait: true },
     totalGeneratedTokens: directTotals.tokens.output + directTotals.tokens.reasoning, totalResponseCount: directTotals.responseCount };
 }
 
@@ -425,6 +463,8 @@ export interface ContentPartProgress {
 export interface ContentReceiveProgress {
   firstWall: number; lastWall: number; firstMono: number; lastMono: number; observationCount: number;
   bytes: { output: CategoryByteEvidence; reasoning: CategoryByteEvidence };
+  /** Proof covers every accepted arrival; an omitted declaration is irreversible. */
+  clockSource?: "performance.now"; clockResolutionMs?: number; clockTrusted?: boolean;
 }
 export interface ContentProgress {
   parts: Map<string, ContentPartProgress>; eventIDs: Set<string>; stepEnds?: Set<number>;
@@ -483,7 +523,7 @@ export function noteStepIdentity(progress: ContentProgress, identity: string | u
 export function noteContentArrival(progress: ContentProgress, arrival: {
   kind: "output" | "reasoning"; bytes: number; partID?: string;
   receivedAt: number; receivedMono: number; stream: ContentStream;
-}): void {
+}, clock?: ReceiveClockContext): void {
   if (arrival.bytes === 0) return;
   if (!Number.isSafeInteger(arrival.bytes) || arrival.bytes < 0) { taintContentProgress(progress, "invalid-arrival-bytes"); return; }
   const part = arrival.partID ? progress.parts.get(arrival.partID) : undefined;
@@ -503,6 +543,14 @@ export function noteContentArrival(progress: ContentProgress, arrival: {
       bytes: { output: { total: 0, firstBatch: 0 }, reasoning: { total: 0, firstBatch: 0 } } };
   }
   const next = progress.receive!;
+  next.clockTrusted = trustedReceiveClock(clock) && (!receive || receive.clockTrusted === true);
+  if (next.clockTrusted) {
+    next.clockSource = clock!.clockSource;
+    next.clockResolutionMs = Math.max(next.clockResolutionMs ?? 0, clock!.clockResolutionMs);
+  } else {
+    delete next.clockSource;
+    delete next.clockResolutionMs;
+  }
   if (arrival.receivedMono > next.lastMono) next.observationCount += 1;
   next.lastMono = arrival.receivedMono;
   next.lastWall = arrival.receivedAt;
@@ -668,7 +716,10 @@ export function contentSpeedObservations(record: HistoryRecord, progress: Conten
   }
   const receive = progress.receive;
   if (!receive || !progress.selectedStream) return reject("missing-receive-observations");
-  if (receive.observationCount < 2 || receive.lastMono - receive.firstMono < MIN_ROLLING_OBSERVATION_MS) return reject("insufficient-receive-span");
+  const span = receive.lastMono - receive.firstMono;
+  if (receive.observationCount < 2 || !valid(span) || span < MIN_COMPLETED_OBSERVATION_MS) return reject("insufficient-receive-span");
+  if (span < MIN_ROLLING_OBSERVATION_MS && receive.clockTrusted !== true) return reject("unknown-receive-clock");
+  if (!completedSpanQualified(span, receive)) return reject("insufficient-receive-span");
   if (contentParts.some((p) => (p.receivedBytes ?? 0) !== p.deltaBytes)) {
     taintContentProgress(progress, "missing-byte-receive-timing");
     return reject("missing-byte-receive-timing");
@@ -685,7 +736,9 @@ export function contentSpeedObservations(record: HistoryRecord, progress: Conten
     selectedStream: progress.selectedStream, stepID: [...progress.stepIdentities][0],
     outputObserved: receive.bytes.output.total > 0, reasoningObserved: receive.bytes.reasoning.total > 0,
     bytes: { output: { ...receive.bytes.output }, reasoning: { ...receive.bytes.reasoning } },
-    usage: { output: record.tokens.output, reasoning: record.tokens.reasoning } };
+    usage: { output: record.tokens.output, reasoning: record.tokens.reasoning },
+    observationQuality: span < MIN_ROLLING_OBSERVATION_MS ? "short" : "standard",
+    ...(receive.clockTrusted === true ? { clockSource: receive.clockSource, clockResolutionMs: receive.clockResolutionMs } : {}) };
   if (!intervalMeasurement(evidence)) return reject("invalid-v3-evidence");
   observations.generationCoverage = { status: "complete", reasons: [] };
   observations.generation = { ...evidence, complete: true, estimated: true };

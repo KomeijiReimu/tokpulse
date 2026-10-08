@@ -220,6 +220,49 @@ async function officialTextComplete(send: (event: any) => Promise<void>, id: str
   await send({ ...event, properties: { info: { ...event.properties.info, time: { created, completed: end } } } });
 }
 
+test("every real paired ingress declares receive-clock precision for a short completed response", async () => {
+  await backend(async ({ path, send }) => {
+    await officialTextStart(send, "short");
+    await send({ ...delta("short", 100, "short-text", "hello"), receiveMono: 100 });
+    await send({ ...delta("short", 356, "short-text", "world"), receiveMono: 356 });
+    await textSnapshot(send, "short", "helloworld", 360, true);
+    await officialTextComplete(send, "short", 10, 0, 10_000);
+    const [record] = await records(path);
+    assert.equal(record.speed?.generation?.durationMs, 256);
+    assert.equal(record.speed?.generation?.generatedTokens, 5);
+    assert.equal(record.speed?.generation?.observationQuality, "short");
+    assert.equal(record.speed?.generationEvidence?.clockSource, "performance.now");
+    assert.equal(record.speed?.generationEvidence?.clockResolutionMs, 1);
+    assert.equal(record.speed?.generationEvidence?.observationQuality, "short");
+    const totals = await createTotalsStorage({ historyPath: path }).read();
+    assert.equal(totals.generationBasisVersion, 3);
+    assert.equal(totals.sessions.s.speed?.generation.shortResponseCount, 1);
+  });
+});
+
+test("CLI 1.18.35-shaped early byte and 256ms final part preserve the whole ten-second receive span", async () => {
+  await backend(async ({ path, send }) => {
+    await officialTextStart(send, "hello");
+    await send(delta("hello", 10, "hello-text", "."));
+    await textSnapshot(send, "hello", ".", 20, true);
+    await send({ type: "message.part.updated", timestamp: 9710, properties: { part: {
+      id: "hello-final", messageID: "hello", sessionID: "s", type: "text", text: "" } } });
+    await send(delta("hello", 9714, "hello-final", "Hell"));
+    await send(delta("hello", 9970, "hello-final", "o!"));
+    await send({ type: "message.part.updated", timestamp: 9971, properties: { part: {
+      id: "hello-final", messageID: "hello", sessionID: "s", type: "text", text: "Hello!", time: { start: 9714, end: 9970 } } } });
+    await officialTextComplete(send, "hello", 12, 0, 10_000);
+    const [record] = await records(path);
+    assert.equal(record.samples[0].bytes, 1);
+    assert.equal(record.speed?.generation?.durationMs, 9960);
+    assert.ok(Math.abs(record.speed!.generation!.generatedTokens - 72 / 7) < 1e-12);
+    const mean = record.speed!.generation!.generatedTokens / (record.speed!.generation!.durationMs / 1000);
+    assert.ok(mean > 1 && mean < 1.1);
+    assert.equal(record.speed?.generationEvidence?.start, 10);
+    assert.equal(record.speed?.generationEvidence?.end, 9970);
+  });
+});
+
 test("official pending snapshots before corresponding deltas resolve without inventing boundaries", async () => {
   await backend(async ({ path, send }) => {
     await officialTextStart(send, "m");

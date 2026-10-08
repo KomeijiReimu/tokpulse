@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -28,7 +30,8 @@ const cacheRoot = process.env.TMPDIR || join(homedir(), ".cache", "tokpulse-test
 
 // Compile only this isolated UI module as the real build does, without writing
 // dist or changing how the non-rendering runtime tests import the source.
-async function loadRenderedTui(): Promise<typeof import("../src/tui.js")> {
+type RenderedTui = typeof import("../src/tui.js") & { __testRuntimeStores: ReturnType<typeof import("../src/tui.js").createRuntimeStore>[]; __testActivityReads: number[] };
+async function loadRenderedTui(): Promise<RenderedTui> {
   const bunModule = "bun";
   const runtime = await import(bunModule);
   const babelModule = "@babel/core";
@@ -38,7 +41,15 @@ async function loadRenderedTui(): Promise<typeof import("../src/tui.js")> {
     import(babelModule), import(solidModule), import(typescriptModule),
   ]);
   const source = fileURLToPath(new URL("../src/tui.tsx", import.meta.url));
-  const transformed = await transformAsync(await readFile(source, "utf8"), {
+  const sourceText = process.env.TOKPULSE_TUI_BASELINE_FILE ? await readFile(process.env.TOKPULSE_TUI_BASELINE_FILE, "utf8") : process.env.TOKPULSE_TUI_BASELINE === "HEAD"
+    ? (await promisify(execFile)("git", ["show", "HEAD:src/tui.tsx"], { cwd: dirname(source) })).stdout
+    : await readFile(source, "utf8");
+  // A read-only capture in the isolated test compilation exposes the actual
+  // plugin's store. It does not replace event adapters, subscribers or hydration.
+  const storeCreation = "const store = createRuntimeStore(options.maxRecords);";
+  assert.equal(sourceText.split(storeCreation).length, 2);
+  const observedSource = `export const __testRuntimeStores = []; export const __testActivityReads = [];\n${sourceText.replace(storeCreation, `${storeCreation}\n__testRuntimeStores.push(store);`).replace("const activityEvents = await readActivityFile(path);", "const activityEvents = await readActivityFile(path); __testActivityReads.push(generation);")}`;
+  const transformed = await transformAsync(observedSource, {
     filename: source, babelrc: false, configFile: false,
     presets: [[solid.default, { moduleName: "@opentui/solid", generate: "universal" }],
       [typescript.default, { allExtensions: true, isTSX: true }]],
@@ -79,11 +90,486 @@ if (!nativeChild) {
     ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /7 pass/);
+    assert.match(output.stderr + output.stdout, /14 pass/);
   });
 }
 
 if (nativeChild) {
+function reportFrame(name: string, frame: string): void {
+  if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`FRAME ${name}\n${frame.split("\n").map((line) => line.trimEnd()).filter(Boolean).join("\n")}\nEND FRAME`);
+}
+
+async function waitForLedger(predicate: () => boolean, message: string): Promise<void> {
+  const deadline = performance.now() + 1500;
+  // Test synchronization only. The plugin never polls a ledger or closes on silence.
+  for (let waited = 0; waited < 1500; waited += 10) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(predicate(), `${message} (bounded wait ${deadline})`);
+}
+
+async function ledgerPluginFixture(lateDirectory = false, gateInitialHistory = false) {
+  const ui = (await uiPromise)!;
+  await mkdir(cacheRoot, { recursive: true });
+  const directory = await mkdtemp(join(cacheRoot, "ledger-watch-"));
+  const ledgerDirectory = lateDirectory ? join(directory, "late", "ledgers") : directory;
+  const historyPath = join(ledgerDirectory, "history.jsonl");
+  const runsPath = join(ledgerDirectory, "runs.jsonl");
+  const handlers = new Map<string, (event: unknown, metadata: { directory: string; workspace: undefined }) => void>();
+  const disposers: (() => void | Promise<void>)[] = [];
+  const originalNow = Date.now;
+  let clock = originalNow();
+  const startedAt = clock + 10;
+  Date.now = () => clock;
+  let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
+  const api = { ...host(80, 40), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
+    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
+    slots: { register: (plugin: typeof registered) => { registered = plugin; return "ledger-watch"; } },
+    event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => { assert.equal(handlers.has(type), false); handlers.set(type, callback); return () => handlers.delete(type); } },
+    lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
+  } as unknown as TuiPluginApi;
+  let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
+  let release: (bytes: string) => void = () => {};
+  let entered = false;
+  let released = !gateInitialHistory;
+  let restoreFilesystem = () => {};
+  if (gateInitialHistory) {
+    await writeFile(historyPath, "");
+    const originals = { ...fsPromises };
+    const gate = new Promise<string>((resolve) => { release = resolve; });
+    const bunTestModule = "bun:test";
+    const { mock } = await import(bunTestModule);
+    mock.module("node:fs/promises", () => ({ ...originals, readFile(...args: unknown[]) {
+      if (String(args[0]) === historyPath && !entered) { entered = true; return gate; }
+      return Reflect.apply(originals.readFile, originals, args);
+    } }));
+    restoreFilesystem = () => { mock.module("node:fs/promises", () => originals); };
+  }
+  let initialization: Promise<void> | undefined;
+  const dispose = async () => { for (const fn of disposers.splice(0).reverse()) await fn(); };
+  try {
+    initialization = ui.default.tui(api, { historyPath }, {} as never) as Promise<void>;
+    if (!gateInitialHistory) await initialization;
+    const store = ui.__testRuntimeStores.at(-1)!;
+    rendered = await testRender(() => {
+      api.renderer = useRenderer();
+      const panel = new BoxRenderable(api.renderer, { width: 80, flexDirection: "column" });
+      panel.add(registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
+      panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
+      return panel as unknown as JSX.Element;
+    }, { width: 80, height: 40 });
+    const send = (offset: number, type: string, properties: Record<string, unknown>) => {
+      clock = startedAt + offset; handlers.get(type)!({ type, properties, timestamp: clock }, { directory, workspace: undefined });
+    };
+    const fact = (sid: string, state: string, offset: number, actor = "current-server") => ({ version: 1, kind: "lifecycle", sessionID: sid, state,
+      timestamp: startedAt + offset, observedAt: startedAt + offset, instanceID: actor });
+    const commitRuns = async (facts: unknown[]) => {
+      const staging = join(ledgerDirectory, "runs-write.pending");
+      await writeFile(staging, facts.map((value) => JSON.stringify(value)).join("\n") + "\n");
+      await rename(staging, runsPath);
+    };
+    const complete = () => send(100, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 6, reasoning: 0 }, time: { created: startedAt, completed: startedAt + 100 } } });
+    const start = () => {
+      send(0, "session.status", { sessionID: "s", status: { type: "busy" } });
+      send(0, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: startedAt } } });
+    };
+    const awaitEventRead = async (before: number) => {
+      await waitForLedger(() => ui.__testActivityReads.length > before && ui.__testActivityReads.at(-1) === store.activityGeneration,
+        "the initial post-completion activity read must have returned before delayed server commit");
+    };
+    return { ui, store, rendered, directory, ledgerDirectory, historyPath, runsPath, startedAt, send, fact, commitRuns, complete, start, awaitEventRead, dispose, initialization,
+      initialReadEntered: () => entered,
+      releaseHistory: (bytes: string) => { released = true; release(bytes); },
+      advance: (offset: number) => { clock = startedAt + offset; },
+      close: async () => { await dispose(); if (!released) release(""); await initialization; restoreFilesystem(); rendered?.renderer.destroy(); Date.now = originalNow; await rm(directory, { recursive: true, force: true }); } };
+  } catch (error) { await dispose(); if (!released) release(""); await initialization; restoreFilesystem(); rendered?.renderer.destroy(); Date.now = originalNow; await rm(directory, { recursive: true, force: true }); throw error; }
+}
+
+test("initialization drains watcher-invalidated authoritative hydration before returning or accepting late same-ID content", async () => {
+  const f = await ledgerPluginFixture(false, true);
+  try {
+    f.start();
+    const owned = f.store.active.get("m")!;
+    assert.ok(f.initialReadEntered());
+    assert.ok(owned);
+    assert.equal(owned.sessionID, "s");
+    assert.equal(f.store.sessionRuntime.get("s")!.activeMessageID, "m");
+    assert.equal(owned.progress!.fromCurrentStart, true);
+    assert.equal(owned.legacy.samples.length + owned.v2.samples.length, 0);
+    await f.rendered.renderOnce();
+    assert.match(f.rendered.captureCharFrame(), /^WAITING --/);
+    const initialGeneration = f.store.historyGeneration;
+    const record = { version: 1, messageID: "m", sessionID: "s", quality: "exact", tokens: { input: 1, output: 6, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+      cost: 0, time: { start: f.startedAt, completed: f.startedAt + 100 }, samples: [] };
+    const bytes = JSON.stringify(record) + "\n";
+    // Same real-file writes as the compiled harness. No completion/idle event
+    // is fed, and the first read stays held until the watcher invalidates it.
+    writeFileSync(f.historyPath, bytes);
+    writeFileSync(join(f.ledgerDirectory, "totals.json"), JSON.stringify({ version: 1, generationBasisVersion: 3, open: {}, settled: { m: true },
+      sessions: { s: { tokens: record.tokens, cost: 0, responseCount: 1 } } }));
+    writeFileSync(f.runsPath, [f.fact("s", "busy", 0), f.fact("s", "idle", 100)].map((fact) => JSON.stringify(fact)).join("\n") + "\n");
+    await waitForLedger(() => f.store.historyGeneration > initialGeneration, "actual filesystem watcher must invalidate the held initial history generation");
+    assert.ok(f.initialReadEntered(), "the original history read is still held; a runs idle may independently retire only its participant");
+    f.advance(101); f.releaseHistory(bytes);
+    await f.initialization;
+    const completedOnReturn = f.store.completedMessageIDs.has("m");
+    const activeOnReturn = f.store.active.has("m");
+    await f.rendered.renderOnce();
+    const immediate = f.rendered.captureCharFrame();
+    f.send(102, "message.part.delta", { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" });
+    f.send(103, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "late-step" });
+    const activeAfterLate = f.store.active.has("m");
+    // Diagnose a temporary startup window separately from permanent loss. This
+    // wait is AFTER observing the immediate result, never an initialization fix.
+    await waitForLedger(() => f.store.completedMessageIDs.has("m"), "latest requested history generation must eventually commit");
+    assert.deepEqual({ completedOnReturn, activeOnReturn, activeAfterLate, eventuallyClosed: !f.store.active.has("m") },
+      { completedOnReturn: true, activeOnReturn: false, activeAfterLate: false, eventuallyClosed: true },
+      "initialization must drain, not return during the stale-read/deferred-read window");
+    assert.match(immediate, /^LAST --/);
+    assert.equal(f.store.sessionRuntime.get("s")!.activeMessageID, undefined);
+    assert.equal(f.store.records.find((record) => record.messageID === "m")!.tokens.output, 6);
+  } finally { await f.close(); }
+});
+
+test("ledger watcher actual plugin observes delayed canonical root idle after its event read, without another host event", async () => {
+  const f = await ledgerPluginFixture();
+  try {
+    await f.commitRuns([f.fact("s", "busy", 0)]);
+    f.start();
+    const before = f.ui.__testActivityReads.length;
+    f.complete();
+    await f.awaitEventRead(before);
+    assert.equal(f.store.sessionRuntime.get("s")!.status, "busy");
+    assert.ok(f.store.activityEvents.some((event) => event.kind === "lifecycle" && event.state === "busy"));
+    // Server SDK idle query commits later than the one 30ms event-triggered read.
+    await f.commitRuns([f.fact("s", "busy", 0), f.fact("s", "idle", 200)]);
+    await waitForLedger(() => f.store.sessionRuntime.get("s")!.status === "idle", "delayed canonical root idle must retire the local participant");
+    assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("s"), false);
+    assert.equal(f.ui.hasLiveTaskWallActivity(f.store), false);
+    assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 1000), 200);
+    await f.rendered.renderOnce(); await f.rendered.renderOnce();
+    const frozen = f.rendered.captureCharFrame();
+    f.advance(60000); await new Promise((resolve) => setTimeout(resolve, 520)); await f.rendered.renderOnce();
+    assert.equal(f.rendered.captureCharFrame(), frozen);
+    await f.dispose();
+    const reads = f.ui.__testActivityReads.length;
+    const generations = [f.store.activityGeneration, f.store.historyGeneration, f.store.clockRevision()];
+    await f.commitRuns([f.fact("s", "busy", 61000)]);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(f.ui.__testActivityReads.length, reads, "disposed file watchers cannot launch another read");
+    assert.deepEqual([f.store.activityGeneration, f.store.historyGeneration, f.store.clockRevision()], generations);
+  } finally { await f.close(); }
+});
+
+test("ledger watcher root idle preserves child union and old terminal cannot close a new root epoch", async () => {
+  const f = await ledgerPluginFixture();
+  try {
+    const busy = [f.fact("s", "busy", 0), { version: 1, kind: "parent", sessionID: "child", parentSessionID: "s", timestamp: f.startedAt }, f.fact("child", "busy", 20)];
+    await f.commitRuns(busy);
+    f.send(0, "session.created", { info: { id: "child", parentID: "s" } });
+    f.start(); f.send(20, "session.status", { sessionID: "child", status: "busy" });
+    const before = f.ui.__testActivityReads.length; f.complete(); await f.awaitEventRead(before);
+    const rootIdle = [...busy, f.fact("s", "idle", 200)];
+    await f.commitRuns(rootIdle);
+    await waitForLedger(() => f.store.sessionRuntime.get("s")!.status === "idle", "root must close even while child is busy");
+    assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("s"), false);
+    assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("child"), true);
+    assert.equal(f.ui.hasLiveTaskWallActivity(f.store), true);
+    assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 500), 500);
+    f.send(1000, "session.status", { sessionID: "s", status: "busy" });
+    f.send(1000, "message.updated", { info: { id: "next", sessionID: "s", role: "assistant", time: { created: f.startedAt + 1000 } } });
+    const oldAndChildIdle = [...rootIdle, f.fact("child", "idle", 1100), f.fact("s", "busy", -1000, "old-server"), f.fact("s", "idle", 1500, "old-server")];
+    await f.commitRuns(oldAndChildIdle);
+    await waitForLedger(() => f.store.sessionRuntime.get("child")!.status === "idle", "child's own disk idle must close it");
+    assert.equal(f.store.sessionRuntime.get("s")!.status, "busy");
+    assert.equal(f.store.sessionRuntime.get("s")!.activeMessageID, "next");
+    assert.equal(f.store.active.has("next"), true);
+    await f.commitRuns([...rootIdle, f.fact("child", "idle", 1100), f.fact("s", "busy", 1000), f.fact("s", "idle", 1200)]);
+    await waitForLedger(() => !f.ui.hasLiveTaskWallActivity(f.store), "new root closes only on its own canonical epoch");
+    assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 60000), 1200);
+  } finally { await f.close(); }
+});
+
+test("ledger watcher re-arms through late directories and projects a later atomic totals scope proof", async () => {
+  const f = await ledgerPluginFixture(true);
+  try {
+    f.start();
+    f.send(20, "session.created", { info: { id: "mc", parentID: "s" } });
+    f.send(20, "session.status", { sessionID: "mc", status: "busy" });
+    f.send(20, "message.updated", { info: { id: "mc-message", sessionID: "mc", role: "assistant", time: { created: f.startedAt + 20 } } });
+    f.send(40, "message.updated", { info: { id: "mc-message", sessionID: "mc", role: "assistant", tokens: { input: 1, output: 100, reasoning: 0 }, time: { created: f.startedAt + 20, completed: f.startedAt + 40 } } });
+    f.send(60, "message.updated", { info: { id: "mc-live", sessionID: "mc", role: "assistant", time: { created: f.startedAt + 60 } } });
+    const before = f.ui.__testActivityReads.length; f.complete(); await f.awaitEventRead(before);
+    assert.equal(f.ui.buildSessionDetailsTree(f.store, "s").average.totalGeneratedTokens, 106, "unknown identity retains usage until positive proof arrives");
+    await mkdir(f.ledgerDirectory, { recursive: true });
+    await f.commitRuns([f.fact("s", "busy", 0), f.fact("s", "idle", 200)]);
+    await waitForLedger(() => f.store.sessionRuntime.get("s")!.status === "idle", "new ledger directories and file creation must be observed");
+    assert.equal(f.ui.hasLiveTaskWallActivity(f.store), true, "unknown maintenance identity is not guessed away");
+    const { createScopeRegistry } = await import("../src/scope.js");
+    const registry = createScopeRegistry();
+    registry.observeSessionMetadata("mc", { id: "mc", agent: "dreamer" });
+    const staging = join(f.ledgerDirectory, "totals-write.pending");
+    await writeFile(staging, JSON.stringify({ ...f.store.totalsLedger, sessionScopes: registry.serialize() }));
+    await rename(staging, join(f.ledgerDirectory, "totals.json"));
+    await waitForLedger(() => f.store.sourceScopes.isExcluded("mc"), "a late totals scope proof must invalidate projections without host events");
+    assert.equal(f.store.active.has("mc-live"), false);
+    assert.ok(f.store.records.every((record) => record.sessionID !== "mc"), "late proof retracts maintenance history too");
+    assert.equal(f.ui.buildSessionDetailsTree(f.store, "s").average.totalGeneratedTokens, 6, "raw usage overlays cannot restore excluded maintenance totals");
+    assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("mc"), false);
+    assert.equal(f.ui.hasLiveTaskWallActivity(f.store), false);
+    assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 60000), 200);
+    const reads = f.ui.__testActivityReads.length;
+    const historyGeneration = f.store.historyGeneration;
+    await writeFile(join(f.ledgerDirectory, "unrelated.txt"), "not a ledger");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(f.ui.__testActivityReads.length, reads, "unrelated directory changes must not replay activity");
+    assert.equal(f.store.historyGeneration, historyGeneration);
+  } finally { await f.close(); }
+});
+
+test("actual plugin subscription retires anonymous step compatibility before idle and retains the real two-part gap", async () => {
+  const ui = (await uiPromise)!;
+  await mkdir(cacheRoot, { recursive: true });
+  const directory = await mkdtemp(join(cacheRoot, "actual-plugin-"));
+  const handlers = new Map<string, (event: unknown, metadata?: { directory: string; workspace: undefined }) => void>();
+  const disposers: (() => void | Promise<void>)[] = [];
+  const originalNow = Date.now;
+  const originalMono = performance.now;
+  let clock = 1000;
+  Date.now = () => clock;
+  performance.now = () => clock;
+  let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
+  const api = { ...host(120, 160),
+    state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
+    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} },
+    ui: { toast: () => {}, dialog: { open: false } },
+    slots: { register: (plugin: typeof registered) => { registered = plugin; return "actual-plugin"; } },
+    event: { on: (type: string, callback: (event: unknown) => void) => { handlers.set(type, callback); return () => handlers.delete(type); } },
+    lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
+  } as unknown as TuiPluginApi;
+  let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
+  const send = (at: number, type: string, properties: Record<string, unknown>) => {
+    clock = at;
+    assert.ok(handlers.has(type), `the real plugin must register ${type}`);
+    // TuiEventBus.on delivers the SDK Event itself, not a direct-helper adapter.
+    handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
+  };
+  try {
+    await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
+    rendered = await testRender(() => {
+      api.renderer = useRenderer();
+      const panel = new BoxRenderable(api.renderer, { width: 120, flexDirection: "column" });
+      panel.add(registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
+      panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
+      return panel as unknown as JSX.Element;
+    }, { width: 120, height: 160 });
+    send(1100, "session.status", { sessionID: "s", status: { type: "busy" } });
+    send(1100, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1100 } } });
+    send(1110, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
+    send(1120, "session.next.step.started", { sessionID: "s", stepID: "step" });
+    send(1200, "message.part.updated", { part: { id: "space", messageID: "m", sessionID: "s", type: "text", text: "" } });
+    send(1300, "message.part.delta", { sessionID: "s", messageID: "m", partID: "space", field: "text", delta: " " });
+    send(1310, "message.part.updated", { part: { id: "space", messageID: "m", sessionID: "s", type: "text", text: "", time: { end: 1310 } } });
+    send(11400, "message.part.updated", { part: { id: "body", messageID: "m", sessionID: "s", type: "text", text: "" } });
+    send(11500, "message.part.delta", { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "你好" });
+    send(11756, "message.part.delta", { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "！" });
+    send(11760, "message.part.updated", { part: { id: "body", messageID: "m", sessionID: "s", type: "text", text: "你好！", time: { end: 11760 } } });
+    await rendered.renderOnce();
+    assert.match(rendered.captureCharFrame(), /WARMUP --/);
+    reportFrame("two-part WARMUP", rendered.captureCharFrame());
+    send(11770, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 10, reasoning: 0 }, time: { created: 1100, completed: 11770 } } });
+    await rendered.renderOnce();
+    assert.match(rendered.captureCharFrame(), /LAST ~1 tok\/s generation/, "completion must retire the anonymous pending ghost before session idle, without shortening the 10s part gap");
+    reportFrame("two-part completed LAST", rendered.captureCharFrame());
+    send(11800, "session.idle", { sessionID: "s" });
+    await rendered.renderOnce();
+    await rendered.renderOnce();
+    const finished = rendered.captureCharFrame();
+    reportFrame("two-part idle frozen", finished);
+    clock += 60000;
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    await rendered.renderOnce();
+    assert.equal(rendered.captureCharFrame(), finished, "terminal task and response must remain frozen at +60s");
+    const retainedCallback = handlers.get("message.part.delta")!;
+    for (const dispose of disposers.splice(0).reverse()) await dispose();
+    retainedCallback({ type: "message.part.delta", properties: { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "late" } }, { directory, workspace: undefined });
+    await rendered.renderOnce();
+    assert.equal(rendered.captureCharFrame(), finished, "disposed subscriptions and timer must not mutate the frame");
+  } finally {
+    for (const dispose of disposers.reverse()) await dispose();
+    rendered?.renderer.destroy();
+    Date.now = originalNow;
+    performance.now = originalMono;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("actual plugin initial hydrate overlaps subscribed live start then rejects late same-ID events", async () => {
+  const ui = (await uiPromise)!;
+  await mkdir(cacheRoot, { recursive: true });
+  const directory = await mkdtemp(join(cacheRoot, "initial-overlap-"));
+  const historyPath = join(directory, "history.jsonl");
+  const completedBytes = JSON.stringify({ version: 1, messageID: "m", sessionID: "s", tokens: { input: 1, output: 6, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
+    quality: "exact", time: { start: 1000, completed: 1150 }, samples: [] }) + "\n";
+  // A real FIFO gates readHistoryFile, so the pre-hydrate assertions cannot
+  // accidentally run after the initial reload has already completed.
+  await promisify(execFile)("mkfifo", [historyPath]);
+  const handlers = new Map<string, (event: unknown, metadata: { directory: string; workspace: undefined }) => void>();
+  const disposers: (() => void | Promise<void>)[] = [];
+  const originalNow = Date.now;
+  const originalMono = performance.now;
+  let clock = 1000;
+  Date.now = () => clock;
+  performance.now = () => clock;
+  let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
+  const send = (at: number, type: string, properties: Record<string, unknown>) => {
+    clock = at;
+    handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
+  };
+  const api = { ...host(80, 30), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
+    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
+    slots: { register: (plugin: typeof registered) => { registered = plugin; return "overlap"; } },
+    event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => {
+      assert.equal(handlers.has(type), false, "no duplicate subscription or invented wrapper");
+      handlers.set(type, callback);
+      if (type === "workspace.deleted") {
+        // All callbacks are installed, but the plugin has not awaited initial disk hydration.
+        send(1000, "session.status", { sessionID: "s", status: { type: "busy" } });
+        send(1000, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1000 } } });
+        send(1010, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
+      }
+      return () => handlers.delete(type);
+    } }, lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
+  } as unknown as TuiPluginApi;
+  let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
+  let initialization: Promise<void> | undefined;
+  let released = false;
+  try {
+    initialization = ui.default.tui(api, { historyPath }, {} as never) as Promise<void>;
+    const store = ui.__testRuntimeStores.at(-1)!;
+    const owned = store.active.get("m")!;
+    assert.ok(owned, "precondition: actual plugin active exists before hydrate");
+    assert.equal(owned.sessionID, "s");
+    assert.equal(store.sessionRuntime.get("s")!.activeMessageID, "m");
+    assert.equal(owned.observedFromStart, true, "precondition: assistant creation is inside this plugin observation epoch");
+    assert.equal(owned.progress!.fromCurrentStart, true);
+    assert.equal(owned.legacy.samples.length + owned.v2.samples.length, 0);
+    rendered = await testRender(() => {
+      api.renderer = useRenderer();
+      return registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as JSX.Element;
+    }, { width: 80, height: 30 });
+    await rendered.renderOnce();
+    assert.match(rendered.captureCharFrame(), /WAITING --|WARMUP --/);
+    assert.equal(store.active.get("m"), owned, "disk hydration must still be waiting");
+    await writeFile(historyPath, completedBytes);
+    released = true;
+    await initialization;
+    await rm(historyPath);
+    await writeFile(historyPath, completedBytes);
+    send(1200, "message.part.delta", { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" });
+    send(1210, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "late-step" });
+    await rendered.renderOnce();
+    const frame = rendered.captureCharFrame();
+    assert.match(frame, /LAST --/);
+    assert.doesNotMatch(frame, /WAITING|WARMUP|LIVE|elapsed/);
+    assert.equal(store.active.has("m"), false);
+    assert.equal(store.sessionRuntime.get("s")!.activeMessageID, undefined);
+    reportFrame("initial hydrate completed unavailable", frame);
+    send(1250, "session.status", { sessionID: "s", status: { type: "busy" } });
+    send(1300, "session.idle", { sessionID: "s" });
+    await rendered.renderOnce();
+    const frozen = rendered.captureCharFrame();
+    clock += 60000;
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    await rendered.renderOnce();
+    assert.equal(rendered.captureCharFrame(), frozen);
+  } finally {
+    if (initialization && !released) { await writeFile(historyPath, completedBytes); await initialization; }
+    for (const dispose of disposers.reverse()) await dispose();
+    rendered?.renderer.destroy(); Date.now = originalNow; performance.now = originalMono;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("actual plugin individual SDK flush arrivals qualify short LAST and average but never short LIVE or peaks", async () => {
+  const ui = (await uiPromise)!;
+  for (const span of [150, 16, 0]) {
+    await mkdir(cacheRoot, { recursive: true });
+    const directory = await mkdtemp(join(cacheRoot, "short-arrivals-"));
+    const handlers = new Map<string, (event: unknown, metadata: { directory: string; workspace: undefined }) => void>();
+    const disposers: (() => void | Promise<void>)[] = [];
+    const originalNow = Date.now;
+    const originalMono = performance.now;
+    let clock = 1000;
+    Date.now = () => clock; performance.now = () => clock;
+    let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
+    const commands = new Map<string, () => void>();
+    let dialog!: () => JSX.Element;
+    const api = { ...host(80, 60), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+      route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} }, mode: { push: () => () => {} },
+      keymap: { registerLayer: (layer: { commands?: { name: string; run: () => void }[] }) => { for (const command of layer.commands ?? []) commands.set(command.name, command.run); return () => {}; } },
+      ui: { toast: () => {}, dialog: { open: false, replace: (render: () => JSX.Element) => { dialog = render; }, setSize: () => {} } },
+      slots: { register: (plugin: typeof registered) => { registered = plugin; return "short"; } },
+      event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => { handlers.set(type, callback); return () => handlers.delete(type); } },
+      lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
+    } as unknown as TuiPluginApi;
+    const send = (at: number, type: string, properties: Record<string, unknown>) => {
+      clock = at; handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
+    };
+    let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
+    let details: Awaited<ReturnType<typeof testRender>> | undefined;
+    try {
+      await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
+      rendered = await testRender(() => {
+        api.renderer = useRenderer();
+        const panel = new BoxRenderable(api.renderer, { width: 80, flexDirection: "column" });
+        panel.add(registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
+        panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
+        return panel as unknown as JSX.Element;
+      }, { width: 80, height: 60 });
+      send(1100, "session.status", { sessionID: "s", status: { type: "busy" } });
+      send(1100, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1100 } } });
+      send(1110, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
+      send(1120, "message.part.updated", { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "" } });
+      // SDK flushes deliver individual events. Same-flush arrivals share a batch,
+      // and a later flush supplies a second monotonic batch; no adapter combines them.
+      const arrivals = span === 0 ? [[1200, "你好"]] as const : [[1200, "你"], [1200 + span, "好"]] as const;
+      for (const [at, delta] of arrivals) send(at, "message.part.delta", { sessionID: "s", messageID: "m", partID: "p", field: "text", delta });
+      await rendered.renderOnce();
+      assert.match(rendered.captureCharFrame(), /WARMUP --/);
+      assert.doesNotMatch(rendered.captureCharFrame(), /LIVE ~/);
+      send(1210 + span, "message.part.updated", { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "你好", time: { end: 1210 + span } } });
+      send(1220 + span, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 6, reasoning: 0 }, time: { created: 1100, completed: 1220 + span } } });
+      send(1230 + span, "session.idle", { sessionID: "s" });
+      await rendered.renderOnce();
+      const frame = rendered.captureCharFrame();
+      if (span === 150) assert.match(frame, /LAST ~20 tok\/s generation · short, low confidence/);
+      else assert.match(frame, /LAST --/);
+      reportFrame(`short ${span}ms completed`, frame);
+      commands.get(ui.DETAILS_COMMAND_NAME)!();
+      assert.ok(dialog, "the actual details command must open its registered dialog");
+      details = await testRender(() => { api.renderer = useRenderer(); return dialog(); }, { width: 120, height: 160 });
+      await details.renderOnce();
+      const detailFrame = details.captureCharFrame();
+      if (span === 150) {
+        assert.match(detailFrame, /Generation avg TPS  ~20 tok\/s/);
+        assert.match(detailFrame, /1 short \(low confidence\)/);
+        assert.match(detailFrame, /short, low confidence/);
+      } else assert.match(detailFrame, /Generation avg TPS  --/);
+      assert.match(detailFrame, /Arrival peaks: -- \(insufficient window observations\)/);
+      reportFrame(`short ${span}ms details`, detailFrame);
+    } finally {
+      for (const dispose of disposers.reverse()) await dispose();
+      details?.renderer.destroy(); rendered?.renderer.destroy(); Date.now = originalNow; performance.now = originalMono;
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("actual narrow sidebar preserves full metric fields and task time without ellipses, independently of terminal width", async () => {
   const ui = (await uiPromise)!;
   const elapsed = (123 * 3600 + 45 * 60 + 56) * 1000;
@@ -115,6 +601,7 @@ test("actual narrow sidebar preserves full metric fields and task time without e
         await rendered.renderOnce();
         await rendered.renderOnce(); // Settle the actual sidebar's measured width after resize.
         const frame = rendered.captureCharFrame();
+        if (speed !== undefined) reportFrame(`sidebar ${width} compact`, frame);
         const visible = frame.split("\n").map((line) => line.slice(0, width).trim()).filter(Boolean);
         assert.deepEqual(visible, ["+ Token Pulse", ...ui.formatPulseMetrics(counts, speed, width - 4, elapsed).split("\n")], `${width}: all visible cells must match whole fields`);
         assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: metrics must not spill outside the sidebar`);
@@ -126,6 +613,7 @@ test("actual narrow sidebar preserves full metric fields and task time without e
         ui.togglePulse(store);
         await rendered.renderOnce();
         const expanded = rendered.captureCharFrame().split("\n").map((line) => line.slice(0, width).trim()).join("\n");
+        if (speed !== undefined) reportFrame(`sidebar ${width} expanded`, rendered.captureCharFrame());
         const visibleGlyphs = expanded.replace(/\s+/g, "");
         assert.ok(visibleGlyphs.includes(`session${sessionID}`), `${width}: wrapping must preserve every full session ID character`);
         assert.doesNotMatch(expanded, /\.\.\.|…/);
@@ -473,30 +961,54 @@ test("native session-tree selector switches direct details, retains ledger-only 
 
 test("native prompt renders WARMUP, LIVE and a host-observed tool WAIT", async () => {
   const ui = (await uiPromise)!;
-  const store = ui.createRuntimeStore(10);
   const now = Date.now();
-  const active = ui.createActiveState("m", "root", now - 1000);
-  active.selectedSource = "legacy";
-  active.legacy.hasData = true;
-  active.legacy.samples = [{ timestamp: now - 1000, tokens: 10 }];
-  store.active.set("m", active);
+  const store = ui.createRuntimeStore(10, now - 1000);
   const api = host(80, 8);
+  ui.handleMessageUpdated(store, api, { info: { id: "m", sessionID: "root", role: "assistant", time: { created: now - 1000 } } }, { type: "message.updated", timestamp: now - 1000 }, 4, now - 1000);
+  const active = store.active.get("m")!;
+  active.selectedSource = "legacy";
+  store.active.set("m", active);
   const partState = api.state as unknown as { part: () => unknown[] };
   partState.part = () => [];
   const prompt = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.session_prompt_right!;
-  const rendered = await testRender(() => prompt({ theme: api.theme }, { session_id: "root" }), { width: 80, height: 8 });
+  let panel!: BoxRenderable;
+  const rendered = await testRender(() => {
+    api.renderer = useRenderer();
+    panel = new BoxRenderable(api.renderer, { width: 20, flexDirection: "column", flexShrink: 0 });
+    panel.add(prompt({ theme: api.theme }, { session_id: "root" }) as unknown as Renderable);
+    return panel as unknown as JSX.Element;
+  }, { width: 80, height: 20 });
   try {
     await rendered.renderOnce();
+    await rendered.renderOnce();
+    assert.match(rendered.captureCharFrame(), /WAITING --/);
+    assert.match(rendered.captureCharFrame(), /gen --/);
+    assert.doesNotMatch(rendered.captureCharFrame(), /gen ~0/);
+    reportFrame("prompt waiting content 20", rendered.captureCharFrame());
+    active.legacy.hasData = true;
+    active.legacy.samples = [{ timestamp: now - 1000, tokens: 10 }];
+    store.bump(); await rendered.renderOnce();
     assert.match(rendered.captureCharFrame(), /WARMUP --/);
     assert.doesNotMatch(rendered.captureCharFrame(), /LIVE ~0/);
     active.legacy.samples.push({ timestamp: now, tokens: 20 });
     store.bump();
     await rendered.renderOnce();
     assert.match(rendered.captureCharFrame(), /LIVE ~\d+ tok\/s/);
+    for (const width of [20, 24, 28, 32]) {
+      panel.width = width;
+      await rendered.renderOnce(); await rendered.renderOnce();
+      const frame = rendered.captureCharFrame();
+      const visible = frame.split("\n").map((line) => line.slice(0, width).trim()).join("\n");
+      assert.doesNotMatch(visible, /\.\.\.|…/);
+      for (const field of [/LIVE ~\d+ tok\/s/, /gen ~30/, /ttft --/, /elapsed 1s/, /total 0/]) assert.match(visible, field);
+      assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), "LIVE cannot spill outside its slot");
+      reportFrame(`prompt LIVE ${width}`, frame);
+    }
     partState.part = () => [{ type: "tool", state: { status: "running", time: { start: now } } }];
     store.bump();
     await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /WAIT --/);
+    assert.match(rendered.captureCharFrame(), /WAIT TOOL --/);
+    reportFrame("prompt tool waiting 32", rendered.captureCharFrame());
   } finally {
     rendered.renderer.destroy();
     store.disposeSignals();

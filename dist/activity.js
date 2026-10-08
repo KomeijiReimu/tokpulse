@@ -1,3 +1,4 @@
+import { coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, isSessionScopeExcluded } from "./scope.js";
 export const ACTIVITY_VERSION = 1;
 export const DEFAULT_ACTIVITY_INSTANCE_ID = "default";
 export const LIFECYCLE_STATES = ["busy", "retry", "idle", "completed", "failed", "aborted", "cancelled", "stopped"];
@@ -49,7 +50,10 @@ export function normalizeActivityEvent(value) {
     }),
     ...(lastObservedAt === undefined ? {} : {
       lastObservedAt
-    })
+    }),
+    ...(coerceScopeEvidence(value.scope) ? {
+      scope: coerceScopeEvidence(value.scope)
+    } : {})
   };
   let event;
   if (kind === "lifecycle") {
@@ -124,7 +128,7 @@ export function activityEventFingerprint(event) {
   return `fp-${fnv1a(activityEventSemanticCanonical(event))}`;
 }
 function activityEventSemanticCanonical(event) {
-  return JSON.stringify([event.version, event.kind, event.sessionID, event.kind === "lifecycle" ? event.state : null, event.parentSessionID ?? null, event.timestamp, event.observedAt, event.instanceID, event.seq ?? null, event.instanceEndedAt ?? null, event.lastObservedAt ?? null]);
+  return JSON.stringify([event.version, event.kind, event.sessionID, event.kind === "lifecycle" ? event.state : null, event.parentSessionID ?? null, event.timestamp, event.observedAt, event.instanceID, event.seq ?? null, event.instanceEndedAt ?? null, event.lastObservedAt ?? null, event.scope ?? null]);
 }
 function activityEventDedupeKey(event) {
   return JSON.stringify([event.eventID, activityEventSemanticCanonical(event)]);
@@ -161,7 +165,10 @@ export const unionDurationMilliseconds = calculateActiveMilliseconds;
  */
 export function calculateActiveIntervals(values, options = {}) {
   const replayOptions = normalizeReplayInput(options);
-  const events = sortActivityEvents(values).filter(isLifecycleEvent);
+  const replayCutoff = resolveGlobalCutoff(replayOptions);
+  // Collect scope/ancestry from all facts before bounding lifecycle replay,
+  // matching replayActivity without treating an untrusted cutoff as an end.
+  const events = filterActivityEvents(values, replayOptions.sessionScopes, replayOptions.parentBySessionID).filter(event => replayCutoff === undefined || event.timestamp <= replayCutoff).filter(isLifecycleEvent);
   const byInstance = groupLifecycleEvents(events);
   const intervals = [];
   for (const [key, stream] of byInstance) {
@@ -170,33 +177,57 @@ export function calculateActiveIntervals(values, options = {}) {
   }
   return mergeIntervals(intervals);
 }
+function activityParents(events, scopes = {}, parents) {
+  const links = new Map();
+  for (const [id, proof] of Object.entries(scopes)) if (proof.parentSessionID) links.set(id, proof.parentSessionID);
+  for (const event of events) {
+    if (event.kind === "parent" || event.parentSessionID !== undefined) links.set(event.sessionID, event.parentSessionID);
+  }
+  if (parents instanceof Map) for (const [id, parent] of parents) links.set(id, parent || undefined);else if (parents) for (const [id, parent] of Object.entries(parents)) links.set(id, parent || undefined);
+  return links;
+}
+
+/** One shared eligibility decision for lifecycle, trees and interval metrics. */
+export function filterActivityEvents(values, scopes = {}, parents) {
+  const events = sortActivityEvents(values);
+  scopes = collectSessionScopeEvidence(events, scopes);
+  const links = activityParents(events, scopes, parents);
+  const eligible = new Map();
+  return events.filter(event => {
+    if (event.scope?.sourceScope === "magic-message") return false;
+    if (!eligible.has(event.sessionID)) eligible.set(event.sessionID, isMeasurementScopeEligible(event, scopes, links));
+    return eligible.get(event.sessionID);
+  });
+}
 export const calculateSessionActiveIntervals = calculateActiveIntervals;
 
 /**
  * Replays an append-only activity log. No implicit `Date.now()` boundary is
- * used: an open interval is omitted unless a caller supplies a cutoff or an
- * explicit instance/observation boundary.
+ * used: historical open intervals require explicit instance/observation bounds;
+ * only a trusted current epoch may use a global cutoff as its end boundary.
  */
 export function replayActivity(values, options = {}) {
   const replayOptions = normalizeReplayInput(options);
   const ordered = sortActivityEvents(values);
+  const scopes = collectSessionScopeEvidence(ordered, replayOptions.sessionScopes);
+  const allParents = activityParents(ordered, scopes, replayOptions.parentBySessionID);
   const replayCutoff = resolveGlobalCutoff(replayOptions);
-  const events = replayCutoff === undefined ? ordered : ordered.filter(event => event.timestamp <= replayCutoff);
-  const parentBySessionID = new Map();
-  for (const event of events) {
-    if (event.kind === "parent") {
-      parentBySessionID.set(event.sessionID, event.parentSessionID);
-    } else if (event.parentSessionID !== undefined) {
-      parentBySessionID.set(event.sessionID, event.parentSessionID);
-    }
-  }
+  const bounded = replayCutoff === undefined ? ordered : ordered.filter(event => event.timestamp <= replayCutoff);
+  const eligible = new Map();
+  const sessionEligible = id => {
+    if (!eligible.has(id)) eligible.set(id, !isSessionScopeExcluded(id, scopes, allParents));
+    return eligible.get(id);
+  };
+  const events = bounded.filter(event => event.scope?.sourceScope !== "magic-message" && sessionEligible(event.sessionID));
+  const parentBySessionID = new Map([...allParents].filter(([id]) => sessionEligible(id)));
   const allSessionIDs = new Set();
   const lifecycleByInstance = groupLifecycleEvents(events.filter(isLifecycleEvent));
   for (const event of events) {
     allSessionIDs.add(event.sessionID);
     if (event.parentSessionID) allSessionIDs.add(event.parentSessionID);
   }
-  for (const parentSessionID of parentBySessionID.values()) {
+  for (const sessionID of [...allSessionIDs]) {
+    const parentSessionID = parentBySessionID.get(sessionID);
     if (parentSessionID) allSessionIDs.add(parentSessionID);
   }
   const lifecycleBySession = new Map();
@@ -342,7 +373,7 @@ function calculateInstanceIntervals(events, sessionID, instanceID, options) {
 function resolveInstanceBoundary(events, sessionID, instanceID, options) {
   const candidates = [];
   const globalCutoff = resolveGlobalCutoff(options);
-  if (globalCutoff !== undefined) candidates.push(globalCutoff);
+  if (globalCutoff !== undefined && options.trustedCurrentInstanceID === instanceID) candidates.push(globalCutoff);
   const instanceEnd = firstBoundary(resolveBoundarySpec(options.instanceEndedAt, instanceID, sessionID), resolveBoundarySpec(options.instanceEndTimes, instanceID, sessionID));
   if (instanceEnd !== undefined) candidates.push(instanceEnd);
   const observedBoundary = resolveBoundarySpec(options.lastObservedAt, instanceID, sessionID);

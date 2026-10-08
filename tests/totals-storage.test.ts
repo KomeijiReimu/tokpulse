@@ -5,9 +5,94 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import type { MeasuredHistoryRecord } from "../src/statistics.js";
-import { parseHistoryJsonl } from "../src/storage.js";
-import { createTotalsStorage, isCorruptTotalsError, projectTotalsGenerationBasis, resolveTotalsPath } from "../src/totals-storage.js";
+import { filterHistoryRecords, parseHistoryJsonl } from "../src/storage.js";
+import { createTotalsStorage, getExcludedMessageIDs, isCorruptTotalsError, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "../src/totals-storage.js";
 import { getSessionAverageSummary, measureRecordSpeed, mergeRecordSpeed } from "../src/statistics.js";
+import { classifyMessageMetadata, classifySessionMetadata, createScopeRegistry } from "../src/scope.js";
+
+test("late MC identity projects all usage/speed and descendants while preserving raw cumulative data and epoch", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  for (const sessionID of ["root", "real", "mc", "grand"]) {
+    await storage.apply(historyRecord(sessionID, { sessionID, tokens: tokens(1, 10, 2), speed: measuredV3Speed(tokens(1, 10, 2)) }));
+  }
+  const before = await storage.read();
+  const registry = createScopeRegistry();
+  registry.observeSessionMetadata("mc", { parentID: "root" });
+  registry.observeSessionMetadata("grand", { parentID: "mc" });
+  registry.observeMessageMetadata("mc", { mode: "dreamer" });
+  for (const [sid, proof] of Object.entries(registry.serialize())) await storage.setSessionScope(sid, proof);
+  const after = await storage.read();
+  assert.deepEqual(after.sessions, before.sessions);
+  assert.deepEqual(after.open, before.open);
+  const projected = projectTotalsMeasurementScope(after);
+  assert.deepEqual(Object.keys(projected.sessions).sort(), ["real", "root"]);
+  assert.deepEqual(projected.sessions.root, before.sessions.root);
+  assert.deepEqual(projected.sessions.real, before.sessions.real);
+  assert.equal(projected.generationBasisVersion, before.generationBasisVersion);
+  assert.equal(getSessionAverageSummary(projected.sessions.real).generation.coveredResponseCount, 1);
+  assert.equal(projectTotalsMeasurementScope(after), projected);
+  assert.equal(projectTotalsMeasurementScope(await createTotalsStorage(storage.path).read()).sessions.mc, undefined);
+  await storage.setSessionScope("mc", classifySessionMetadata({ agent: "build" }));
+  assert.equal(projectTotalsMeasurementScope(await storage.read()).sessions.mc, undefined);
+  assert.equal((await storage.read()).sessions.mc.tokens.output, 10);
+});
+
+test("message-only exclusion reverses exact open and settled contributions once and prevents corrected replay", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const normal = historyRecord("normal", { tokens: tokens(2, 20, 4), speed: measuredV3Speed(tokens(2, 20, 4)) });
+  const baseline = await storage.apply(normal);
+  const compact = historyRecord("compact", { tokens: tokens(10, 100, 20), cost: 9, speed: measuredV3Speed(tokens(10, 100, 20)) });
+  await storage.apply(compact, { retainedMessageIDs: ["normal"] });
+  const proof = classifyMessageMetadata({ summary: true, mode: "compaction" });
+  const excluded = await storage.excludeMessage("compact", proof);
+  assert.deepEqual(excluded.sessions, baseline.sessions);
+  assert.deepEqual((excluded.settled.compact as any).excluded, proof);
+  assert.equal((excluded.settled.compact as any).tokens.output, 100);
+  assert.equal(excluded.open.compact, undefined);
+  assert.deepEqual(await storage.excludeMessage("compact", proof), excluded);
+  assert.deepEqual(filterHistoryRecords([normal, compact], excluded.sessionScopes, undefined, getExcludedMessageIDs(excluded)), [normal]);
+  assert.equal(getExcludedMessageIDs(excluded), getExcludedMessageIDs(excluded));
+  assert.deepEqual(await createTotalsStorage(storage.path).apply({ ...compact, tokens: tokens(20, 200, 40) }), excluded);
+  await storage.apply(historyRecord("open-compaction", { tokens: tokens(5, 50), speed: measuredV3Speed(tokens(5, 50)) }));
+  assert.deepEqual((await storage.excludeMessage("open-compaction", proof)).sessions, baseline.sessions);
+  assert.equal((await storage.read()).sessionScopes, undefined);
+});
+
+test("legacy settled true exclusion never guesses an amount and blocks resurrection; unknown tombstones share settled scheme", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const baseline = await storage.apply(historyRecord("legacy", { tokens: tokens(10, 20) }));
+  baseline.settled.legacy = true;
+  delete baseline.open.legacy;
+  assert.equal(getExcludedMessageIDs(baseline).has("legacy"), false);
+  await writeFile(storage.path, JSON.stringify(baseline));
+  const proof = classifyMessageMetadata({ modelID: "magic-context" });
+  const excluded = await storage.excludeMessage("legacy", proof);
+  assert.deepEqual(excluded.sessions, baseline.sessions);
+  assert.equal(getExcludedMessageIDs(excluded).has("legacy"), true);
+  assert.deepEqual(filterHistoryRecords([historyRecord("legacy"), historyRecord("normal")], {}, undefined, getExcludedMessageIDs(excluded)).map((record) => record.messageID), ["normal"]);
+  assert.deepEqual((await storage.apply(historyRecord("legacy", { tokens: tokens(100, 200) }))).sessions, baseline.sessions);
+  await storage.excludeMessage("not-seen", proof);
+  const later = await storage.apply(historyRecord("not-seen", { tokens: tokens(50, 50) }));
+  assert.deepEqual(later.sessions, baseline.sessions);
+  assert.equal(later.settled["not-seen"], true);
+  assert.equal(getExcludedMessageIDs(await createTotalsStorage(storage.path).read()).has("not-seen"), true);
+});
+
+test("provisional exclusion and compact record proof cannot remove same-SID user contributions", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const baseline = await storage.apply(historyRecord("normal", { tokens: tokens(7, 3) }));
+  await storage.apply(historyRecord("provisional", { quality: "provisional", tokens: tokens(50, 20) }));
+  const proof = classifyMessageMetadata({ agent: "compaction" });
+  const corrected = await storage.excludeMessage("provisional", proof);
+  assert.deepEqual(corrected.sessions, baseline.sessions);
+  const excludedRecord = { ...historyRecord("proof", { tokens: tokens(100, 100) }), scope: proof };
+  assert.deepEqual((await storage.apply(excludedRecord)).sessions, baseline.sessions);
+  assert.deepEqual((await storage.apply(historyRecord("proof"))).sessions, baseline.sessions);
+});
 
 test("resolveTotalsPath uses a sibling totals.json unless totalsPath is explicit", () => {
   assert.equal(
@@ -208,7 +293,7 @@ for (const settled of [false, true]) {
     assert.equal(corrected.sessions.session?.cost, 0);
     assert.equal(corrected.sessions.session?.responseCount, 1);
     assert.deepEqual(corrected.sessions.session?.speed, {
-      generation: { generatedTokens: 0, coverageGeneratedTokens: 0, durationMs: 2000, responseCount: 1, estimatedResponseCount: 1 },
+      generation: { generatedTokens: 0, coverageGeneratedTokens: 0, durationMs: 2000, responseCount: 1, estimatedResponseCount: 1, shortResponseCount: 0 },
       response: { generatedTokens: 0, coverageGeneratedTokens: 0, durationMs: 3000, responseCount: 1, estimatedResponseCount: 0 },
     });
     assert.equal(getSessionAverageSummary(corrected.sessions.session!).generation.rate, 0);
@@ -749,6 +834,37 @@ function measuredV3Speed(counts: TokenCounts) {
     usage: { output: counts.output, reasoning: counts.reasoning },
   } });
 }
+
+function shortV3Speed(counts: TokenCounts) {
+  const original = measuredV3Speed(counts).generationEvidence!;
+  const record = historyRecord("short-measurement", { tokens: counts, time: { start: 0, completed: 3000 } });
+  return measureRecordSpeed(record, { usageExact: true, responseTimingExact: true, generation: {
+    ...original, start: 100, end: 300, firstReceiveMono: 10, lastReceiveMono: 210,
+    clockSource: "performance.now", clockResolutionMs: 1, observationQuality: "short", complete: true, estimated: true,
+  } });
+}
+
+test("short generation quality survives usage corrections, +/- message exclusion, rollup projection and restart", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const normal = historyRecord("normal-short", { tokens: tokens(1, 10, 2), speed: shortV3Speed(tokens(1, 10, 2)) });
+  const baseline = await storage.apply(normal);
+  assert.equal(baseline.sessions.session.speed?.generation.shortResponseCount, 1);
+  const compact = historyRecord("compact-short", { tokens: tokens(2, 20, 4), speed: shortV3Speed(tokens(2, 20, 4)) });
+  const combined = await storage.apply(compact);
+  assert.equal(combined.sessions.session.speed?.generation.shortResponseCount, 2);
+  const corrected = await storage.apply({ ...compact, tokens: tokens(1, 5, 1), speed: shortV3Speed(tokens(1, 5, 1)) }, { retainedMessageIDs: ["normal-short"] });
+  assert.equal(corrected.sessions.session.speed?.generation.shortResponseCount, 2);
+  const excluded = await storage.excludeMessage("compact-short", classifyMessageMetadata({ providerID: "magic-context" }));
+  assert.deepEqual(excluded.sessions, baseline.sessions);
+  assert.equal(excluded.sessions.session.speed?.generation.shortResponseCount, 1);
+  assert.deepEqual((await createTotalsStorage(storage.path).read()).sessions, baseline.sessions);
+  await storage.apply(historyRecord("mc-short", { sessionID: "mc", tokens: tokens(2, 20, 4), speed: shortV3Speed(tokens(2, 20, 4)) }));
+  await storage.setSessionScope("mc", classifyMessageMetadata({ mode: "dreamer" }));
+  const projected = projectTotalsMeasurementScope(await storage.read());
+  assert.deepEqual(projected.sessions, baseline.sessions);
+  assert.equal(projected.sessions.session.speed?.generation.shortResponseCount, 1);
+});
 
 test("legacy TUI projection hides generation without mutating usage, response, marker, or disk", async (context) => {
   const directory = await makeTestDirectory(context);

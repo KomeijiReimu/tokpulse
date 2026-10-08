@@ -34,6 +34,8 @@ import {
   projectSessionTotals,
   freezeSessionRun,
   handleSessionLifecycle,
+  handleMessageUpdated,
+  finalizeResponse,
   hasLiveTaskWallActivity,
   historyRecordsEquivalent,
   lockStreamSource,
@@ -563,7 +565,7 @@ test("LAST history and details select the same qualified generation and estimate
     assert.equal(last.estimated, history.estimated);
     assert.equal(last.estimated, true);
     assert.deepEqual(details.lastSpeed, history);
-    assert.match(liveLabel(store, "s", 5.5, 28), /^LAST ~500 tok\/s generation$/);
+    assert.match(liveLabel(store, "s", 5.5, 28), /^LAST ~500 tok\/s generation\ngen 1k · ttft 100ms\nmeasured 1s · total 1k$/);
     assert.match(formatHistoryRow(response), /~500\s+generation\s+--\s+--/);
     assert.equal(formatResponseThroughput(response), "Response throughput 200 tok/s");
     assert.match(formatResponseTimingDetails(response), /First content TTFT 1s.*thinking · part start/);
@@ -591,7 +593,7 @@ test("legacy generation evidence cannot become primary TPS; response and samples
   const store = createRuntimeStore(1);
   try {
     store.lastCompletedBySession.set("s", makeLastCompletedSnapshot(missing));
-    assert.equal(liveLabel(store, "s", 5.5, 20), "LAST --");
+    assert.match(liveLabel(store, "s", 5.5, 20), /^LAST --[\s\S]*gen 100[\s\S]*measured --[\s\S]*No qualified generation timing\.$/);
   } finally { store.disposeSignals(); }
 });
 
@@ -883,7 +885,7 @@ test("out-of-order idle before a child run is retained until its later busy even
 });
 
 test("session lifecycle keeps an unknown child's idle event before busy", () => {
-  const store = createRuntimeStore(10);
+  const store = createRuntimeStore(10, 0);
   const api = {} as TuiPluginApi;
   handleSessionLifecycle(store, api, "session.idle", { sessionID: "child" }, {
     type: "session.idle",
@@ -1055,7 +1057,7 @@ test("late parent mapping migrates a child-key run to the root", () => {
 });
 
 test("v1.18.18 session.status payload drives retry and idle lifecycle", () => {
-  const store = createRuntimeStore(10);
+  const store = createRuntimeStore(10, 0);
   const api = {} as TuiPluginApi;
   const retry = {
     type: "session.status",
@@ -1122,7 +1124,7 @@ test("persisted intervals and live task overlay are merged without double counti
 });
 
 test("canonical v2 retry and failed lifecycle transitions the live task run", () => {
-  const store = createRuntimeStore(10);
+  const store = createRuntimeStore(10, 0);
   const api = {} as TuiPluginApi;
   const retried = {
     type: "session.next.retried",
@@ -1142,7 +1144,7 @@ test("canonical v2 retry and failed lifecycle transitions the live task run", ()
 });
 
 test("historical idle and failed events do not freeze the current session runtime", () => {
-  const store = createRuntimeStore(10);
+  const store = createRuntimeStore(10, 0);
   const api = {} as TuiPluginApi;
   const lifecycle = (type: string, timestamp: number) => ({
     type,
@@ -1371,7 +1373,7 @@ test("child agent rows use cumulative direct generation, not bounded response hi
     store.totalsLedger.sessions.child = { tokens: tokens(0), cost: 0, responseCount: 0, speed: emptySpeedTotals() };
     const wrapper = childRows([], "root", store).find((row) => row.sessionID === "child")!;
     assert.deepEqual([wrapper.responseCount, wrapper.generated, wrapper.speedAvailable], [0, 0, false]);
-    delete store.totalsLedger.generationBasisVersion;
+    store.totalsLedger = { ...store.totalsLedger, generationBasisVersion: undefined };
     assert.ok(childRows([stale], "root", store).every((row) => !row.speedAvailable));
   } finally { store.disposeSignals(); }
 });
@@ -1464,17 +1466,18 @@ test("main average uses ratio of cumulative sums and identifies partial estimate
 });
 
 test("prompt warms up without fake LIVE zero, becomes ready, and respects known tool waits", () => {
-  const store = createRuntimeStore(10);
-  const active = createActiveState("m", "root", 0);
+  const store = createRuntimeStore(10, 0);
+  handleMessageUpdated(store, {} as TuiPluginApi, { info: { id: "m", sessionID: "root", role: "assistant", time: { created: 0 } } }, { type: "message.updated", timestamp: 0 }, 4, 0);
+  const active = store.active.get("m")!;
   active.selectedSource = "legacy";
   active.legacy.hasData = true;
   active.legacy.samples = [{ timestamp: 0, tokens: 10 }];
   store.active.set("m", active);
-  assert.equal(liveLabel(store, "root", 5.5, 20, 500), "WARMUP --");
+  assert.match(liveLabel(store, "root", 5.5, 20, 500), /^WARMUP -- · gen ~10\nttft --\nelapsed 500ms\ntotal 0$/);
   active.legacy.samples.push({ timestamp: 1000, tokens: 20 });
-  assert.equal(liveLabel(store, "root", 5.5, 20, 1000), "LIVE ~20 tok/s");
-  assert.equal(liveLabel(store, "root", 5.5, 20, 1000, true), "WAIT --");
-  assert.equal(liveLabel(store, "root", 5.5, 20, 11000), "WAIT --");
+  assert.match(liveLabel(store, "root", 5.5, 20, 1000), /^LIVE ~20 tok\/s\n/);
+  assert.match(liveLabel(store, "root", 5.5, 20, 1000, true), /^WAIT TOOL --\n/);
+  assert.match(liveLabel(store, "root", 5.5, 20, 11000), /^WAIT -- · gen ~30\n/);
   assert.equal(liveLabel(store, "other", 5.5, 20, 1000), "IDLE");
   store.active.clear();
   store.lastCompletedBySession.set("root", makeLastCompletedSnapshot(record("done", "root", 10, 0)));
@@ -1482,6 +1485,88 @@ test("prompt warms up without fake LIVE zero, becomes ready, and respects known 
   store.active.set("child", active);
   assert.match(liveLabel(store, "root", 5.5, 20, 1000), /^LAST /);
   store.disposeSignals();
+});
+
+test("response finalization retires only matching SID, message and epoch pending ownership", () => {
+  for (const pendingOwner of ["m", undefined, "next"] as const) {
+    const store = createRuntimeStore(1, 0);
+    try {
+      handleMessageUpdated(store, {} as TuiPluginApi, { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 0 } } }, { type: "message.updated", timestamp: 0 }, 4, 0);
+      const direct = store.active.get("m")!;
+      const pending = createActiveState("__pending__:s", "s", 10);
+      pending.ownerMessageID = pendingOwner;
+      pending.responseEpoch = direct.responseEpoch;
+      store.active.set(pending.messageID, pending);
+      assert.equal(finalizeResponse(store, "m", "other", direct.responseEpoch, { authoritative: true }), undefined);
+      assert.equal(store.active.get("m"), direct, "a mismatched SID cannot retire the direct response");
+      assert.equal(finalizeResponse(store, "m", "s", direct.responseEpoch, { authoritative: false }), undefined);
+      assert.equal(finalizeResponse(store, "m", "s", direct.responseEpoch, { authoritative: true }), direct);
+      assert.equal(store.active.has("m"), false);
+      assert.equal(store.active.has(pending.messageID), pendingOwner === "next");
+      assert.equal(store.sessionRuntime.get("s")!.status, "busy", "response completion is not task idle");
+      assert.equal(store.sessionRuntime.get("s")!.activeMessageID, undefined);
+    } finally { store.disposeSignals(); }
+  }
+  const store = createRuntimeStore(1, 0);
+  try {
+    handleMessageUpdated(store, {} as TuiPluginApi, { info: { id: "next", sessionID: "s", role: "assistant", time: { created: 100 } } }, { type: "message.updated", timestamp: 100 }, 4, 100);
+    const next = store.active.get("next")!;
+    const pending = createActiveState("__pending__:s", "s", 110);
+    pending.ownerMessageID = "next";
+    pending.responseEpoch = next.responseEpoch;
+    store.active.set(pending.messageID, pending);
+    finalizeResponse(store, "previous", "s", (next.responseEpoch ?? 1) - 1, { authoritative: true });
+    assert.equal(store.active.get("next"), next);
+    assert.equal(store.active.get(pending.messageID), pending);
+    assert.match(liveLabel(store, "s", 4, 24, 200), /^WAITING --/);
+    assert.equal(hasLiveTaskWallActivity(store), true);
+  } finally { store.disposeSignals(); }
+  const pendingStore = createRuntimeStore(1, 0);
+  try {
+    const pending = createActiveState("__pending__:s", "s", 0);
+    pending.ownerMessageID = "m";
+    pending.responseEpoch = 1;
+    pending.legacy.samples = [{ timestamp: 100, tokens: 2 }];
+    pendingStore.active.set(pending.messageID, pending);
+    const captured = finalizeResponse(pendingStore, "m", "s", 1, { authoritative: true });
+    assert.ok(captured);
+    assert.equal(captured, pending, "owned pending observations survive retirement for completion measurement");
+    assert.equal(captured.messageID, "m");
+    assert.equal(captured.legacy.samples.length, 1);
+    assert.equal(pendingStore.active.size, 0);
+  } finally { pendingStore.disposeSignals(); }
+});
+
+test("clock-only task reads reuse immutable closed lifecycle snapshots and extend only the live tail", () => {
+  const store = createRuntimeStore(1, 0);
+  try {
+    const run = createTaskWallRun("root");
+    store.taskRuns.set("root", run);
+    for (let index = 0; index < 30; index++) {
+      transitionTaskWallRun(run, "root", "busy", index * 1000);
+      transitionTaskWallRun(run, "root", "idle", index * 1000 + 100);
+    }
+    transitionTaskWallRun(run, "root", "busy", 30000);
+    let iterations = 0;
+    const seen = new Set<unknown>();
+    for (const map of [run.lifecycleHistory, run.lifecycleEvents, run.pendingLifecycleEvents, run.lastRunLifecycleEvents]) for (const events of map.values()) {
+      if (seen.has(events)) continue;
+      seen.add(events);
+      const values = [...events];
+      Object.defineProperty(events, Symbol.iterator, { value: function* () { iterations++; yield* values; } });
+      Object.freeze(events);
+    }
+    assert.equal(taskWallTimeForSession(store, "root", 31000), 4000);
+    const initialIterations = iterations;
+    for (let index = 1; index <= 20; index++) {
+      store.tick();
+      assert.equal(taskWallTimeForSession(store, "root", 31000 + index * 500), 4000 + index * 500);
+    }
+    assert.equal(iterations, initialIterations, "a timer tick must not iterate the old lifecycle arrays again");
+    transitionTaskWallRun(run, "root", "idle", 42000);
+    assert.equal(taskWallTimeForSession(store, "root", 60000), 15000);
+    assert.equal(taskWallTimeForSession(store, "root", 120000), 15000);
+  } finally { store.disposeSignals(); }
 });
 
 test("plugin options preserve native key strings and explicit disabled shortcuts", () => {

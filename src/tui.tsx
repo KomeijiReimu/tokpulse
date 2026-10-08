@@ -1,8 +1,9 @@
 /** @jsxImportSource @opentui/solid */
 
 import { readFile } from "node:fs/promises";
+import { watch, statSync, type FSWatcher } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import type { MouseEvent, ScrollBoxRenderable, SelectRenderable } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
@@ -47,14 +48,17 @@ import type { ActivityEvent, ActivityReplay } from "./activity.js";
 import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, type SpeedContribution, cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, parseModelDelta, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 import { getSessionAverageSummary, type AverageRateSummary, type SessionAverageSummary } from "./statistics.js";
 import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteContentArrival, noteStepIdentity, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
+import { RECEIVE_CLOCK_RESOLUTION_MS, type ReceiveClockContext, type ObservationQuality } from "./statistics.js";
+import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, isSessionScopeExcluded, mergeScopeEvidence, type CompactScopeEvidence, type ScopeRegistry } from "./scope.js";
 import {
   DEFAULT_MAX_RECORDS,
   readHistoryFile,
+  filterHistoryRecords,
 } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import type { TotalsRollup } from "./totals-aggregate.js";
-import { TOTALS_VERSION, projectTotalsGenerationBasis, resolveTotalsPath } from "./totals-storage.js";
+import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "./totals-storage.js";
 import type {
   OpenContribution,
   SessionDirectTotals,
@@ -67,6 +71,7 @@ const HISTORY_MODE = "oc-tps.history";
 const COMMAND_NAME = "oc-tps.history";
 export const DETAILS_COMMAND_NAME = "oc-tps.details";
 const SPARK_CHARS = ".:-=+#";
+const RECEIVE_CLOCK: ReceiveClockContext = Object.freeze({ clockSource: "performance.now", clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS });
 
 type ObjectRecord = Record<string, unknown>;
 export type StreamName = "legacy" | "v2";
@@ -92,10 +97,69 @@ function knownNonAssistant(store: RuntimeStore, messageID: string): boolean {
   const role = observationRuntime(store).metadata.roles.get(messageID);
   return role !== undefined && role !== "assistant";
 }
+
+const scopeSnapshots = new WeakMap<RuntimeStore, { ledger: TotalsLedger; registry: ScopeRegistry; revision: number; records: readonly HistoryRecord[]; disk: readonly HistoryRecord[]; ledgerView: TotalsLedger }>();
+function scopedLedger(store: RuntimeStore): TotalsLedger {
+  const cached = scopeSnapshots.get(store);
+  if (cached?.ledger === store.totalsLedger && cached.registry === store.sourceScopes && cached.revision === store.sourceScopes.revision
+    && cached.records === store.records && cached.disk === store.diskRecords) return cached.ledgerView;
+  const scopes: Record<string, CompactScopeEvidence> = { ...collectSessionScopeEvidence([...store.diskRecords, ...store.records], store.totalsLedger.sessionScopes) };
+  for (const [id, proof] of Object.entries(store.sourceScopes.serialize())) scopes[id] = mergeScopeEvidence(scopes[id], proof);
+  const ledgerView = { ...store.totalsLedger, sessionScopes: scopes };
+  // Remove only positively excluded reversible contributions, never raw facts.
+  for (const [id, proof] of store.messageScopes) {
+    const contribution = Object.prototype.hasOwnProperty.call(ledgerView.open, id) ? ledgerView.open[id] : ledgerView.settled[id];
+    if (!contribution || contribution === true || contribution.excluded) continue;
+    const direct = ledgerView.sessions[contribution.sessionID];
+    if (!direct) continue;
+    ledgerView.sessions = { ...ledgerView.sessions, [contribution.sessionID]: cloneDirectTotals(direct) };
+    subtractDirect(ledgerView.sessions[contribution.sessionID], contribution.tokens, contribution.cost, contribution.speed);
+    if (ledgerView.open[id]) ledgerView.open = { ...ledgerView.open, [id]: { ...contribution, excluded: proof } };
+    else ledgerView.settled = { ...ledgerView.settled, [id]: { ...contribution, excluded: proof } };
+  }
+  scopeSnapshots.set(store, { ledger: store.totalsLedger, registry: store.sourceScopes, revision: store.sourceScopes.revision, records: store.records, disk: store.diskRecords, ledgerView });
+  return ledgerView;
+}
+function scopeEligible(store: RuntimeStore, sessionID: string, messageID?: string): boolean {
+  const ledger = scopedLedger(store);
+  return !(messageID && getExcludedMessageIDs(ledger).has(messageID))
+    && isMeasurementScopeEligible({ sessionID, scope: messageID ? store.messageScopes.get(messageID) : undefined }, ledger.sessionScopes, store.sessionParents);
+}
+function scopedRecords(store: RuntimeStore, records: readonly HistoryRecord[]): HistoryRecord[] {
+  return filterHistoryRecords(records.map((record) => {
+    const proof = store.messageScopes.get(record.messageID);
+    return proof ? { ...record, scope: mergeScopeEvidence(record.scope, proof) } : record;
+  }), scopedLedger(store).sessionScopes, store.sessionParents, getExcludedMessageIDs(scopedLedger(store)));
+}
+function observeAssistantScope(store: RuntimeStore, sessionID: string, messageID: string, info: ObjectRecord): CompactScopeEvidence {
+  const previousRevision = store.sourceScopes.revision;
+  const proof = store.sourceScopes.observeMessageMetadata(sessionID, info);
+  if (proof.sourceScope === "magic-message" || proof.sourceScope === "magic-session") {
+    store.messageScopes.set(messageID, mergeScopeEvidence(store.messageScopes.get(messageID), proof));
+    scopeSnapshots.delete(store);
+  }
+  if ((previousRevision !== store.sourceScopes.revision && store.sourceScopes.isExcluded(sessionID)) || !scopeEligible(store, sessionID, messageID)) {
+    refreshScopeProjection(store);
+  }
+  return proof;
+}
+
+function refreshScopeProjection(store: RuntimeStore): void {
+  store.records = scopedRecords(store, store.records);
+  store.activityReplay = replayActivity(store.activityEvents, { sessionScopes: scopedLedger(store).sessionScopes, parentBySessionID: store.sessionParents });
+  for (const state of [...store.active.values()]) if (!scopeEligible(store, state.sessionID, state.messageID)) {
+    finalizeResponse(store, state.messageID, state.sessionID, state.responseEpoch, { authoritative: true });
+  }
+  for (const [id, last] of store.lastCompletedBySession) if (!scopeEligible(store, id, last.record.messageID)) store.lastCompletedBySession.delete(id);
+  for (const run of store.taskRuns.values()) for (const id of run.activeSessions) if (!scopeEligible(store, id)) run.activeSessions.delete(id);
+  store.bump();
+}
 export function recordTuiPartMetadata(store: RuntimeStore, properties: ObjectRecord, event: CompatibleEvent = {}, receivedAt = Date.now()): void {
   const observations = observationRuntime(store);
   const part = asRecord(properties.part);
   const messageID = readString(part?.messageID);
+  const sessionID = readString(part?.sessionID) ?? (messageID ? store.active.get(messageID)?.sessionID : undefined);
+  if (sessionID && !scopeEligible(store, sessionID, messageID)) return;
   const active = messageID ? store.active.get(messageID) : undefined;
   if (active && part?.sessionID !== undefined && part.sessionID !== active.sessionID) return;
   cachePartSnapshot(observations.metadata, properties);
@@ -268,6 +332,8 @@ export interface ActiveState {
   legacy: CandidateStream;
   v2: CandidateStream;
   selectedSource?: StreamName;
+  responseEpoch?: number;
+  ownerMessageID?: string;
 }
 
 export type SessionRunStatus = "idle" | "busy" | "retry";
@@ -481,6 +547,7 @@ export interface LastCompletedSnapshot {
   estimated: boolean;
   available?: boolean;
   basis?: "generation" | "response";
+  observationQuality?: ObservationQuality;
 }
 
 export interface TuiOptions {
@@ -506,6 +573,8 @@ export interface RuntimeStore {
   sessionRuntime: Map<string, SessionRuntime>;
   taskRuns: Map<string, TaskWallRun>;
   sessionParents: Map<string, string>;
+  sourceScopes: ScopeRegistry;
+  messageScopes: Map<string, CompactScopeEvidence>;
   totalsLedger: TotalsLedger;
   lastCompletedBySession: Map<string, LastCompletedSnapshot>;
   focusSessionID?: string;
@@ -515,6 +584,8 @@ export interface RuntimeStore {
   activityReplay: ActivityReplay;
   activityGeneration: number;
   revision: () => number;
+  clockRevision: () => number;
+  tick: () => void;
   bump: () => void;
   disposed: boolean;
   disposeSignals: () => void;
@@ -540,6 +611,7 @@ export interface RecordSpeedSummary extends RateStats {
   generated: number;
   estimated: boolean;
   basis?: "generation" | "response";
+  observationQuality?: ObservationQuality;
 }
 
 function isRecord(value: unknown): value is ObjectRecord {
@@ -692,7 +764,8 @@ function modelName(value: ObjectRecord | undefined): string | undefined {
   const direct = readString(value.model);
   if (direct) return direct;
   const model = asRecord(value.model);
-  return readStringFrom([model, value], ["modelID", "modelId", "id", "name"]);
+  return readStringFrom([model], ["modelID", "modelId", "id", "name"])
+    ?? readStringFrom([value], ["modelID", "modelId"]);
 }
 
 function tokenFields(value: unknown): Partial<TokenCounts> {
@@ -1281,9 +1354,18 @@ function getOrCreateActiveState(
   const direct = messageID ? active.get(messageID) : undefined;
   const pendingID = pendingKey(sessionID);
   const pending = active.get(pendingID);
-  const state = direct ?? pending ?? createActiveState(messageID ?? pendingID, sessionID, timestamp);
+  const ownedPending = pending?.ownerMessageID === messageID ? pending : undefined;
+  const state = direct ?? ownedPending ?? createActiveState(messageID ?? pendingID, sessionID, timestamp);
+  if (direct && ownedPending && direct !== ownedPending && direct.responseEpoch === ownedPending.responseEpoch) {
+    direct.progress = mergeContentProgress(direct.progress, ownedPending.progress);
+    direct.fallbackTokens = mergeTokenFields(direct.fallbackTokens, ownedPending.fallbackTokens);
+    for (const source of ["legacy", "v2"] as const) {
+      direct[source].hasData ||= ownedPending[source].hasData;
+      direct[source].samples.push(...ownedPending[source].samples);
+    }
+  }
   if (messageID) state.messageID = messageID;
-  if (messageID && pending && state === pending) active.delete(pendingID);
+  if (messageID && ownedPending) active.delete(pendingID);
   return state;
 }
 
@@ -1294,11 +1376,46 @@ export function takeActiveState(
 ): ActiveState | undefined {
   const direct = active.get(messageID);
   const pendingID = pendingKey(sessionID);
-  const state = direct ?? active.get(pendingID);
+  const pending = active.get(pendingID);
+  const state = direct ?? (pending?.ownerMessageID === messageID ? pending : undefined);
   if (!state || state.sessionID !== sessionID) return undefined;
   active.delete(messageID);
-  if (!direct) active.delete(pendingID);
+  if (pending?.ownerMessageID === messageID && (state.responseEpoch === undefined || pending.responseEpoch === state.responseEpoch)) active.delete(pendingID);
   state.messageID = messageID;
+  return state;
+}
+
+function ownedMessageID(store: RuntimeStore, sessionID: string): string | undefined {
+  const id = store.sessionRuntime.get(sessionID)?.activeMessageID;
+  return id && observationRuntime(store).liveAssistantMessages.has(id) && !knownCompletedMessage(store, id) ? id : undefined;
+}
+
+/** Completion is a lifecycle fact, independent of whether its usage correction wins. */
+export function finalizeResponse(store: RuntimeStore, messageID: string, sessionID: string, epoch: number | undefined,
+  completionFact: { completedAt?: number; authoritative: boolean }): ActiveState | undefined {
+  if (!completionFact.authoritative) return undefined;
+  const runtime = store.sessionRuntime.get(sessionID);
+  const direct = store.active.get(messageID);
+  if (direct && (direct.sessionID !== sessionID || (epoch !== undefined && direct.responseEpoch !== epoch))) return undefined;
+  const pendingID = pendingKey(sessionID);
+  const pending = store.active.get(pendingID);
+  const ownedPending = pending?.sessionID === sessionID && pending.ownerMessageID === messageID
+    && (epoch === undefined || pending.responseEpoch === epoch) ? pending : undefined;
+  const state = direct ?? ownedPending;
+  if (direct && ownedPending && direct !== ownedPending && direct.responseEpoch === ownedPending.responseEpoch) {
+    getOrCreateActiveState(store.active, messageID, sessionID, direct.startedAt);
+  }
+  if (state) state.messageID = messageID;
+  const sameCurrent = runtime?.activeMessageID === messageID && (epoch === undefined || runtime.runEpoch === epoch);
+  if (state) store.active.delete(messageID);
+  if (pending?.sessionID === sessionID && (pending.ownerMessageID === messageID || (sameCurrent && pending.ownerMessageID === undefined))
+    && (epoch === undefined || pending.responseEpoch === undefined || pending.responseEpoch === epoch)) store.active.delete(pendingID);
+  if (sameCurrent) runtime!.activeMessageID = undefined;
+  store.completedMessageIDs.add(messageID);
+  const observations = observationRuntime(store);
+  observations.metadata.completed.add(messageID);
+  observations.liveAssistantMessages.delete(messageID);
+  if (state || sameCurrent || (pending && !store.active.has(pendingID))) store.bump();
   return state;
 }
 
@@ -1618,6 +1735,7 @@ export function makeLastCompletedSnapshot(
     estimated: selected.estimated,
     available: selected.available,
     basis: selected.basis,
+    observationQuality: selected.measurement?.observationQuality,
   };
 }
 
@@ -1675,6 +1793,7 @@ function commitRecord(
   ) {
     store.lastCompletedBySession.set(effectiveRecord.sessionID, snapshot);
   }
+  store.bump();
 }
 
 function parentSessionID(
@@ -2004,7 +2123,8 @@ function rememberSessionParent(
 ): boolean {
   if (!sessionID || !parentID || sessionID === parentID) return false;
   const previous = store.sessionParents.get(sessionID);
-  if (previous !== parentID) store.sessionParents.set(sessionID, parentID);
+  store.sourceScopes.observeSessionMetadata(sessionID, { parentID });
+  if (previous !== parentID) store.sessionParents = new Map(store.sessionParents).set(sessionID, parentID);
   const repaired = repairKnownParents(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
   const migrated = migrateTaskWallRuns(store, rootSessionID);
@@ -2062,9 +2182,15 @@ export function cacheSessionParentFromEvent(store: RuntimeStore, input: unknown)
   if (type !== "session.created" && type !== "session.updated") return false;
   const properties = eventProperties(event);
   const sessionID = readSessionID(properties, event);
+  if (!sessionID) return false;
+  const before = store.sourceScopes.revision;
+  store.sourceScopes.observeSessionMetadata(sessionID, eventInfo(properties, event) ?? asRecord(properties.session) ?? properties);
   const parentID = sessionParentFromEvent(type, properties, event);
-  if (!sessionID || !parentID) return false;
-  return rememberSessionParent(store, sessionID, parentID);
+  const mapped = parentID ? rememberSessionParent(store, sessionID, parentID) : false;
+  if (store.sourceScopes.revision !== before) {
+    refreshScopeProjection(store);
+  }
+  return mapped || store.sourceScopes.revision !== before;
 }
 
 function rootSessionIDFor(
@@ -2073,6 +2199,14 @@ function rootSessionIDFor(
   sessionID: string,
   info?: ObjectRecord,
 ): string {
+  try {
+    const cached = api.state.session.get(sessionID);
+    if (cached) {
+      const previous = store.sourceScopes.revision;
+      store.sourceScopes.observeSessionMetadata(sessionID, cached);
+      if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
+    }
+  } catch { /* SDK state may not be ready; unknown is not exclusion evidence. */ }
   const parent = parentSessionID(api, sessionID, info, store);
   if (parent) rememberSessionParent(store, sessionID, parent);
   const rootSessionID = knownRootSessionID(store, sessionID);
@@ -2121,29 +2255,51 @@ function findTaskWallRun(
     .find((run) => run.rootSessionID === sessionID || run.participantSessions.has(sessionID));
 }
 
+const taskDisplaySnapshots = new WeakMap<TaskWallRun, {
+  store: RuntimeStore; scopeRevision: number; ledger: TotalsLedger; parents: ReadonlyMap<string, string>; phase: TaskWallRun["phase"];
+  sources: Map<string, TaskLifecycleEvent[]>[]; entries: [string, TaskLifecycleEvent[]][][];
+  history: Map<string, TaskLifecycleEvent[]>; intervals: TaskActivityInterval[]; boundary?: number; open: boolean;
+}>();
+function taskDisplayIntervals(store: RuntimeStore, run: TaskWallRun, now: number): TaskActivityInterval[] {
+  const sources = [run.lifecycleHistory, run.lifecycleEvents, run.pendingLifecycleEvents, run.lastRunLifecycleEvents];
+  let cached = taskDisplaySnapshots.get(run);
+  const unchanged = cached?.store === store && cached.scopeRevision === store.sourceScopes.revision
+    && cached.ledger === store.totalsLedger && cached.parents === store.sessionParents && cached.phase === run.phase
+    && sources.every((source, index) => source === cached!.sources[index] && source.size === cached!.entries[index].length
+      && cached!.entries[index].every(([id, events]) => source.get(id) === events));
+  if (!unchanged) {
+    // Lifecycle arrays are replaced, not mutated, by recordLifecycleFact. Replay
+    // their closed facts once; a timer tick only extends the current open tail.
+    const history = new Map([...completeLifecycleHistoryForRun(run)].filter(([id]) => scopeEligible(store, id)));
+    const latest = [...history.values()].flatMap((events) => events.at(-1) ? [events.at(-1)!.timestamp] : []);
+    const boundary = latest.length ? Math.max(...latest) : undefined;
+    cached = { store, scopeRevision: store.sourceScopes.revision, ledger: store.totalsLedger, parents: store.sessionParents, phase: run.phase,
+      sources, entries: sources.map((source) => [...source]), history, intervals: lifecycleIntervals(history), boundary,
+      open: run.phase === "active" && [...history.values()].some((events) => activeTaskSessionState(events.at(-1)?.state)) };
+    taskDisplaySnapshots.set(run, cached);
+  }
+  if (!cached!.history.size) return run.phase === "active" ? cloneIntervals(run.carriedIntervals) : [...run.lastRunIntervals, ...run.carriedIntervals];
+  const boundary = cached!.boundary;
+  if (run.phase === "active" && boundary !== undefined && now < boundary) return lifecycleIntervals(cached!.history, now);
+  return cached!.open && boundary !== undefined && now > boundary
+    ? [...cached!.intervals, { start: boundary, end: now }] : cached!.intervals;
+}
+
 export function taskWallTimeForSession(
   store: RuntimeStore,
   sessionID: string | undefined,
   now = Date.now(),
 ): number | undefined {
-  if (!sessionID) return undefined;
+  if (!sessionID || !scopeEligible(store, sessionID)) return undefined;
   const rootSessionID = activityRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
   const runs = taskWallRunsForActivityRoot(store, rootSessionID);
   const liveIntervals: TaskActivityInterval[] = [];
   let hasCompletedLiveActivity = false;
   for (const run of runs) {
-    if (run.phase === "active") {
-      rebuildActiveIntervals(run, now);
-      liveIntervals.push(...run.activeIntervals);
-      hasCompletedLiveActivity = run.lifecycleEvents.size > 0 || run.carriedIntervals.length > 0;
-    } else {
-      liveIntervals.push(...run.lastRunIntervals, ...run.carriedIntervals);
-      hasCompletedLiveActivity = run.lastRunWallTime !== undefined
-        || run.lastRunLifecycleEvents.size > 0
-        || run.lastRunIntervals.length > 0
-        || run.carriedIntervals.length > 0;
-    }
+    liveIntervals.push(...taskDisplayIntervals(store, run, now));
+    hasCompletedLiveActivity ||= run.lifecycleEvents.size > 0 || run.lastRunWallTime !== undefined
+      || run.lastRunLifecycleEvents.size > 0 || run.lastRunIntervals.length > 0 || run.carriedIntervals.length > 0;
   }
   const persistedIntervals = persistedActivityIntervalsForRoot(
     store.activityReplay,
@@ -2168,11 +2324,12 @@ export function taskWallTimeForSession(
 }
 
 export function hasLiveTaskWallActivity(
-  store: Pick<RuntimeStore, "active" | "taskRuns">,
+  store: RuntimeStore,
 ): boolean {
-  if (store.active.size > 0) return true;
+  for (const state of store.active.values()) if (observationRuntime(store).liveAssistantMessages.has(state.messageID)
+    && !knownCompletedMessage(store, state.messageID) && scopeEligible(store, state.sessionID, state.messageID)) return true;
   for (const run of store.taskRuns.values()) {
-    if (run.phase === "active") return true;
+    if (run.phase === "active" && [...run.activeSessions].some((id) => scopeEligible(store, id))) return true;
   }
   return false;
 }
@@ -2281,6 +2438,7 @@ export function recordDelta(
   bytesPerToken: number,
   receivedAt = Date.now(),
   receivedMono = performance.now(),
+  clock?: ReceiveClockContext,
 ): void {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
@@ -2291,18 +2449,23 @@ export function recordDelta(
   }
   const parentID = sessionParentFromEvent("message.part.delta", properties, event);
   if (parentID) rememberSessionParent(store, sessionID, parentID);
-  const messageID = readMessageID(properties);
+  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
+  if (!scopeEligible(store, sessionID, messageID)) return;
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
   const timestamp = receivedAt;
-  const existingState = (messageID ? store.active.get(messageID) : undefined)
-    ?? store.active.get(pendingKey(sessionID));
+  const pending = store.active.get(pendingKey(sessionID));
+  const existingState = messageID ? store.active.get(messageID) ?? (pending?.ownerMessageID === messageID ? pending : undefined) : pending;
   if (existingState && existingState.sessionID !== sessionID) return;
   const progress = existingState?.progress ?? cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
+  // Losing compatibility streams must not mutate hashes, timing or sticky taints.
+  const selected = existingState?.selectedSource ?? progress.selectedStream;
+  if (selected !== undefined && selected !== stream) return;
   const parsed = parseModelDelta(progress, properties, event, stream, delta);
   if (!parsed) return;
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID)
+    ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
   const state = existingState ?? getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.progress = progress;
   bindTuiPendingTaints(store, state);
@@ -2313,7 +2476,7 @@ export function recordDelta(
   }
   runtime.runFirstTokenAt = Math.min(runtime.runFirstTokenAt ?? timestamp, timestamp);
   const bytes = utf8ByteLength(delta);
-  noteContentArrival(progress, { kind: parsed.kind, partID: parsed.partID, bytes, receivedAt, receivedMono, stream });
+  noteContentArrival(progress, { kind: parsed.kind, partID: parsed.partID, bytes, receivedAt, receivedMono, stream }, clock);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample: SpeedSample = {
     timestamp,
@@ -2322,14 +2485,6 @@ export function recordDelta(
     bytes,
     kind: parsed.kind,
   };
-  if (existingState?.selectedSource !== undefined && existingState.selectedSource !== stream) {
-    existingState[stream].hasData = true;
-    existingState[stream].samples.push(sample);
-    existingState[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
-    if (messageID) runtime.activeMessageID = messageID;
-    store.bump();
-    return;
-  }
   if (state.sessionID !== sessionID) return;
   state.selectedSource = lockStreamSource(state.selectedSource, stream);
   runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined
@@ -2339,7 +2494,9 @@ export function recordDelta(
   state[stream].hasData = true;
   state[stream].samples.push(sample);
   state[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
-  store.active.set(messageID ?? pendingKey(sessionID), state);
+  state.responseEpoch ??= runtime.runEpoch;
+  state.ownerMessageID ??= messageID;
+  store.active.set(state.messageID, state);
   store.bump();
 }
 
@@ -2351,10 +2508,12 @@ export function recordStepStarted(
   if (isReplayEvent(event, properties)) return;
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
-  const messageID = readMessageID(properties);
+  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
+  if (!scopeEligible(store, sessionID, messageID)) return;
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const timestamp = eventTimestamp(event, properties);
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID)
+    ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.startedAt = Math.min(state.startedAt, timestamp);
   state.model = state.model ?? modelName(properties);
@@ -2362,7 +2521,9 @@ export function recordStepStarted(
   noteStepIdentity(state.progress, stepIdentity(properties));
   bindTuiPendingTaints(store, state);
   if (messageID) runtime.activeMessageID = messageID;
-  store.active.set(messageID ?? pendingKey(sessionID), state);
+  state.responseEpoch ??= runtime.runEpoch;
+  state.ownerMessageID ??= messageID;
+  store.active.set(state.messageID, state);
   store.bump();
 }
 
@@ -2374,10 +2535,12 @@ export function recordStepFallback(
   if (isReplayEvent(event, properties)) return;
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
-  const messageID = readMessageID(properties);
+  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
+  if (!scopeEligible(store, sessionID, messageID)) return;
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const timestamp = eventTimestamp(event, properties);
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID)
+    ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
   state.fallbackTokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
@@ -2387,7 +2550,9 @@ export function recordStepFallback(
   state.model = state.model ?? modelName(properties);
   state.cost = readNumber(info?.cost ?? properties.cost) ?? state.cost;
   if (messageID) runtime.activeMessageID = messageID;
-  store.active.set(messageID ?? pendingKey(sessionID), state);
+  state.responseEpoch ??= runtime.runEpoch;
+  state.ownerMessageID ??= messageID;
+  store.active.set(state.messageID, state);
   store.bump();
 }
 
@@ -2420,9 +2585,9 @@ function preferredUpdateLayer(candidate: HistoryLayerCandidate, existing: Histor
 }
 
 function baseHistoryRecords(store: RuntimeStore): HistoryRecord[] {
-  if (store.diskRecords.length > 0 || store.records.length === 0) return store.diskRecords;
+  if (store.diskRecords.length > 0 || store.records.length === 0) return scopedRecords(store, store.diskRecords);
   const optimisticIDs = new Set(store.optimistic.keys());
-  return store.records.filter((record) => !optimisticIDs.has(record.messageID));
+  return scopedRecords(store, store.records.filter((record) => !optimisticIDs.has(record.messageID)));
 }
 
 function preferredHistoryLayer(
@@ -2568,6 +2733,12 @@ export function handleMessageUpdated(
     "session.id",
   ]);
   if (!messageID || !sessionID) return false;
+  rootSessionIDFor(store, api, sessionID);
+  observeAssistantScope(store, sessionID, messageID, info);
+  if (!scopeEligible(store, sessionID, messageID)) {
+    finalizeResponse(store, messageID, sessionID, store.active.get(messageID)?.responseEpoch, { authoritative: true });
+    return false;
+  }
   const observations = observationRuntime(store);
   recordTuiObservationLifecycle(store, "message.updated", properties, event, receivedAt);
   if (typeof info.role === "string") observations.metadata.roles.set(messageID, info.role);
@@ -2592,13 +2763,19 @@ export function handleMessageUpdated(
     observations.liveAssistantMessages.add(messageID);
     const runtime = ensureSessionRun(store, sessionID, timestamp);
     const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
+    state.responseEpoch = runtime.runEpoch;
+    state.ownerMessageID = messageID;
     state.startedAt = Math.min(
       state.startedAt,
       created,
     );
     if (state.observedFromStart === undefined) {
       const cached = cachedContentProgress(observations.metadata, messageID);
-      state.observedFromStart = !(existing?.legacy.hasData || existing?.v2.hasData)
+      const usage = tokenFields(info.tokens);
+      const alreadyGenerating = (usage.output ?? 0) > 0 || (usage.reasoning ?? 0) > 0
+        || infoTimeValue(info, ["firstToken", "firstContent", "firstResponse"]) !== undefined
+        || ["in_progress", "in-progress", "recovering", "recovered"].includes(readString(info.status) ?? "");
+      state.observedFromStart = !alreadyGenerating && !(existing?.legacy.hasData || existing?.v2.hasData)
         && ![...cached.parts.values()].some((part) => part.snapshotBytes > 0 || part.deltaBytes > 0);
       state.progress = mergeContentProgress(createContentProgress({ fromCurrentStart: state.observedFromStart }), state.progress ?? cached);
       observations.metadata.progress.set(messageID, state.progress!);
@@ -2615,6 +2792,8 @@ export function handleMessageUpdated(
   }
 
   if (isReplayEvent(event, properties)) return false;
+  const finalized = finalizeResponse(store, messageID, sessionID, store.active.get(messageID)?.responseEpoch,
+    { completedAt: infoTimeValue(info, ["completed", "end"]), authoritative: true });
   const previous = previousTuiRecord(store, messageID);
   const openSnapshot = store.totalsLedger.open[messageID] as OpenContribution | undefined;
   const snapshot = openSnapshot ?? store.totalsLedger.settled[messageID];
@@ -2638,14 +2817,14 @@ export function handleMessageUpdated(
     store.active.delete(messageID);
     return false;
   }
-  const pendingState = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
+  const pendingState = finalized;
   const candidateTokens = makeTokens(info, pendingState, bytesPerToken);
   const exactFields = tokenFields(info.tokens);
   if (prior && (prior.quality ?? "exact") === "exact" && prior.tokens.reasoning > 0 && exactFields.reasoning === undefined) return false;
   const quality: RecordQuality = exactFields.output !== undefined && exactFields.input !== undefined
     && (exactFields.reasoning !== undefined || candidateTokens.reasoning === 0) ? "exact" : "provisional";
   if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") return false;
-  const state = takeActiveState(store.active, messageID, sessionID);
+  const state = finalized;
   const tokens = makeTokens(info, state, bytesPerToken);
   const record = makeHistoryRecord({
     messageID,
@@ -2827,14 +3006,17 @@ export function handleSessionLifecycle(
   event: CompatibleEvent,
   bytesPerToken: number,
 ): boolean {
-  recordTuiObservationLifecycle(store, type, properties, event);
   const sessionID = readSessionID(properties, event);
+  if (!sessionID || !scopeEligible(store, sessionID) || isReplayEvent(event, properties)) return false;
+  recordTuiObservationLifecycle(store, type, properties, event);
   const status = sessionRunStatus(type, properties, event);
   if (!sessionID || status === undefined) return false;
   const timestamp = eventTimestamp(event, properties);
+  if (status !== "idle" && timestamp < observationRuntime(store).observedSince) return false;
   const eventParent = sessionParentFromEvent(type, properties, event);
   if (eventParent) rememberSessionParent(store, sessionID, eventParent);
   const rootSessionID = rootSessionIDFor(store, api, sessionID);
+  if (!scopeEligible(store, sessionID)) return false;
   const taskRun = status === "idle"
     ? findTaskWallRun(store, rootSessionID, sessionID) ?? getTaskWallRun(store, rootSessionID)
     : getTaskWallRun(store, rootSessionID);
@@ -2967,6 +3149,11 @@ export function hydrateHistoryState(
   diskRecords: readonly HistoryRecord[],
 ): void {
   for (const record of diskRecords) {
+    if (record.time.completed !== undefined && record.quality !== "provisional") finalizeResponse(store, record.messageID, record.sessionID,
+      store.active.get(record.messageID)?.responseEpoch, { completedAt: record.time.completed, authoritative: true });
+    if (!scopeEligible(store, record.sessionID, record.messageID)
+      || !isMeasurementScopeEligible(record, scopedLedger(store).sessionScopes, store.sessionParents)
+      || getExcludedMessageIDs(scopedLedger(store)).has(record.messageID)) continue;
     const overlay = store.optimistic.get(record.messageID);
     let selected = record;
     if (overlay) {
@@ -3039,7 +3226,17 @@ export async function reloadHistory(
     warnWithToast(api, "history read failed", error);
     return;
   }
-  if (store.disposed || generation !== store.historyGeneration) return;
+  if (store.disposed) return;
+  // Completion ownership is independent of the usage snapshot's generation.
+  // Once disk supplied an authoritative same-ID completion, late content must
+  // not revive it while the latest history/totals read is still draining.
+  for (const record of diskRecords) {
+    if (record.time.completed !== undefined && record.quality !== "provisional") {
+      finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch,
+        { completedAt: record.time.completed, authoritative: true });
+    }
+  }
+  if (generation !== store.historyGeneration) return;
 
   let totalsLedger: TotalsLedger | undefined;
   try {
@@ -3052,6 +3249,7 @@ export async function reloadHistory(
 
   if (totalsLedger) store.totalsLedger = totalsLedger;
   store.diskRecords = diskRecords.map((record) => withCanonicalLedgerSpeed(store.totalsLedger, record));
+  store.sourceScopes = createScopeRegistry(scopedLedger(store).sessionScopes);
   for (const [id, record] of store.optimistic) {
     store.optimistic.set(id, withCanonicalLedgerSpeed(store.totalsLedger, record));
   }
@@ -3061,17 +3259,17 @@ export async function reloadHistory(
   }
   repairKnownParents(store);
   hydrateHistoryState(store, store.diskRecords);
-  store.records = mergeHistoryLayers(
+  store.records = scopedRecords(store, mergeHistoryLayers(
     store.diskRecords,
     store.optimistic,
     maxRecords,
     store.optimisticQuality,
     store.optimisticOrder,
-  );
-  store.bump();
+  ));
+  refreshScopeProjection(store);
 }
 
-async function reloadActivity(
+export async function reloadActivity(
   store: RuntimeStore,
   api: TuiPluginApi,
   path: string,
@@ -3080,7 +3278,7 @@ async function reloadActivity(
   if (store.disposed) return;
   try {
     const activityEvents = await readActivityFile(path);
-    const activityReplay = replayActivity(activityEvents);
+    const activityReplay = replayActivity(activityEvents, { sessionScopes: scopedLedger(store).sessionScopes, parentBySessionID: store.sessionParents });
     if (
       store.disposed
       || generation !== store.activityGeneration
@@ -3091,13 +3289,35 @@ async function reloadActivity(
     let parentChanged = false;
     for (const [sessionID, parentSessionID] of activityReplay.parentBySessionID) {
       if (!parentSessionID || store.sessionParents.get(sessionID) === parentSessionID) continue;
-      store.sessionParents.set(sessionID, parentSessionID);
+      store.sessionParents = new Map(store.sessionParents).set(sessionID, parentSessionID);
+      store.sourceScopes.observeSessionMetadata(sessionID, { parentID: parentSessionID });
       parentChanged = true;
     }
     if (parentChanged) {
       repairKnownParents(store);
       for (const sessionID of activityReplay.parentBySessionID.keys()) {
         migrateTaskWallRuns(store, activityRootSessionID(store, sessionID));
+      }
+    }
+    // A closed canonical SDK epoch retracts its matching local open overlay.
+    // Old completions cannot close a newer response, tool run or child epoch.
+    for (const participant of activityReplay.participants) {
+      if (!scopeEligible(store, participant.sessionID)) continue;
+      const rootID = activityRootSessionID(store, participant.sessionID);
+      const run = findTaskWallRun(store, rootID, participant.sessionID);
+      if (!run || run.phase !== "active" || run.runStartedAt === undefined) continue;
+      const lastActive = run.lastActivityAt.get(participant.sessionID) ?? run.runStartedAt;
+      for (const instance of participant.instances) {
+        const terminal = instance.events.at(-1);
+        if (!terminal || instance.open || terminal.state === "busy" || terminal.state === "retry"
+          || terminal.timestamp < lastActive || terminal.observedAt < observationRuntime(store).observedSince) continue;
+        if (!instance.events.some((fact) => (fact.state === "busy" || fact.state === "retry")
+          && fact.timestamp >= observationRuntime(store).observedSince && fact.timestamp <= lastActive)) continue;
+        const current = latestActive(store, participant.sessionID);
+        if (current && current.startedAt > terminal.timestamp) continue;
+        if (knownToolWaiting(api, store, participant.sessionID)) continue;
+        handleSessionLifecycle(store, api, "session.idle", { sessionID: participant.sessionID },
+          { type: "session.idle", timestamp: terminal.timestamp }, DEFAULT_BYTES_PER_TOKEN);
       }
     }
     store.bump();
@@ -3172,6 +3392,7 @@ function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefine
 export function createRuntimeStore(maxRecords: number, observedSince = Date.now()): RuntimeStore {
   return createRoot((disposeSignals): RuntimeStore => {
     const [revision, setRevision] = createSignal(0);
+    const [clockRevision, setClockRevision] = createSignal(0);
     const store: RuntimeStore = {
       maxRecords,
       diskRecords: [],
@@ -3185,6 +3406,8 @@ export function createRuntimeStore(maxRecords: number, observedSince = Date.now(
       sessionRuntime: new Map<string, SessionRuntime>(),
       taskRuns: new Map<string, TaskWallRun>(),
       sessionParents: new Map<string, string>(),
+      sourceScopes: createScopeRegistry(),
+      messageScopes: new Map(),
       totalsLedger: emptyTotalsLedger(),
       lastCompletedBySession: new Map<string, LastCompletedSnapshot>(),
       activityEvents: [],
@@ -3193,6 +3416,8 @@ export function createRuntimeStore(maxRecords: number, observedSince = Date.now(
       pulseExpanded: false,
       historyGeneration: 0,
       revision,
+      clockRevision,
+      tick: () => setClockRevision((value) => value + 1),
       bump: () => setRevision((value) => value + 1),
       disposed: false,
       disposeSignals,
@@ -3304,6 +3529,10 @@ export function formatPulseMetrics(tokens: TokenCounts, speed: number | undefine
     `${formatCompactNumber(totalTokens(tokens))} total`, speedLabel,
     `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`,
   ];
+  return wrapMetricFields(fields, width);
+}
+
+function wrapMetricFields(fields: readonly string[], width: number): string {
   const lines: string[] = [];
   for (const field of fields) {
     const previous = lines[lines.length - 1];
@@ -3352,6 +3581,7 @@ export function recordSpeedSummary(record: HistoryRecord): RecordSpeedSummary {
     generated,
     estimated: selected.estimated,
     basis: selected.basis,
+    observationQuality: selected.measurement?.observationQuality,
   };
 }
 
@@ -3428,7 +3658,7 @@ export function formatHistoryRow(record: HistoryRecord): string {
     padRight(truncateMiddle(record.model, 14), 14),
     padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9),
     padLeft(speed.available ? `${speed.estimated ? "~" : ""}${formatCompactNumber(speed.avg)}` : "--", 7),
-    padRight(speed.basis ?? "--", 10),
+    padRight(speed.observationQuality === "short" ? "generation short" : speed.basis ?? "--", 10),
     padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.max)}` : "--", 7),
     padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.min)}` : "--", 7),
     padLeft(formatOptionalDuration(ttft), 7),
@@ -3648,6 +3878,8 @@ interface TotalsProjectionLedger {
   sessions: Record<string, SessionDirectTotals>;
   open: Record<string, OpenContribution>;
   settled?: Record<string, OpenContribution | true>;
+  sessionScopes?: Record<string, CompactScopeEvidence>;
+  messageScopes?: Record<string, CompactScopeEvidence>;
 }
 
 export function projectSessionTotals(
@@ -3657,7 +3889,7 @@ export function projectSessionTotals(
   sessionID: string,
 ): TotalsRollup {
   const projected = projectTotals(ledger, records, parentBySessionID);
-  return rollupSessionTotals(projected.sessions, projected.parents, sessionID);
+  return rollupSessionTotals(projected.sessions, projected.parents, sessionID, ledger.sessionScopes);
 }
 
 function totalsForSession(store: RuntimeStore, sessionID: string | undefined): TotalsRollup | undefined {
@@ -3665,7 +3897,7 @@ function totalsForSession(store: RuntimeStore, sessionID: string | undefined): T
   // Detail-window trimming must not discard unconfirmed direct contributions.
   const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER,
     store.optimisticQuality, store.optimisticOrder);
-  return projectSessionTotals(store.totalsLedger, contributions, store.sessionParents, sessionID);
+  return projectSessionTotals(scopedLedger(store), scopedRecords(store, contributions), store.sessionParents, sessionID);
 }
 
 export function sessionUsageSummary(store: RuntimeStore, sessionID: string): SessionAverageSummary {
@@ -3684,17 +3916,18 @@ export function sessionAverageDisplay(summary: SessionAverageSummary, isChild = 
   return {
     label: isChild ? "Session avg TPS" : "Main avg TPS",
     value: measured.available && measured.rate !== undefined ? `~${formatCompactRate(measured.rate)}` : "--",
-    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls`,
+    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls${measured.shortResponseCount ? ` · ${formatCompactNumber(measured.shortResponseCount)} short (low confidence)` : ""}`,
     ...(!measured.available && measured.coveredResponseCount === 0 && summary.totalResponseCount > 0
       ? { diagnostic: "No qualified generation timing." } : {}),
   };
 }
 
 function averageCoverage(summary: AverageRateSummary, total: SessionAverageSummary): string {
-  return `Observed usage ${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured`;
+  return `Observed usage ${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured${summary.shortResponseCount ? ` · ${formatCompactNumber(summary.shortResponseCount)} short (low confidence)` : ""}`;
 }
 
 export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStore; sessionID: string }): JSX.Element {
+  if (!scopeEligible(props.store, props.sessionID)) return <text fg={props.api.theme.current.textMuted}>Maintenance session excluded</text>;
   const [dimensions, setDimensions] = createSignal({ width: props.api.renderer.width, height: props.api.renderer.height });
   const onResize = (width: number, height: number) => setDimensions({ width, height });
   if (typeof props.api.renderer.on === "function") {
@@ -3768,17 +4001,18 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
         <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.generation, details().average)}</text>
         <text fg={theme.text} wrapMode="word">{`Response throughput  ${formatAverageRate(details().average.response)}`}</text>
         <text fg={theme.textMuted} wrapMode="word">{averageCoverage(details().average.response, details().average)}</text>
-        <text fg={theme.textMuted} wrapMode="word">Response time includes TTFT and may include tool waits. Generation TPS requires complete content and at least 1s between observed arrivals.</text>
+        <text fg={theme.textMuted} wrapMode="word">Response time includes TTFT and may include tool waits. Completed TPS needs complete content and at least 100ms of verified arrival timing. Under 1s is short, low confidence. LIVE and peaks still need 1s.</text>
         <text fg={theme.accent} paddingTop={1}>SESSION USAGE</text>
         <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map((metric) => [metric])} />
         <text fg={theme.accent} paddingTop={1}>LAST RESPONSE</text>
         <text fg={theme.text} wrapMode="word">{details().last
-          ? `${details().lastSpeed!.available ? `~${formatCompactRate(details().lastSpeed!.avg)} (generation)` : "Generation TPS --"} · TTFT ${formatOptionalDuration(details().last!.ttft)} · response time ${formatOptionalDuration(durationOf(details().last!.record))}`
+          ? `${details().lastSpeed!.available ? `~${formatCompactRate(details().lastSpeed!.avg)} (generation)${details().lastSpeed!.observationQuality === "short" ? " · short, low confidence" : ""}` : "Generation TPS --"} · TTFT ${formatOptionalDuration(details().last!.ttft)} · response time ${formatOptionalDuration(durationOf(details().last!.record))}`
           : "No completed response in the loaded history"}</text>
         {details().last && <>
           <text fg={theme.textMuted} wrapMode="word">{formatResponseThroughput(details().last!.record)}</text>
           <text fg={theme.textMuted} wrapMode="word">{formatResponseTimingDetails(details().last!.record)}</text>
           <text fg={theme.textMuted} wrapMode="word">{formatArrivalPeaks(details().last!.record)}</text>
+          {!details().lastSpeed?.available && <text fg={theme.textMuted} wrapMode="word">{responseMeasurementStatus(details().last!.record)}</text>}
         </>}
         {details().last?.record.model && <text fg={theme.textMuted} wrapMode="word">{`Last model: ${details().last!.record.model}`}</text>}
         {tree().nodes.length > 1 ? <>
@@ -3818,7 +4052,7 @@ export interface SessionDetailsTree {
 export function buildSessionDetailsTree(store: RuntimeStore, rootID: string, parents: ReadonlyMap<string, string> = store.sessionParents): SessionDetailsTree {
   const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER,
     store.optimisticQuality, store.optimisticOrder);
-  const projected = projectTotals(store.totalsLedger, contributions, parents);
+  const projected = projectTotals(scopedLedger(store), scopedRecords(store, contributions), parents);
   const children = new Map<string, string[]>();
   for (const [id, parent] of projected.parents) {
     const siblings = children.get(parent) ?? [];
@@ -3830,6 +4064,7 @@ export function buildSessionDetailsTree(store: RuntimeStore, rootID: string, par
   const pending = [{ sessionID: rootID, depth: 0 }];
   while (pending.length) {
     const node = pending.pop()!;
+    if (isSessionScopeExcluded(node.sessionID, scopedLedger(store).sessionScopes, parents)) continue;
     if (visited.has(node.sessionID)) continue;
     visited.add(node.sessionID);
     const direct = Object.prototype.hasOwnProperty.call(projected.sessions, node.sessionID)
@@ -3838,7 +4073,7 @@ export function buildSessionDetailsTree(store: RuntimeStore, rootID: string, par
     const descendants = (children.get(node.sessionID) ?? []).slice().sort().reverse();
     for (const sessionID of descendants) pending.push({ sessionID, depth: node.depth + 1 });
   }
-  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID).including;
+  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID, scopedLedger(store).sessionScopes).including;
   return { rootID, nodes, including, average: getSessionAverageSummary(including) };
 }
 
@@ -3861,6 +4096,7 @@ export function createDetailsController(api: TuiPluginApi, store: RuntimeStore) 
         api.ui.toast({ variant: "info", message: "Open a session to view Token Pulse details", duration: 3000 });
         return undefined;
       }
+      if (!scopeEligible(store, sessionID)) return undefined;
       api.ui.dialog.replace(() => <TokenPulseDetails api={api} store={store} sessionID={sessionID} />, () => {
         owned = false;
         openedSessionID = undefined;
@@ -3902,11 +4138,14 @@ function projectTotals(
   records: readonly HistoryRecord[],
   parentBySessionID: ReadonlyMap<string, string>,
 ): ProjectedTotals {
-  const unique = mergeHistoryLayers(records, new Map(), Number.MAX_SAFE_INTEGER);
+  const scope = collectSessionScopeEvidence(records, ledger.sessionScopes);
+  const canonical: TotalsLedger = { ...ledger, version: TOTALS_VERSION, generationBasisVersion: ledger.generationBasisVersion === 3 ? 3 : undefined, settled: ledger.settled ?? {} };
+  const parents = new Map(parentBySessionID); // Shared caches require immutable parent snapshots.
+  const unique = filterHistoryRecords(mergeHistoryLayers(records, new Map(), Number.MAX_SAFE_INTEGER), scope, parents, getExcludedMessageIDs(canonical));
   const basis = projectTotalsGenerationBasis({ ...ledger, version: TOTALS_VERSION,
-    generationBasisVersion: ledger.generationBasisVersion === 3 ? 3 : undefined, settled: ledger.settled ?? {} });
+    generationBasisVersion: ledger.generationBasisVersion === 3 ? 3 : undefined, settled: ledger.settled ?? {}, sessionScopes: scope });
   return {
-    sessions: applyWindowAdjustments(basis, unique),
+    sessions: projectTotalsMeasurementScope({ ...basis, sessions: applyWindowAdjustments(basis, unique) }, parents).sessions,
     parents: projectionParents(parentBySessionID, unique),
   };
 }
@@ -3928,6 +4167,7 @@ function applyWindowAdjustments(
     const next = contributionNumbers(withCanonicalLedgerSpeed(ledger, record));
     if (!next) continue;
     const previous = settledValue ?? open[record.messageID];
+    if (previous?.excluded) continue;
     if (previous) {
       if (previous.quality === "exact" && record.quality === "provisional") continue;
       const priorUpdate = coerceCompletionUpdate(previous.update);
@@ -4175,13 +4415,25 @@ function coerceTotalsSnapshot(value: unknown): TotalsLedger {
     if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
     open[messageID] = coerceOpenContribution(contribution);
   }
-  return projectTotalsGenerationBasis({
+  const sessionScopes: Record<string, CompactScopeEvidence> = {};
+  if (isRecord(value.sessionScopes)) for (const [id, raw] of Object.entries(value.sessionScopes)) {
+    const proof = coerceScopeEvidence(raw);
+    if (proof) sessionScopes[id] = proof;
+  }
+  const messageScopes: Record<string, CompactScopeEvidence> = {};
+  if (isRecord(value.messageScopes)) for (const [id, raw] of Object.entries(value.messageScopes)) {
+    const proof = coerceScopeEvidence(raw);
+    if (proof && value.settled && asRecord(value.settled)?.[id] === true) messageScopes[id] = proof;
+  }
+  return {
     version: TOTALS_VERSION,
     ...(value.generationBasisVersion === 3 ? { generationBasisVersion: 3 } : {}),
     sessions,
     open,
     settled: coerceSettled(value.settled),
-  });
+    sessionScopes,
+    messageScopes,
+  };
 }
 
 function coerceSettled(value: unknown): Record<string, OpenContribution | true> {
@@ -4229,6 +4481,7 @@ function coerceOpenContribution(value: unknown): OpenContribution {
     cost: requireNonNegative(value.cost),
     ...(value.speed !== undefined ? { speed: coerceSpeedContribution(value.speed) } : {}),
     ...(value.update !== undefined ? { update: coerceCompletionUpdate(value.update) } : {}),
+    ...(coerceScopeEvidence(value.excluded) ? { excluded: coerceScopeEvidence(value.excluded) } : {}),
     ...(isRecord(value.speedBackfill) && value.speedBackfill.version === 1 && value.speedBackfill.source === "server"
       ? { speedBackfill: { version: 1 as const, source: "server" as const } } : {}),
   };
@@ -4262,14 +4515,17 @@ export function childRows(
   store?: RuntimeStore,
 ): ChildRow[] {
   if (!sessionID || !store) return [];
-  const projected = projectTotals(store.totalsLedger, records, store.sessionParents);
-  const root = rollupSessionTotals(projected.sessions, projected.parents, sessionID);
+  records = scopedRecords(store, records);
+  const ledger = scopedLedger(store);
+  const projected = projectTotals(ledger, records, store.sessionParents);
+  const root = rollupSessionTotals(projected.sessions, projected.parents, sessionID, ledger.sessionScopes);
   const rows: ChildRow[] = [];
   const visited = new Set<string>([sessionID]);
   const append = (childID: string, depth: number): void => {
     if (visited.has(childID)) return;
+    if (isSessionScopeExcluded(childID, ledger.sessionScopes, projected.parents)) return;
     visited.add(childID);
-    const rollup = rollupSessionTotals(projected.sessions, projected.parents, childID);
+    const rollup = rollupSessionTotals(projected.sessions, projected.parents, childID, ledger.sessionScopes);
     const directRecords = records.filter((record) => record.sessionID === childID);
     const show = directRecords.length > 0 || totalsHaveUsage(rollup.including);
     if (show) {
@@ -4321,18 +4577,25 @@ function activeStats(
 }
 
 function latestActive(
-  active: ReadonlyMap<string, ActiveState>,
+  store: RuntimeStore,
   sessionID: string,
   preferredMessageID?: string,
 ): ActiveState | undefined {
-  const preferred = preferredMessageID ? active.get(preferredMessageID) : undefined;
-  if (preferred?.sessionID === sessionID) return preferred;
-  return [...active.values()]
-    .filter((state) => state.sessionID === sessionID && !state.messageID.startsWith("__pending__:"))
-    .sort((left, right) => right.startedAt - left.startedAt)[0]
-    ?? [...active.values()]
-      .filter((state) => state.sessionID === sessionID)
-      .sort((left, right) => right.startedAt - left.startedAt)[0];
+  const id = preferredMessageID ?? ownedMessageID(store, sessionID);
+  const state = id ? store.active.get(id) : undefined;
+  return state?.sessionID === sessionID && observationRuntime(store).liveAssistantMessages.has(state.messageID)
+    && !knownCompletedMessage(store, state.messageID) && scopeEligible(store, sessionID, state.messageID) ? state : undefined;
+}
+
+export function responseMeasurementStatus(record: HistoryRecord): string {
+  if (selectSpeedMeasurement(record).available) return "";
+  if (record.samples.length === 1) return "Single batch; TPS unavailable.";
+  const reasons = record.speed?.generationCoverage?.reasons ?? [];
+  if (reasons.includes("insufficient-receive-span")) return "Insufficient arrival timing.";
+  if (reasons.includes("unknown-receive-clock")) return "Receive clock not verified.";
+  if (reasons.includes("hidden-reasoning") || reasons.includes("unobserved-output")) return "Incomplete content observation.";
+  if (reasons.includes("tool-usage-uncertain")) return "Tool usage timing not verified.";
+  return "No qualified generation timing.";
 }
 
 export function liveLabel(
@@ -4343,31 +4606,29 @@ export function liveLabel(
   now = Date.now(),
   toolWaiting = false,
 ): string {
+  if (!scopeEligible(store, sessionID)) return "";
   const runtime = store.sessionRuntime.get(sessionID);
-  const state = latestActive(store.active, sessionID, runtime?.activeMessageID);
+  const state = latestActive(store, sessionID, runtime?.activeMessageID);
   const stats = activeStats(state, now, bytesPerToken);
   const runGenerated = runtime ? generatedTokens(runtime.runTotals) : 0;
   if (state) {
-    const rate = toolWaiting || stats.status === "inactive" ? "WAIT --"
-      : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
-    if (width < 34) return rate;
-    if (width < 58) {
-      return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)}`;
-    }
-    return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)} elapsed ${formatDuration(stats.elapsed)} total ${formatCompactNumber(runGenerated)}`;
+    const hasContent = selectedSamples(state).length > 0;
+    const rate = toolWaiting ? "WAIT TOOL --" : !hasContent ? "WAITING --"
+      : stats.status === "inactive" ? "WAIT --" : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
+    return wrapMetricFields([rate, `gen ${hasContent ? `~${formatCompactNumber(stats.generated)}` : "--"}`,
+      `ttft ${formatOptionalDuration(stats.ttft)}`, `elapsed ${formatDuration(stats.elapsed)}`, `total ${formatCompactNumber(runGenerated)}`], width);
   }
   const last = store.lastCompletedBySession.get(sessionID);
-  if (last) {
+  if (last && scopeEligible(store, sessionID, last.record.messageID)) {
     const prefix = last.estimated ? "LAST ~" : "LAST ";
     const rate = last.available === false ? "LAST --" : `${prefix}${formatCompactRate(last.rate)} ${last.basis ?? ""}`.trimEnd();
-    const totalGenerated = runtime && runtime.runEpoch > 0 ? runGenerated : last.generated;
-    if (width < 34) return rate;
-    if (width < 58) {
-      return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)}`;
-    }
-    return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)} measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)} total ${formatCompactNumber(totalGenerated)}`;
+    const totalGenerated = runtime && runtime.runResponseCount > 0 ? runGenerated : last.generated;
+    return wrapMetricFields([rate, ...(last.observationQuality === "short" ? ["short, low confidence"] : []),
+      `gen ${formatCompactNumber(last.generated)}`, `ttft ${formatOptionalDuration(last.ttft)}`,
+      `measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)}`, `total ${formatCompactNumber(totalGenerated)}`,
+      ...(last.available === false ? [responseMeasurementStatus(last.record)] : [])], width);
   }
-  return "IDLE";
+  return runtime?.status === "busy" || runtime?.status === "retry" ? "TASK BUSY" : "IDLE";
 }
 
 function currentSessionID(api: TuiPluginApi): string | undefined {
@@ -4499,22 +4760,26 @@ function PromptRight(props: {
   options: TuiOptions;
 }): JSX.Element {
   rememberVisibleSession(props.store, props.sessionID);
+  const [width, setWidth] = createSignal(0);
   const label = createMemo(() => {
     props.store.revision();
+    props.store.clockRevision();
     return liveLabel(
       props.store,
       props.sessionID,
       props.options.bytesPerToken,
-      Math.max(1, props.api.renderer.width),
+      width(),
       Date.now(),
       knownToolWaiting(props.api, props.store, props.sessionID),
     );
   });
-  return <text fg={props.api.theme.current.accent} truncate wrapMode="none">{label()}</text>;
+  return <box flexDirection="column" width="100%" flexShrink={0} onSizeChange={function () { setWidth(Math.max(1, this.width)); }}>
+    <text fg={props.api.theme.current.accent} wrapMode="word" flexShrink={0}>{label()}</text>
+  </box>;
 }
 
 function knownToolWaiting(api: TuiPluginApi, store: RuntimeStore, sessionID: string): boolean {
-  const state = latestActive(store.active, sessionID, store.sessionRuntime.get(sessionID)?.activeMessageID);
+  const state = latestActive(store, sessionID, store.sessionRuntime.get(sessionID)?.activeMessageID);
   if (!state) return false;
   const latest = selectedSamples(state).at(-1)?.timestamp ?? state.startedAt;
   try {
@@ -4553,6 +4818,7 @@ function BottomContent(props: {
     props.store.revision();
     return displayedSessionID(props.store, props.sessionID);
   });
+  const visible = createMemo(() => { props.store.revision(); return scopeEligible(props.store, sessionID()); });
   const view = createMemo((): AggregateView => {
     props.store.revision();
     return {
@@ -4563,6 +4829,7 @@ function BottomContent(props: {
   });
   const taskWallTime = createMemo(() => {
     props.store.revision();
+    props.store.clockRevision();
     return taskWallTimeForSession(props.store, sessionID());
   });
   const rows = createMemo(() => childRows(view().records, sessionID(), props.store));
@@ -4621,6 +4888,7 @@ function BottomContent(props: {
       overflow="hidden"
       flexShrink={0}
     >
+      {visible() && <>
       <box
         focusable
         width="100%"
@@ -4673,6 +4941,7 @@ function BottomContent(props: {
           {rows().length > 0 && <ChildAgentRows theme={props.api.theme} rows={rows()} />}
         </>
       ))}
+      </>}
     </box>
   );
 }
@@ -4735,6 +5004,117 @@ function legacyBinding(options: TuiOptions, name: string, fallback: string): str
   return typeof value === "string" && value !== "none" ? value : undefined;
 }
 
+/** Watch only ledger names. Directory watches survive atomic file replacement;
+ * a missing directory is reached through its nearest existing ancestor, without
+ * recursive watches, scans, polling, or any inference of task completion. */
+function watchLedgerPaths(paths: readonly { path: string; changed: () => void }[]): () => void {
+  let disposed = false;
+  const disposers: (() => void)[] = [];
+  const groups = new Map<string, Map<string, () => void>>();
+  for (const item of paths) {
+    const path = resolve(item.path);
+    const directory = dirname(path);
+    const files = groups.get(directory) ?? new Map<string, () => void>();
+    files.set(basename(path), item.changed);
+    groups.set(directory, files);
+  }
+  for (const [target, files] of groups) {
+    let watcher: FSWatcher | undefined;
+    let current: { directory: string; dev: number; ino: number } | undefined;
+    let disabled = false;
+    let probeTimer: ReturnType<typeof setTimeout> | undefined;
+    const fingerprint = (name: string): string | undefined => {
+      try {
+        const stat = statSync(join(target, name));
+        return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+      } catch (error) { if (isNodeError(error) && error.code === "ENOENT") return undefined; throw error; }
+    };
+    const fingerprints = new Map<string, string | undefined>();
+    const probeRenames = () => {
+      if (probeTimer !== undefined) clearTimeout(probeTimer);
+      // Bun can coalesce an atomic rename to the staging filename only. One
+      // event-driven metadata flush checks ONLY our two known ledger paths;
+      // unchanged history/temp/unrelated files never cause a ledger replay.
+      probeTimer = setTimeout(() => {
+        probeTimer = undefined;
+        if (disposed || disabled) return;
+        try {
+          for (const [name, changed] of files) {
+            const next = fingerprint(name);
+            if (next === fingerprints.get(name)) continue;
+            fingerprints.set(name, next);
+            changed();
+          }
+        } catch (error) { disable(error); }
+      }, 30);
+    };
+    const locate = () => {
+      let directory = target;
+      while (true) {
+        try {
+          const stat = statSync(directory);
+          if (!stat.isDirectory()) throw new Error("Ledger parent is not a directory");
+          return { directory, dev: stat.dev, ino: stat.ino };
+        } catch (error) {
+          if (!isNodeError(error) || error.code !== "ENOENT" || dirname(directory) === directory) throw error;
+          directory = dirname(directory);
+        }
+      }
+    };
+    const same = (next: ReturnType<typeof locate>) => current?.directory === next.directory && current.dev === next.dev && current.ino === next.ino;
+    const disable = (error: unknown) => {
+      if (disposed || disabled) return;
+      disabled = true;
+      if (probeTimer !== undefined) clearTimeout(probeTimer);
+      watcher?.close();
+      watcher = undefined;
+      // Finite fallback: existing host-event reloads remain available. Do not
+      // restart an unsupported watcher in a timer/CPU loop or invent idle facts.
+      console.warn(`[oc-tps] ledger watcher unavailable for ${target}; updates rely on host events`, error);
+    };
+    const arm = (refresh: boolean): void => {
+      if (disposed || disabled) return;
+      try {
+        // Re-check after attaching: creation between stat and watch must not
+        // leave us stranded at an ancestor after its last mkdir/rename event.
+        for (let remaining = target.split(sep).length + 1; remaining > 0; remaining--) {
+          const next = locate();
+          if (same(next)) break;
+          const previous = watcher;
+          watcher = watch(next.directory, { persistent: false, encoding: "buffer" }, (kind, filename) => {
+            if (disposed || disabled) return;
+            try {
+              if (kind === "rename" && !same(locate())) { arm(true); return; }
+              const name = filename === null ? undefined : Buffer.isBuffer(filename) ? filename.toString() : String(filename);
+              if (current?.directory !== target) {
+                const child = relative(current!.directory, target).split(sep)[0];
+                if (name === undefined || name === child) arm(true);
+                return;
+              }
+              if (name === undefined) probeRenames();
+              else if (files.has(name)) { fingerprints.set(name, fingerprint(name)); files.get(name)!(); }
+              if (kind === "rename") probeRenames();
+            } catch (error) { disable(error); }
+          });
+          watcher.on("error", disable);
+          current = next;
+          previous?.close();
+          if (current.directory === target) for (const name of files.keys()) fingerprints.set(name, fingerprint(name));
+          if (refresh && current.directory === target) for (const changed of files.values()) changed();
+          refresh = true;
+        }
+      } catch (error) { disable(error); }
+    };
+    arm(false);
+    disposers.push(() => { if (probeTimer !== undefined) clearTimeout(probeTimer); watcher?.close(); watcher = undefined; });
+  }
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    for (const dispose of disposers) dispose();
+  };
+}
+
 const tui: TuiPlugin = async (api, rawOptions) => {
   const options = resolveOptions(rawOptions);
   if (!options.enabled) return;
@@ -4751,49 +5131,78 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   let activityReloadTimer: ReturnType<typeof setTimeout> | undefined;
   let reloadGeneration = 0;
   let activityReloadGeneration = 0;
+  let historyAppliedGeneration = 0;
+  let activityAppliedGeneration = -1;
+  let historyDrain: Promise<void> | undefined;
+  let activityDrain: Promise<void> | undefined;
+
+  const drainHistory = (): Promise<void> => {
+    if (historyDrain) return historyDrain;
+    historyDrain = (async () => {
+      while (!disposed) {
+        const generation = reloadGeneration;
+        if (reloadTimer !== undefined) clearTimeout(reloadTimer);
+        reloadTimer = undefined;
+        await reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, generation);
+        if (generation !== reloadGeneration) continue;
+        historyAppliedGeneration = generation;
+        return;
+      }
+    })().finally(() => { historyDrain = undefined; });
+    return historyDrain;
+  };
+  const drainActivity = (): Promise<void> => {
+    if (activityDrain) return activityDrain;
+    activityDrain = (async () => {
+      while (!disposed) {
+        const generation = activityReloadGeneration;
+        if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
+        activityReloadTimer = undefined;
+        await reloadActivity(store, api, runsPath, generation);
+        if (generation !== activityReloadGeneration) continue;
+        activityAppliedGeneration = generation;
+        return;
+      }
+    })().finally(() => { activityDrain = undefined; });
+    return activityDrain;
+  };
 
   const scheduleReload = (): void => {
+    if (disposed) return;
     reloadGeneration += 1;
     const generation = reloadGeneration;
     store.historyGeneration = generation;
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
-    const run = async (attempt: number): Promise<void> => {
-      if (disposed || generation !== reloadGeneration) return;
+    const run = async (attempt: number, expectedGeneration: number): Promise<void> => {
+      if (disposed || expectedGeneration !== reloadGeneration) return;
       reloadTimer = undefined;
-      await reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, generation);
+      await drainHistory();
       if (
         !disposed
-        && generation === reloadGeneration
         && attempt < 3
         && store.optimistic.size > 0
+        && reloadTimer === undefined
       ) {
+        const latestGeneration = reloadGeneration;
         reloadTimer = setTimeout(() => {
-          void run(attempt + 1);
+          void run(attempt + 1, latestGeneration);
         }, 100);
       }
     };
     reloadTimer = setTimeout(() => {
-      void run(0);
+      void run(0, generation);
     }, 30);
   };
 
   const scheduleActivityReload = (): void => {
+    if (disposed) return;
     activityReloadGeneration += 1;
     const generation = activityReloadGeneration;
     store.activityGeneration = generation;
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
-    const run = async (attempt: number): Promise<void> => {
-      if (disposed || generation !== activityReloadGeneration) return;
-      activityReloadTimer = undefined;
-      await reloadActivity(store, api, runsPath, generation);
-      if (!disposed && generation === activityReloadGeneration && attempt < 3) {
-        activityReloadTimer = setTimeout(() => {
-          void run(attempt + 1);
-        }, 100);
-      }
-    };
     activityReloadTimer = setTimeout(() => {
-      void run(0);
+      activityReloadTimer = undefined;
+      if (!disposed && generation === activityReloadGeneration) void drainActivity();
     }, 30);
   };
 
@@ -4864,7 +5273,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     }
   };
 
-  const handleEvent = (input: unknown): void => {
+  const handleEvent = (input: unknown, _metadata?: { directory?: string; workspace?: unknown }): void => {
     if (disposed) return;
     const receivedAt = Date.now();
     const receivedMono = performance.now();
@@ -4892,7 +5301,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         return;
       }
       if (type === "message.part.delta") {
-        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken, receivedAt, receivedMono);
+        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken, receivedAt, receivedMono, RECEIVE_CLOCK);
         return;
       }
       if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
@@ -4905,6 +5314,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           options.bytesPerToken,
           receivedAt,
           receivedMono,
+          RECEIVE_CLOCK,
         );
         return;
       }
@@ -4962,13 +5372,19 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   subscribe("workspace.disposed", handleEvent);
   subscribe("workspace.deleted", handleEvent);
 
+  const stopLedgerWatchers = watchLedgerPaths([
+    { path: runsPath, changed: scheduleActivityReload },
+    { path: totalsPath, changed: scheduleReload },
+  ]);
+
   const interval = setInterval(() => {
-    if (!disposed && hasLiveTaskWallActivity(store)) store.bump();
+    if (!disposed && hasLiveTaskWallActivity(store)) store.tick();
   }, 500);
 
   api.lifecycle.onDispose(() => {
     disposed = true;
     store.disposed = true;
+    stopLedgerWatchers();
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
     clearInterval(interval);
@@ -4989,11 +5405,15 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     store.disposeSignals();
   });
 
-  store.historyGeneration += 1;
-  await Promise.all([
-    reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, store.historyGeneration),
-    reloadActivity(store, api, runsPath, store.activityGeneration),
-  ]);
+  store.historyGeneration = ++reloadGeneration;
+  // Watcher/host requests received during an in-flight initial read are part of
+  // initialization, not fire-and-forget work after a stale promise has returned.
+  do {
+    await Promise.all([
+      historyAppliedGeneration < reloadGeneration ? drainHistory() : Promise.resolve(),
+      activityAppliedGeneration < activityReloadGeneration ? drainActivity() : Promise.resolve(),
+    ]);
+  } while (!disposed && (historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration));
 };
 
 const plugin = {

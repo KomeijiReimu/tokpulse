@@ -1,20 +1,26 @@
 import { addTokenCounts, emptyTokenCounts } from "./core.js";
 import { addSpeedTotals, coerceSpeedTotals } from './statistics.js';
+import { isSessionScopeExcluded } from "./scope.js";
 /**
  * Fold caller-supplied direct totals by parent links.
  * `direct` is the session alone. `including` adds every descendant once.
  * Null, empty, and self parents are ignored. Cycles are visited once.
  * This module does not read history or live activity.
  */
-export function rollupSessionTotals(sessions, parentBySessionID, sessionID) {
+export function rollupSessionTotals(sessions, parentBySessionID, sessionID, sessionScopes = {}) {
   const childrenByParent = indexChildren(parentBySessionID);
+  const eligibility = new Map();
+  const eligible = id => {
+    if (!eligibility.has(id)) eligibility.set(id, !isSessionScopeExcluded(id, sessionScopes, parentBySessionID));
+    return eligibility.get(id);
+  };
   return {
-    direct: copyTotals(lookup(sessions, sessionID)),
-    including: sumReachable(sessions, childrenByParent, sessionID),
-    children: directChildIDs(childrenByParent, sessionID).map(childID => ({
+    direct: copyTotals(eligible(sessionID) ? lookup(sessions, sessionID) : undefined),
+    including: sumReachable(sessions, childrenByParent, sessionID, eligible),
+    children: directChildIDs(childrenByParent, sessionID).filter(eligible).map(childID => ({
       sessionID: childID,
       direct: copyTotals(lookup(sessions, childID)),
-      including: sumReachable(sessions, childrenByParent, childID)
+      including: sumReachable(sessions, childrenByParent, childID, eligible)
     }))
   };
 }
@@ -43,7 +49,7 @@ function normalizeParent(sessionID, parent) {
 function directChildIDs(childrenByParent, sessionID) {
   return (childrenByParent.get(sessionID) ?? []).slice().sort((left, right) => left.localeCompare(right));
 }
-function sumReachable(sessions, childrenByParent, rootID) {
+function sumReachable(sessions, childrenByParent, rootID, eligible) {
   const totals = zeroTotals();
   const visited = new Set();
   const pending = [rootID];
@@ -51,6 +57,7 @@ function sumReachable(sessions, childrenByParent, rootID) {
     const current = pending.pop();
     if (current === undefined || visited.has(current)) continue;
     visited.add(current);
+    if (!eligible(current)) continue;
     const source = lookup(sessions, current);
     if (source) {
       totals.tokens = addTokenCounts(totals.tokens, source.tokens);

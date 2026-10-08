@@ -1,6 +1,7 @@
 import { addTokenCounts, emptyTokenCounts } from "./core.js";
 import { addSpeedTotals, coerceSpeedTotals } from './statistics.js';
 import type { SessionDirectTotals } from "./totals-storage.js";
+import { isSessionScopeExcluded, type SessionScopes } from "./scope.js";
 
 export interface TotalsRollupChild {
   sessionID: string;
@@ -24,15 +25,21 @@ export function rollupSessionTotals(
   sessions: Readonly<Record<string, SessionDirectTotals>>,
   parentBySessionID: ReadonlyMap<string, string | null | undefined> | Readonly<Record<string, string | null | undefined>>,
   sessionID: string,
+  sessionScopes: SessionScopes = {},
 ): TotalsRollup {
   const childrenByParent = indexChildren(parentBySessionID);
+  const eligibility = new Map<string, boolean>();
+  const eligible = (id: string) => {
+    if (!eligibility.has(id)) eligibility.set(id, !isSessionScopeExcluded(id, sessionScopes, parentBySessionID));
+    return eligibility.get(id)!;
+  };
   return {
-    direct: copyTotals(lookup(sessions, sessionID)),
-    including: sumReachable(sessions, childrenByParent, sessionID),
-    children: directChildIDs(childrenByParent, sessionID).map((childID) => ({
+    direct: copyTotals(eligible(sessionID) ? lookup(sessions, sessionID) : undefined),
+    including: sumReachable(sessions, childrenByParent, sessionID, eligible),
+    children: directChildIDs(childrenByParent, sessionID).filter(eligible).map((childID) => ({
       sessionID: childID,
       direct: copyTotals(lookup(sessions, childID)),
-      including: sumReachable(sessions, childrenByParent, childID),
+      including: sumReachable(sessions, childrenByParent, childID, eligible),
     })),
   };
 }
@@ -77,6 +84,7 @@ function sumReachable(
   sessions: Readonly<Record<string, SessionDirectTotals>>,
   childrenByParent: ReadonlyMap<string, readonly string[]>,
   rootID: string,
+  eligible: (sessionID: string) => boolean,
 ): SessionDirectTotals {
   const totals = zeroTotals();
   const visited = new Set<string>();
@@ -86,6 +94,7 @@ function sumReachable(
     const current = pending.pop();
     if (current === undefined || visited.has(current)) continue;
     visited.add(current);
+    if (!eligible(current)) continue;
 
     const source = lookup(sessions, current);
     if (source) {

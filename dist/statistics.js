@@ -1,9 +1,12 @@
 import { MIN_ROLLING_OBSERVATION_MS } from "./core.js";
 import { createHash } from "node:crypto";
 export const GENERATION_BASIS_VERSION = 3;
+/** Runtime ingress declaration, never an implicit default for old observations. */
+export const RECEIVE_CLOCK_RESOLUTION_MS = 1;
+export const MIN_COMPLETED_OBSERVATION_MS = 100;
 /** Stable rejection codes only: never persist event text, provider errors or
  * reasoning content as a diagnostic. Bound both input inspection and output. */
-const GENERATION_REJECTION_REASONS = new Set(["unknown-coverage", "generation-invalidated", "invalid-v3-evidence", "missing-content-observation", "not-observed-from-current-start", "unknown-final-usage", "unknown-reasoning-usage", "unattributed-or-merged-deltas", "unknown-or-multiple-step-identities", "unknown-step-identity", "multiple-step-identities", "missing-receive-observations", "insufficient-receive-span", "unfinished-response", "tool-usage-uncertain", "snapshot-delta-gap", "snapshot-delta-mismatch", "missing-comparable-final-snapshot", "missing-byte-receive-timing", "hidden-reasoning", "unobserved-output", "receive-byte-mismatch", "invalid-arrival-bytes", "anonymous-or-tool-arrival", "invalid-receive-clock", "arrival-kind-mismatch", "mixed-streams", "duplicate-or-unparsed-arrival", "nonmonotonic-receive-clock", "merged-receive-streams", "merged-recovered-content", "merged-delta-streams", "unknown-merged-coverage", "anonymous-snapshot", "part-kind-changed", "anonymous-delta", "retry", "failed", "recovery", "disconnect", "transport-disruption", "recovered-content", "unobserved-response-start", "not-current-assistant", "superseded-assistant", "previous-response-disruption", "aborted", "cancelled"]);
+const GENERATION_REJECTION_REASONS = new Set(["unknown-coverage", "generation-invalidated", "invalid-v3-evidence", "missing-content-observation", "not-observed-from-current-start", "unknown-final-usage", "unknown-reasoning-usage", "unattributed-or-merged-deltas", "unknown-or-multiple-step-identities", "unknown-step-identity", "multiple-step-identities", "missing-receive-observations", "insufficient-receive-span", "unknown-receive-clock", "unfinished-response", "tool-usage-uncertain", "snapshot-delta-gap", "snapshot-delta-mismatch", "missing-comparable-final-snapshot", "missing-byte-receive-timing", "hidden-reasoning", "unobserved-output", "receive-byte-mismatch", "invalid-arrival-bytes", "anonymous-or-tool-arrival", "invalid-receive-clock", "arrival-kind-mismatch", "mixed-streams", "duplicate-or-unparsed-arrival", "nonmonotonic-receive-clock", "merged-receive-streams", "merged-recovered-content", "merged-delta-streams", "unknown-merged-coverage", "anonymous-snapshot", "part-kind-changed", "anonymous-delta", "retry", "failed", "recovery", "disconnect", "transport-disruption", "recovered-content", "unobserved-response-start", "not-current-assistant", "superseded-assistant", "previous-response-disruption", "aborted", "cancelled"]);
 function coerceGenerationCoverage(value) {
   if (!object(value) || !["complete", "unknown", "gap"].includes(value.status) || !Array.isArray(value.reasons)) return undefined;
   const reasons = [];
@@ -105,8 +108,21 @@ export function selectResponseMeasurement(record) {
     }
   };
 }
+function trustedReceiveClock(value) {
+  return object(value) && value.clockSource === "performance.now" && valid(value.clockResolutionMs) && value.clockResolutionMs > 0;
+}
+function completedSpanQualified(span, clock) {
+  if (!valid(span) || span < MIN_COMPLETED_OBSERVATION_MS) return false;
+  const declared = clock.clockSource !== undefined || clock.clockResolutionMs !== undefined;
+  if (span < MIN_ROLLING_OBSERVATION_MS || declared) {
+    return trustedReceiveClock(clock) && span >= Math.max(MIN_COMPLETED_OBSERVATION_MS, 10 * clock.clockResolutionMs);
+  }
+  return true; // Existing long v3 evidence predates explicit clock declarations.
+}
 function isV3Evidence(value) {
-  if (!object(value) || value.version !== 3 || value.coverage !== "complete" || value.fromCurrentStart !== true || value.timeSource !== "receive-monotonic" || !["legacy", "v2"].includes(value.selectedStream) || typeof value.stepID !== "string" || !value.stepID.trim() || !valid(value.start) || !valid(value.end) || !valid(value.firstReceiveMono) || !valid(value.lastReceiveMono) || value.lastReceiveMono - value.firstReceiveMono < MIN_ROLLING_OBSERVATION_MS || !Number.isInteger(value.observationCount) || value.observationCount < 2 || !object(value.bytes) || !object(value.usage)) return false;
+  if (!object(value) || value.version !== 3 || value.coverage !== "complete" || value.fromCurrentStart !== true || value.timeSource !== "receive-monotonic" || !["legacy", "v2"].includes(value.selectedStream) || typeof value.stepID !== "string" || !value.stepID.trim() || !valid(value.start) || !valid(value.end) || !valid(value.firstReceiveMono) || !valid(value.lastReceiveMono) || !completedSpanQualified(value.lastReceiveMono - value.firstReceiveMono, value) || !Number.isInteger(value.observationCount) || value.observationCount < 2 || !object(value.bytes) || !object(value.usage)) return false;
+  const quality = value.lastReceiveMono - value.firstReceiveMono < MIN_ROLLING_OBSERVATION_MS ? "short" : "standard";
+  if ((quality === "short" || value.observationQuality !== undefined) && value.observationQuality !== quality) return false;
   for (const kind of ["output", "reasoning"]) {
     const bytes = value.bytes[kind];
     if (!object(bytes) || !Number.isSafeInteger(bytes.total) || bytes.total < 0 || !Number.isSafeInteger(bytes.firstBatch) || bytes.firstBatch < 0 || bytes.firstBatch > bytes.total || !valid(value.usage[kind]) || value.usage[kind] > 0 && bytes.total === 0 || value[`${kind}Observed`] !== bytes.total > 0) return false;
@@ -141,7 +157,16 @@ function copyV3Evidence(e, usage = e.usage) {
     usage: {
       output: usage.output,
       reasoning: usage.reasoning
-    }
+    },
+    ...(e.clockSource !== undefined ? {
+      clockSource: e.clockSource
+    } : {}),
+    ...(e.clockResolutionMs !== undefined ? {
+      clockResolutionMs: e.clockResolutionMs
+    } : {}),
+    ...(e.observationQuality !== undefined ? {
+      observationQuality: e.observationQuality
+    } : {})
   };
 }
 
@@ -164,7 +189,8 @@ function intervalMeasurement(e) {
     generatedTokens,
     coverageGeneratedTokens,
     durationMs,
-    estimated: true
+    estimated: true,
+    observationQuality: durationMs < MIN_ROLLING_OBSERVATION_MS ? "short" : "standard"
   };
 }
 export function isQualifiedGenerationContribution(speed) {
@@ -174,7 +200,7 @@ function qualifiedGeneration(speed, record) {
   const evidence = speed?.generationEvidence;
   if (!speed?.generation || !isV3Evidence(evidence)) return false;
   const expected = intervalMeasurement(evidence);
-  if (!expected || speed.generation.estimated !== true || speed.generation.durationMs !== expected.durationMs || speed.generation.generatedTokens !== expected.generatedTokens || speed.generation.coverageGeneratedTokens !== expected.coverageGeneratedTokens) return false;
+  if (!expected || speed.generation.estimated !== true || speed.generation.durationMs !== expected.durationMs || speed.generation.generatedTokens !== expected.generatedTokens || speed.generation.coverageGeneratedTokens !== expected.coverageGeneratedTokens || (expected.observationQuality === "short" || speed.generation.observationQuality !== undefined) && speed.generation.observationQuality !== expected.observationQuality) return false;
   if (!record) return true;
   return valid(record.time.completed) && evidence.usage.output === record.tokens.output && evidence.usage.reasoning === record.tokens.reasoning;
 }
@@ -187,7 +213,10 @@ export function emptySpeedTotals() {
     coverageGeneratedTokens: 0
   });
   return {
-    generation: zero(),
+    generation: {
+      ...zero(),
+      shortResponseCount: 0
+    },
     response: zero()
   };
 }
@@ -203,6 +232,13 @@ export function coerceSpeedContribution(value) {
         estimated: m.estimated
       };
       if (valid(m.coverageGeneratedTokens)) result[kind].coverageGeneratedTokens = m.coverageGeneratedTokens;
+      if (m.observationQuality !== undefined) {
+        if (m.observationQuality !== "short" && m.observationQuality !== "standard") {
+          delete result[kind];
+          continue;
+        }
+        result[kind].observationQuality = m.observationQuality;
+      }
     }
   }
   const evidence = value.generationEvidence;
@@ -301,6 +337,10 @@ export function coerceSpeedTotals(value) {
       estimatedResponseCount: m.estimatedResponseCount,
       coverageGeneratedTokens: valid(m.coverageGeneratedTokens) ? m.coverageGeneratedTokens : 0
     };
+    if (kind === "generation") {
+      if (m.shortResponseCount !== undefined && (!Number.isInteger(m.shortResponseCount) || !valid(m.shortResponseCount) || m.shortResponseCount > m.responseCount)) return undefined;
+      result.generation.shortResponseCount = m.shortResponseCount ?? 0;
+    }
   }
   return result;
 }
@@ -319,6 +359,7 @@ export function updateSpeedTotals(current, contribution, sign) {
     a.durationMs = Math.max(0, a.durationMs + sign * m.durationMs);
     a.responseCount = Math.max(0, a.responseCount + sign);
     a.estimatedResponseCount = Math.max(0, a.estimatedResponseCount + sign * Number(m.estimated));
+    if (kind === "generation") a.shortResponseCount = Math.max(0, (a.shortResponseCount ?? 0) + sign * Number(m.observationQuality === "short"));
     a.coverageGeneratedTokens = Math.max(0, (a.coverageGeneratedTokens ?? 0) + sign * (kind === "generation" ? m.coverageGeneratedTokens : m.generatedTokens));
   }
   return result;
@@ -331,6 +372,7 @@ export function addSpeedTotals(left, right) {
     for (const field of ["generatedTokens", "durationMs", "responseCount", "estimatedResponseCount"]) result[kind][field] += incoming[kind][field];
     result[kind].coverageGeneratedTokens = (result[kind].coverageGeneratedTokens ?? 0) + (incoming[kind].coverageGeneratedTokens ?? 0);
   }
+  result.generation.shortResponseCount = (result.generation.shortResponseCount ?? 0) + (incoming.generation.shortResponseCount ?? 0);
   return result;
 }
 export function sameSpeedContribution(left, right) {
@@ -351,7 +393,8 @@ export function getSessionAverageSummary(directTotals) {
   return {
     generation: {
       ...generation,
-      estimated: generation.available || generation.estimated
+      estimated: generation.available || generation.estimated,
+      shortResponseCount: speed.generation.shortResponseCount ?? 0
     },
     response: {
       ...summary(speed.response),
@@ -506,7 +549,7 @@ export function noteStepIdentity(progress, identity) {
 /** Call exactly once AFTER parse accepts a nonempty selected-stream delta,
  * using both clocks captured together at ingress. Part bytes and receive bytes
  * are separate accounting lanes: every accepted byte must have receive timing. */
-export function noteContentArrival(progress, arrival) {
+export function noteContentArrival(progress, arrival, clock) {
   if (arrival.bytes === 0) return;
   if (!Number.isSafeInteger(arrival.bytes) || arrival.bytes < 0) {
     taintContentProgress(progress, "invalid-arrival-bytes");
@@ -558,6 +601,14 @@ export function noteContentArrival(progress, arrival) {
     };
   }
   const next = progress.receive;
+  next.clockTrusted = trustedReceiveClock(clock) && (!receive || receive.clockTrusted === true);
+  if (next.clockTrusted) {
+    next.clockSource = clock.clockSource;
+    next.clockResolutionMs = Math.max(next.clockResolutionMs ?? 0, clock.clockResolutionMs);
+  } else {
+    delete next.clockSource;
+    delete next.clockResolutionMs;
+  }
   if (arrival.receivedMono > next.lastMono) next.observationCount += 1;
   next.lastMono = arrival.receivedMono;
   next.lastWall = arrival.receivedAt;
@@ -760,7 +811,10 @@ export function contentSpeedObservations(record, progress, firstOutput, usageExa
   }
   const receive = progress.receive;
   if (!receive || !progress.selectedStream) return reject("missing-receive-observations");
-  if (receive.observationCount < 2 || receive.lastMono - receive.firstMono < MIN_ROLLING_OBSERVATION_MS) return reject("insufficient-receive-span");
+  const span = receive.lastMono - receive.firstMono;
+  if (receive.observationCount < 2 || !valid(span) || span < MIN_COMPLETED_OBSERVATION_MS) return reject("insufficient-receive-span");
+  if (span < MIN_ROLLING_OBSERVATION_MS && receive.clockTrusted !== true) return reject("unknown-receive-clock");
+  if (!completedSpanQualified(span, receive)) return reject("insufficient-receive-span");
   if (contentParts.some(p => (p.receivedBytes ?? 0) !== p.deltaBytes)) {
     taintContentProgress(progress, "missing-byte-receive-timing");
     return reject("missing-byte-receive-timing");
@@ -799,7 +853,12 @@ export function contentSpeedObservations(record, progress, firstOutput, usageExa
     usage: {
       output: record.tokens.output,
       reasoning: record.tokens.reasoning
-    }
+    },
+    observationQuality: span < MIN_ROLLING_OBSERVATION_MS ? "short" : "standard",
+    ...(receive.clockTrusted === true ? {
+      clockSource: receive.clockSource,
+      clockResolutionMs: receive.clockResolutionMs
+    } : {})
   };
   if (!intervalMeasurement(evidence)) return reject("invalid-v3-evidence");
   observations.generationCoverage = {

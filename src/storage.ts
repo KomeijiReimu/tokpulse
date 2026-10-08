@@ -7,6 +7,26 @@ import {
   TokenCounts,
 } from "./core.js";
 import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, mergeRecordSpeed, type MeasuredHistoryRecord } from './statistics.js';
+import { coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, mergeScopeEvidence, type CompactScopeEvidence, type ScopeParents, type SessionScopes } from "./scope.js";
+
+export type ScopedHistoryRecord = HistoryRecord & { scope?: CompactScopeEvidence };
+/** Display-only filtering; never deletes raw historical facts. */
+export function filterHistoryRecords<T extends HistoryRecord>(records: readonly T[], sessionScopes: SessionScopes = {}, parents?: ScopeParents, excludedMessageIDs?: ReadonlySet<string>): T[] {
+  sessionScopes = collectSessionScopeEvidence(records, sessionScopes);
+  const links = new Map<string, string | null | undefined>();
+  for (const record of records) if (record.parentSessionID) links.set(record.sessionID, record.parentSessionID);
+  if (parents instanceof Map) for (const [id, parent] of parents) links.set(id, parent);
+  else if (parents) for (const [id, parent] of Object.entries(parents)) links.set(id, parent);
+  const eligible = new Map<string, boolean>();
+  return records.filter((record) => {
+    if (excludedMessageIDs?.has(record.messageID)) return false;
+    const scoped = record;
+    if (scoped.scope?.sourceScope === "magic-message") return false;
+    if (!eligible.has(record.sessionID)) eligible.set(record.sessionID, isMeasurementScopeEligible(scoped, sessionScopes, links));
+    return eligible.get(record.sessionID)!;
+});
+}
+export const projectHistoryRecords = filterHistoryRecords;
 
 export const DEFAULT_MAX_RECORDS = 1000;
 
@@ -120,6 +140,8 @@ export function mergeHistoryRecords(
     const existing = byMessage.get(normalized.messageID);
     if (!existing || isPreferredRecord(normalized, existing)) {
       byMessage.set(normalized.messageID, mergeAcceptedRecord(normalized, existing));
+    } else {
+      byMessage.set(normalized.messageID, mergeHistoryScope(existing, normalized));
     }
   }
   return [...byMessage.values()];
@@ -195,6 +217,8 @@ export function parseHistoryJsonl(content: string): HistoryRecord[] {
         const existing = byMessage.get(record.messageID);
         if (!existing || isPreferredRecord(record, existing)) {
           byMessage.set(record.messageID, mergeAcceptedRecord(record, existing));
+        } else {
+          byMessage.set(record.messageID, mergeHistoryScope(existing, record));
         }
       }
     } catch {
@@ -212,13 +236,15 @@ export function serializeHistoryJsonl(records: readonly HistoryRecord[]): string
     const existing = unique.get(normalized.messageID);
     if (!existing || isPreferredRecord(normalized, existing)) {
       unique.set(normalized.messageID, mergeAcceptedRecord(normalized, existing));
+    } else {
+      unique.set(normalized.messageID, mergeHistoryScope(existing, normalized));
     }
   }
   if (unique.size === 0) return "";
   return `${[...unique.values()].map((record) => JSON.stringify(record)).join("\n")}\n`;
 }
 
-export function normalizeHistoryRecord(value: unknown): HistoryRecord | undefined {
+export function normalizeHistoryRecord(value: unknown): ScopedHistoryRecord | undefined {
   if (!isRecord(value)) return undefined;
   if (value.version !== undefined && value.version !== HISTORY_VERSION) return undefined;
   if (typeof value.messageID !== "string" || value.messageID.length === 0) return undefined;
@@ -248,6 +274,7 @@ export function normalizeHistoryRecord(value: unknown): HistoryRecord | undefine
     // empty server snapshot can revoke an earlier qualified measurement.
     ...(isRecord(value.speed) ? { speed: coerceSpeedContribution(value.speed) ?? {} } : {}),
     ...(coerceCompletionUpdate(value.update) ? { update: coerceCompletionUpdate(value.update) } : {}),
+    ...(coerceScopeEvidence(value.scope) ? { scope: coerceScopeEvidence(value.scope) } : {}),
   };
 }
 
@@ -255,7 +282,7 @@ function upsertRecord(records: readonly HistoryRecord[], record: HistoryRecord):
   const normalized = normalizeHistoryRecord(record);
   if (!normalized) throw new TypeError("Invalid history record");
   const existing = records.find((entry) => entry.messageID === normalized.messageID);
-  const chosen = existing && !isPreferredRecord(normalized, existing) ? existing : mergeAcceptedRecord(normalized, existing);
+  const chosen = existing && !isPreferredRecord(normalized, existing) ? mergeHistoryScope(existing, normalized) : mergeAcceptedRecord(normalized, existing);
   const result = records.filter((entry) => entry.messageID !== normalized.messageID);
   result.push(chosen);
   return result;
@@ -266,10 +293,18 @@ function mergeAcceptedRecord(candidate: HistoryRecord, existing?: HistoryRecord)
   if (!existing) return candidate;
   const speed = coerceSpeedContribution(mergeRecordSpeed(candidate, existing,
     (candidate as MeasuredHistoryRecord).update && candidate.speed !== undefined && !candidate.speed.generation ? "invalidated" : "unobserved"));
-  const merged = { ...candidate };
+  const merged = mergeHistoryScope(candidate, existing);
   if (speed) merged.speed = speed;
   else if (candidate.speed !== undefined) merged.speed = {};
   else delete merged.speed;
+  return merged;
+}
+
+function mergeHistoryScope(candidate: HistoryRecord, existing: HistoryRecord): ScopedHistoryRecord {
+  const merged: ScopedHistoryRecord = { ...candidate };
+  const oldScope = existing.scope;
+  const nextScope = candidate.scope;
+  if (oldScope || nextScope) merged.scope = nextScope ? mergeScopeEvidence(oldScope, nextScope) : oldScope;
   return merged;
 }
 

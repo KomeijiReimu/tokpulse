@@ -1,6 +1,6 @@
 import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { dedupeActivityEvents, normalizeActivityEvent, replayActivity } from "./activity.js";
+import { dedupeActivityEvents, normalizeActivityEvent, replayActivity, filterActivityEvents } from "./activity.js";
 export const DEFAULT_RUNS_FILENAME = "runs.jsonl";
 /** Derives the independent activity ledger beside a history.jsonl file. */
 export function deriveRunsPath(historyPath) {
@@ -45,7 +45,10 @@ export function parseActivityJsonl(content, options = {}) {
       // A partial final line or a corrupt line must not hide valid facts.
     }
   }
-  return options.dedupe === false ? parsed : dedupeActivityEvents(parsed);
+  const events = options.dedupe === false ? parsed : dedupeActivityEvents(parsed);
+  if (!options.sessionScopes && !options.parentBySessionID) return events;
+  const eligible = new Set(filterActivityEvents(events, options.sessionScopes, options.parentBySessionID).map(event => event.sessionID));
+  return events.filter(event => eligible.has(event.sessionID) && event.scope?.sourceScope !== "magic-message");
 }
 export function serializeActivityJsonl(events) {
   const normalized = dedupeActivityEvents(events);

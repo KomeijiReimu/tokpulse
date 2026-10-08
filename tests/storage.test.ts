@@ -12,7 +12,66 @@ import {
   readHistoryFile,
   serializeHistoryJsonl,
   hasOriginalResponseTiming,
+  filterHistoryRecords,
+  type ScopedHistoryRecord,
 } from "../src/storage.js";
+import { classifyMessageMetadata, createScopeRegistry } from "../src/scope.js";
+
+test("late session scope projects old history without destroying raw records or normal users", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const path = join(directory, "history.jsonl");
+  const storage = createHistoryStorage(path);
+  const records = [historyRecord("root", { sessionID: "root" }), historyRecord("mc", { sessionID: "mc", parentSessionID: "root" }), historyRecord("grand", { sessionID: "grand", parentSessionID: "mc" }), historyRecord("real", { sessionID: "real", parentSessionID: "root" })];
+  for (const record of records) await storage.upsert(record);
+  const raw = await readFile(path, "utf8");
+  const registry = createScopeRegistry();
+  registry.observeMessageMetadata("mc", { agent: "historian-editor" });
+  assert.deepEqual(filterHistoryRecords(await storage.read(), registry.serialize()), [records[0], records[3]]);
+  assert.equal(await readFile(path, "utf8"), raw);
+  assert.equal((await storage.read()).length, 4);
+});
+
+test("stored compaction proof round-trips and cannot hide other messages on same SID or be erased by replay", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createHistoryStorage(join(directory, "history.jsonl"));
+  const compact: ScopedHistoryRecord = { ...historyRecord("compact"), scope: classifyMessageMetadata({ agent: "compaction" }) };
+  await storage.upsert(compact);
+  await storage.upsert(historyRecord("normal"));
+  await storage.upsert(historyRecord("compact", { cost: 2 }));
+  const records = await storage.read();
+  assert.deepEqual((records.find((record) => record.messageID === "compact") as ScopedHistoryRecord).scope, compact.scope);
+  assert.deepEqual(filterHistoryRecords(records).map((record) => record.messageID), ["normal"]);
+  assert.deepEqual((parseHistoryJsonl(serializeHistoryJsonl([compact]))[0] as ScopedHistoryRecord).scope, compact.scope);
+  const stale: ScopedHistoryRecord = { ...compact, quality: "provisional" };
+  const chosen = parseHistoryJsonl(serializeHistoryJsonl([historyRecord("compact", { quality: "exact" }), stale]));
+  assert.equal(chosen[0].quality, "exact");
+  assert.deepEqual(filterHistoryRecords(chosen), []);
+});
+
+test("history normalization, upsert and scope projection preserve short observation quality and clock evidence", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createHistoryStorage(join(directory, "history.jsonl"));
+  const record = historyRecord("short-quality", { time: { start: 0, completed: 3000 } });
+  record.speed = measureRecordSpeed(record, { usageExact: true, responseTimingExact: true, generation: {
+    version: 3, coverage: "complete", complete: true, estimated: true,
+    start: 100, end: 300, firstReceiveMono: 10, lastReceiveMono: 210, observationCount: 2,
+    timeSource: "receive-monotonic", fromCurrentStart: true, selectedStream: "v2", stepID: "short-step",
+    outputObserved: true, reasoningObserved: false,
+    bytes: { output: { total: 100, firstBatch: 25 }, reasoning: { total: 0, firstBatch: 0 } },
+    usage: { output: 5, reasoning: 0 }, clockSource: "performance.now", clockResolutionMs: 1, observationQuality: "short",
+  } });
+  assert.equal(record.speed.generation?.observationQuality, "short");
+  await storage.upsert(record);
+  const correction = { ...record, cost: 2 };
+  delete correction.speed;
+  await storage.upsert(correction);
+  const projected = filterHistoryRecords(await storage.read());
+  assert.equal(projected[0].speed?.generation?.observationQuality, "short");
+  assert.equal(projected[0].speed?.generationEvidence?.observationQuality, "short");
+  assert.equal(projected[0].speed?.generationEvidence?.clockSource, "performance.now");
+  assert.equal(projected[0].speed?.generationEvidence?.clockResolutionMs, 1);
+  assert.equal(parseHistoryJsonl(serializeHistoryJsonl(projected))[0].speed?.generation?.observationQuality, "short");
+});
 
 test("recovers valid records from a temp-only file", async (context) => {
   const directory = await makeTestDirectory(context);

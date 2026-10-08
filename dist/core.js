@@ -82,6 +82,32 @@ export function appendSpeedSample(samples, sample, windowMs = DEFAULT_ROLLING_WI
   const predecessor = next.filter(entry => entry.timestamp < cutoff).at(-1)?.timestamp;
   return next.filter(entry => entry.timestamp >= cutoff || entry.timestamp === predecessor);
 }
+/** Local, immutable-to-consumers normalization shared by LIVE and extrema. */
+function normalizeArrivalPoints(samples, now, windowMs) {
+  const ordered = samples.filter(sample => Number.isFinite(sample.timestamp)).sort((left, right) => left.timestamp - right.timestamp);
+  const points = [];
+  const referenceNow = now ?? ordered.at(-1)?.timestamp;
+  const result = {
+    points,
+    referenceNow
+  };
+  if (referenceNow === undefined || !Number.isFinite(referenceNow) || windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs < 0)) return result;
+  for (const sample of ordered) {
+    if (sample.timestamp > referenceNow) break;
+    result.latestObservationAt = sample.timestamp;
+    const tokens = nonNegativeNumber(sample.estimatedTokens ?? sample.tokens);
+    if (tokens > 0) result.latestTokenAt = sample.timestamp;
+    const previous = points.at(-1);
+    if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;else {
+      if (previous && windowMs !== undefined && sample.timestamp - previous.timestamp > windowMs) points.length = 0;
+      points.push({
+        timestamp: sample.timestamp,
+        tokens
+      });
+    }
+  }
+  return result;
+}
 
 /**
  * Measures token arrivals, not the model's precise generation speed. The first
@@ -101,27 +127,14 @@ export function measureRollingTokenRate(samples, now, windowMs = DEFAULT_ROLLING
     observedTokens: 0,
     observationCount: 0
   };
-  const ordered = samples.filter(sample => Number.isFinite(sample.timestamp)).sort((left, right) => left.timestamp - right.timestamp);
-  const referenceNow = now ?? ordered.at(-1)?.timestamp;
+  const {
+    points,
+    referenceNow,
+    latestObservationAt,
+    latestTokenAt
+  } = normalizeArrivalPoints(samples, now, windowMs);
   if (referenceNow === undefined || !Number.isFinite(referenceNow) || !Number.isFinite(windowMs) || windowMs < 0) return empty;
   const cutoff = referenceNow - windowMs;
-  const points = [];
-  let latestObservationAt;
-  let latestTokenAt;
-  for (const sample of ordered) {
-    if (sample.timestamp > referenceNow) break;
-    latestObservationAt = sample.timestamp;
-    const tokens = nonNegativeNumber(sample.estimatedTokens ?? sample.tokens);
-    if (tokens > 0) latestTokenAt = sample.timestamp;
-    const previous = points.at(-1);
-    if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;else {
-      if (previous && sample.timestamp - previous.timestamp > windowMs) points.length = 0;
-      points.push({
-        timestamp: sample.timestamp,
-        tokens
-      });
-    }
-  }
   const baseline = points.length > 0 ? Math.max(cutoff, points[0].timestamp) : referenceNow;
   const elapsedMs = referenceNow - baseline;
   let observedTokens = 0;
@@ -176,13 +189,42 @@ export function calculateRateStats(values) {
   };
 }
 export function calculateSpeedStats(samples) {
-  const timestamps = [...new Set(samples.filter(sample => Number.isFinite(sample.timestamp)).map(sample => sample.timestamp))].sort((a, b) => a - b);
+  const {
+    points
+  } = normalizeArrivalPoints(samples);
+  const prefix = [];
   const rates = [];
+  let segmentStart = 0;
+  let left = 0;
+  let latestTokenAt;
   // Peaks/troughs are supported rolling windows ending at actual observations,
-  // not arbitrary adjacent-chunk rates or a response-average fallback.
-  for (const timestamp of timestamps) {
-    const measurement = measureRollingTokenRate(samples, timestamp);
-    if (measurement.status === "ready") rates.push(measurement.rate);
+  // not arbitrary adjacent-chunk rates or a response-average fallback. One sort,
+  // then a linear moving boundary; prefix sums exclude each segment's baseline.
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    if (index > 0 && point.timestamp - points[index - 1].timestamp > DEFAULT_ROLLING_WINDOW_MS) {
+      segmentStart = index;
+      left = index;
+    }
+    prefix[index] = index === segmentStart ? 0 : prefix[index - 1] + point.tokens;
+    if (point.tokens > 0) latestTokenAt = point.timestamp;
+    const cutoff = point.timestamp - DEFAULT_ROLLING_WINDOW_MS;
+    while (points[left].timestamp < cutoff) left += 1;
+    const elapsedMs = point.timestamp - Math.max(cutoff, points[segmentStart].timestamp);
+    const interpolated = left > segmentStart && points[left].timestamp > cutoff;
+    const observationCount = index - left + 1 + Number(interpolated);
+    if (point.timestamp - (latestTokenAt ?? point.timestamp) >= DEFAULT_ROLLING_WINDOW_MS || observationCount < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) continue;
+    let observedTokens = prefix[index] - prefix[left];
+    if (interpolated) observedTokens += points[left].tokens * ((points[left].timestamp - cutoff) / (points[left].timestamp - points[left - 1].timestamp));
+    // Rare overflowing/huge token sums cannot safely be subtracted. Preserve the
+    // original per-window finite-rate decision rather than poisoning later windows.
+    if (!Number.isFinite(observedTokens) || prefix[index] > Number.MAX_SAFE_INTEGER || prefix[left] > Math.abs(observedTokens) * 10_000) {
+      const measurement = measureRollingTokenRate(samples, point.timestamp);
+      if (measurement.status === "ready") rates.push(measurement.rate);
+      continue;
+    }
+    const rate = observedTokens / elapsedMs * 1000;
+    if (Number.isFinite(elapsedMs) && Number.isFinite(rate)) rates.push(rate);
   }
   return {
     ...calculateRateStats(rates),

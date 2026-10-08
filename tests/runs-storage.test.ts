@@ -9,6 +9,28 @@ import {
   parseActivityJsonl,
   serializeActivityJsonl,
 } from "../src/runs-storage.js";
+import { classifyMessageMetadata } from "../src/scope.js";
+
+test("scoped ledger read/replay retracts late identity but preserves original runs and boundaries", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "oc-tps-runs-scope-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const ledger = new ActivityLedger(join(directory, "runs.jsonl"));
+  await ledger.appendMany([
+    lifecycle("user-start", 0, "root", 1), lifecycle("user-stop", 100, "root", 2),
+    { ...lifecycle("mc-start", 0, "mc", 1), instanceID: "old", lastObservedAt: 1000 },
+    { kind: "parent", sessionID: "mc", parentSessionID: "root", timestamp: 2000 },
+    { kind: "parent", sessionID: "grand", parentSessionID: "mc", timestamp: 2001 },
+    lifecycle("grand-start", 0, "grand", 1), lifecycle("grand-stop", 2000, "grand", 2),
+  ]);
+  const raw = await readFile(ledger.path, "utf8");
+  assert.equal((await ledger.replay()).rootActiveMilliseconds.root, 2000);
+  const sessionScopes = { mc: classifyMessageMetadata({ mode: "dreamer" }) };
+  assert.equal((await ledger.replay({ sessionScopes, replayCutoff: 100_000 })).rootActiveMilliseconds.root, 100);
+  assert.deepEqual((await ledger.read({ sessionScopes })).map((event) => event.sessionID), ["root", "root"]);
+  assert.equal((await ledger.read()).length, 7);
+  assert.equal(await readFile(ledger.path, "utf8"), raw);
+  assert.equal((await new ActivityLedger(ledger.path).read()).find((event) => event.sessionID === "mc")?.lastObservedAt, 1000);
+});
 
 test("history path derives a sibling runs.jsonl and explicit absolute path wins", () => {
   assert.equal(deriveRunsPath("/tmp/oc/history.jsonl"), "/tmp/oc/runs.jsonl");

@@ -3,6 +3,47 @@ import test from "node:test";
 import type { SessionDirectTotals } from "../src/totals-storage.js";
 import { rollupSessionTotals } from "../src/totals-aggregate.js";
 import { getSessionAverageSummary, updateSpeedTotals } from "../src/statistics.js";
+import { classifyMessageMetadata } from "../src/scope.js";
+
+test("every direct and including rollup filters MC descendants without changing exact user sums", () => {
+  const root = usage(1);
+  const real = usage(10);
+  real.speed = updateSpeedTotals(undefined, { response: { generatedTokens: 5, durationMs: 100, estimated: false } }, 1);
+  const sessions = { root, real, mc: usage(100), grand: usage(1000) };
+  const parents = { real: "root", mc: "root", grand: "mc" };
+  const scopes = { mc: classifyMessageMetadata({ mode: "dreamer" }) };
+  const actual = rollupSessionTotals(sessions, parents, "root", scopes);
+  assert.deepEqual(actual, rollupSessionTotals({ root, real }, { real: "root" }, "root"));
+  assert.deepEqual(rollupSessionTotals(sessions, parents, "mc", scopes), { direct: zero(), including: zero(), children: [] });
+  assert.deepEqual(rollupSessionTotals(sessions, parents, "grand", scopes).direct, zero());
+  assert.equal(sessions.mc.tokens.input, 100);
+  assert.equal(actual.including.speed?.response.generatedTokens, 5);
+});
+
+test("scope inheritance through a cycle safely filters every rollup entry", () => {
+  const result = rollupSessionTotals({ a: usage(1), b: usage(10) }, { a: "b", b: "a" }, "a", { b: classifyMessageMetadata({ agent: "historian" }) });
+  assert.deepEqual(result, { direct: zero(), including: zero(), children: [] });
+});
+
+test("shared speed merge preserves shortResponseCount in direct/including and scope-filtered totals", () => {
+  const makeShortTotals = (count: number) => {
+    const totals = usage(count);
+    totals.speed = {
+      generation: { generatedTokens: count * 5, coverageGeneratedTokens: count * 10, durationMs: count * 200, responseCount: count, estimatedResponseCount: count, shortResponseCount: count },
+      response: { generatedTokens: count * 10, coverageGeneratedTokens: count * 10, durationMs: count * 3000, responseCount: count, estimatedResponseCount: 0 },
+    };
+    return totals;
+  };
+  const sessions = { root: makeShortTotals(1), real: makeShortTotals(2), mc: makeShortTotals(10), grand: makeShortTotals(20) };
+  const parents = { real: "root", mc: "root", grand: "mc" };
+  const actual = rollupSessionTotals(sessions, parents, "root", { mc: classifyMessageMetadata({ mode: "dreamer" }) });
+  assert.equal(actual.direct.speed?.generation.shortResponseCount, 1);
+  assert.equal(actual.including.speed?.generation.shortResponseCount, 3);
+  assert.equal(actual.children[0].direct.speed?.generation.shortResponseCount, 2);
+  assert.equal(actual.children[0].including.speed?.generation.shortResponseCount, 2);
+  assert.deepEqual(actual, rollupSessionTotals({ root: sessions.root, real: sessions.real }, { real: "root" }, "root"));
+  assert.equal(sessions.mc.speed?.generation.shortResponseCount, 10);
+});
 
 test("direct average excludes child speed while rollup keeps independent sums", () => {
   const root = usage(1);

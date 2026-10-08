@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { HistoryRecord } from "../src/core.js";
 import { utf8ByteLength } from "../src/core.js";
+import { GENERATION_BASIS_VERSION, MIN_COMPLETED_OBSERVATION_MS, RECEIVE_CLOCK_RESOLUTION_MS, type ReceiveClockContext } from "../src/statistics.js";
 import { acceptModelDelta, addSpeedTotals, applyFirstResponseSignal, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentProgress, deriveSafeResponseMeasurement, earliestFirstOutput, getSessionAverageSummary, isQualifiedGenerationContribution, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, noteContentArrival, notePartSnapshot, noteStepIdentity, parseModelDelta, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal, updateSpeedTotals } from "../src/statistics.js";
 
 function record(output = 100, reasoning = 0): HistoryRecord {
@@ -145,9 +146,9 @@ test("a later Thinking signal cannot displace legacy earlier content timing", ()
   assert.equal(earlierThinking.firstToken, 100);
 });
 
-function arrival(progress: ReturnType<typeof createContentProgress>, partID: string, delta: string, receivedAt: number, receivedMono = receivedAt, stream: "legacy" | "v2" = "legacy") {
+function arrival(progress: ReturnType<typeof createContentProgress>, partID: string, delta: string, receivedAt: number, receivedMono = receivedAt, stream: "legacy" | "v2" = "legacy", clock?: ReceiveClockContext) {
   const parsed = parseModelDelta(progress, { partID, field: "text" }, { type: "message.part.delta" }, stream, delta);
-  if (parsed) noteContentArrival(progress, { ...parsed, bytes: utf8ByteLength(delta), receivedAt, receivedMono, stream });
+  if (parsed) noteContentArrival(progress, { ...parsed, bytes: utf8ByteLength(delta), receivedAt, receivedMono, stream }, clock);
 }
 
 function completeProgress(type = "text", delta = "hello") {
@@ -308,7 +309,7 @@ test("a category beginning after the global-first batch does not lose its own fi
   assert.equal(speed.generationEvidence?.bytes?.output.firstBatch, 0);
 });
 
-test("v3 requires two receive-mono batches and at least one second; long part/tool-tail times cannot qualify", () => {
+test("undeclared v3 requires two receive-mono batches and one second; long part/tool-tail times cannot qualify", () => {
   for (const span of [0, 1, 999]) {
     const progress = createContentProgress({ fromCurrentStart: true });
     noteStepIdentity(progress, "step");
@@ -330,6 +331,182 @@ test("v3 requires two receive-mono batches and at least one second; long part/to
   assert.equal(empty.eventIDs.size, 0);
   assert.equal(measured(record(), empty).generation, undefined);
   assert.equal(measureRecordSpeed(record(), contentSpeedObservations(record(), completeProgress(), undefined, false, true)).generation, undefined);
+});
+
+const trustedClock: ReceiveClockContext = { clockSource: "performance.now", clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS };
+function timedProgress(span = 150, firstClock: ReceiveClockContext | undefined = trustedClock, lastClock = firstClock) {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  arrival(progress, "p", "h", 100, 50, "legacy", firstClock);
+  arrival(progress, "p", "ello", 100 + span, 50 + span, "legacy", lastClock);
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  return progress;
+}
+
+test("trusted 150ms completed flow is estimated short, with unchanged interval proportions and no LIVE extrema", () => {
+  assert.equal(MIN_COMPLETED_OBSERVATION_MS, 100);
+  assert.equal(RECEIVE_CLOCK_RESOLUTION_MS, 1);
+  assert.equal(GENERATION_BASIS_VERSION, 3);
+  const current = record(100);
+  const speed = measured(current, timedProgress());
+  assert.deepEqual(speed.generation, { generatedTokens: 80, coverageGeneratedTokens: 100, durationMs: 150, estimated: true, observationQuality: "short" });
+  assert.equal(speed.generationEvidence?.clockSource, "performance.now");
+  assert.equal(speed.generationEvidence?.clockResolutionMs, 1);
+  assert.equal(speed.generationEvidence?.observationQuality, "short");
+  const selected = selectSpeedMeasurement({ ...current, speed });
+  assert.equal(selected.rate, 80_000 / 150);
+  assert.equal(selected.estimated, true);
+  assert.equal(selected.measurement?.observationQuality, "short");
+  assert.equal(isQualifiedGenerationContribution(speed), true);
+  assert.deepEqual(coerceSpeedContribution(JSON.parse(JSON.stringify(speed))), speed);
+});
+
+test("short completed flow requires declared trusted clock proof on every arrival and sufficient resolution span", () => {
+  const undeclared = timedProgress();
+  delete undeclared.receive!.clockSource;
+  delete undeclared.receive!.clockResolutionMs;
+  undeclared.receive!.clockTrusted = false;
+  assert.deepEqual(measured(record(), undeclared).generationCoverage, { status: "unknown", reasons: ["unknown-receive-clock"] });
+  const missingFirst = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(missingFirst, "step");
+  arrival(missingFirst, "p", "h", 100, 50);
+  arrival(missingFirst, "p", "ello", 250, 200, "legacy", trustedClock);
+  notePartSnapshot(missingFirst, { part: { id: "p", type: "text", text: "hello" }, final: true });
+  assert.equal(measured(record(), missingFirst).generationCoverage?.reasons[0], "unknown-receive-clock");
+  const missingLast = timedProgress(150, trustedClock, undefined);
+  // Explicit omitted clock after the two declared batches also loses all-arrival proof.
+  arrival(missingLast, "p", "!", 250, 200);
+  notePartSnapshot(missingLast, { part: { id: "p", type: "text", text: "hello!" }, final: true });
+  assert.equal(measured(record(), missingLast).generationCoverage?.reasons[0], "unknown-receive-clock");
+  for (const span of [0, 1, 99]) {
+    const speed = measured(record(), timedProgress(span));
+    assert.equal(speed.generation, undefined);
+    assert.equal(speed.generationCoverage?.reasons[0], "insufficient-receive-span");
+    assert.equal(selectSpeedMeasurement({ ...record(), speed }).available, false);
+  }
+  for (const clock of [{ clockSource: "Date.now", clockResolutionMs: 1 },
+    { clockSource: "performance.now", clockResolutionMs: 0 }, { clockSource: "performance.now", clockResolutionMs: NaN },
+    { clockSource: "performance.now", clockResolutionMs: Infinity }]) {
+    assert.equal(measured(record(), timedProgress(150, clock as ReceiveClockContext)).generationCoverage?.reasons[0], "unknown-receive-clock");
+  }
+  const coarse = { ...trustedClock, clockResolutionMs: 20 };
+  assert.equal(measured(record(), timedProgress(150, coarse)).generationCoverage?.reasons[0], "insufficient-receive-span");
+  assert.equal(measured(record(), timedProgress(200, coarse)).generation?.observationQuality, "short");
+  assert.equal(measured(record(), timedProgress(100)).generation?.observationQuality, "short");
+  assert.equal(measured(record(), timedProgress(999)).generation?.observationQuality, "short");
+  assert.equal(measured(record(), timedProgress(1000)).generation?.observationQuality, "standard");
+  assert.equal(measured(record(), timedProgress(1000, { ...trustedClock, clockResolutionMs: 101 })).generation, undefined);
+  const mixedResolution = timedProgress(150, trustedClock, coarse);
+  assert.equal(measured(record(), mixedResolution).generation, undefined);
+  assert.equal(mixedResolution.receive?.clockResolutionMs, 20);
+});
+
+test("short evidence/measurement coercion never fabricates missing resolution/source/quality", () => {
+  const speed = measured(record(), timedProgress());
+  for (const field of ["clockSource", "clockResolutionMs", "observationQuality"] as const) {
+    const evidence = { ...speed.generationEvidence! };
+    delete evidence[field];
+    assert.equal(isQualifiedGenerationContribution({ ...speed, generationEvidence: evidence }), false);
+  }
+  for (const observationQuality of [undefined, "standard", "invented"] as const) {
+    assert.equal(isQualifiedGenerationContribution({ ...speed, generation: { ...speed.generation!, observationQuality } } as any), false);
+  }
+  assert.equal(isQualifiedGenerationContribution({ ...speed, generationEvidence: { ...speed.generationEvidence!, observationQuality: "standard" } }), false);
+  assert.equal(isQualifiedGenerationContribution({ ...speed, generationEvidence: { ...speed.generationEvidence!, clockResolutionMs: 16 } }), false);
+  const old = measured();
+  delete old.generation!.observationQuality;
+  delete old.generationEvidence!.observationQuality;
+  assert.equal(isQualifiedGenerationContribution(old), true);
+  assert.equal(selectSpeedMeasurement({ ...record(), speed: old }).available, true);
+  assert.equal(coerceSpeedContribution(old)?.generationEvidence?.observationQuality, undefined);
+  assert.equal(updateSpeedTotals(undefined, old, 1)?.generation.shortResponseCount, 0);
+});
+
+test("short plus long AVG is ratio of interval sums; correction and revocation retain quality/counts without reset", () => {
+  const current = record(100);
+  const short = measured(current, timedProgress());
+  const long = measured(record(200));
+  let totals = updateSpeedTotals(updateSpeedTotals(undefined, long, 1), short, 1)!;
+  const summary = getSessionAverageSummary({ tokens: record(300).tokens, responseCount: 2, speed: totals });
+  assert.equal(summary.generation.rate, 240_000 / 1150);
+  assert.equal(summary.generation.shortResponseCount, 1);
+  assert.equal(summary.generation.coveredGeneratedTokens, 300);
+  const corrected = mergeRecordSpeed(record(250), { tokens: current.tokens, speed: short });
+  assert.equal(corrected.generation?.generatedTokens, 200);
+  assert.equal(corrected.generation?.durationMs, 150);
+  assert.equal(corrected.generation?.observationQuality, "short");
+  assert.deepEqual(corrected.generationEvidence?.bytes, short.generationEvidence?.bytes);
+  assert.equal(corrected.generationEvidence?.clockResolutionMs, 1);
+  assert.equal(corrected.generationEvidence?.observationQuality, "short");
+  totals = updateSpeedTotals(updateSpeedTotals(totals, short, -1), corrected, 1)!;
+  assert.equal(totals.generation.generatedTokens, 360);
+  assert.equal(totals.generation.durationMs, 1150);
+  assert.equal(totals.generation.shortResponseCount, 1);
+  const revoked = mergeRecordSpeed(record(250, 1), { tokens: record(250).tokens, speed: corrected });
+  assert.equal(revoked.generation, undefined);
+  assert.equal(mergeRecordSpeed(record(250), { tokens: record(250).tokens, speed: corrected }, "invalidated").generation, undefined);
+  totals = updateSpeedTotals(updateSpeedTotals(totals, corrected, -1), revoked, 1)!;
+  assert.equal(totals.generation.generatedTokens, 160);
+  assert.equal(totals.generation.durationMs, 1000);
+  assert.equal(totals.generation.responseCount, 1);
+  assert.equal(totals.generation.shortResponseCount, 0);
+  const merged = addSpeedTotals(updateSpeedTotals(undefined, short, 1), updateSpeedTotals(undefined, long, 1))!;
+  assert.equal(merged.generation.shortResponseCount, 1);
+  const old = { ...merged, generation: { ...merged.generation } };
+  delete old.generation.shortResponseCount;
+  assert.equal(coerceSpeedTotals(old)?.generation.generatedTokens, merged.generation.generatedTokens);
+  assert.equal(coerceSpeedTotals(old)?.generation.shortResponseCount, 0);
+});
+
+test("short acceptance retains strict reasoning, hash, usage, ownership, step and sticky-taint checks", () => {
+  for (const change of [
+    (p: ReturnType<typeof createContentProgress>) => { taintContentProgress(p, "retry"); },
+    (p: ReturnType<typeof createContentProgress>) => { p.fromCurrentStart = false; },
+    (p: ReturnType<typeof createContentProgress>) => { noteStepIdentity(p, "another"); },
+    (p: ReturnType<typeof createContentProgress>) => { p.parts.get("p")!.receivedBytes = 0; },
+    (p: ReturnType<typeof createContentProgress>) => { notePartSnapshot(p, { part: { id: "p", type: "text", text: "world" }, final: true }); },
+  ]) {
+    const p = timedProgress();
+    change(p);
+    assert.equal(measured(record(), p).generation, undefined);
+  }
+  assert.equal(measured(record(100, 1), timedProgress()).generation, undefined);
+  assert.equal(measureRecordSpeed(record(), contentSpeedObservations(record(), timedProgress(), undefined, false, true)).generation, undefined);
+  assert.equal(measureRecordSpeed(record(), contentSpeedObservations(record(), timedProgress(), undefined, true, true, false)).generation, undefined);
+});
+
+test("short output and reasoning share the global-first batch without token subtraction or full-usage substitution", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "" } });
+  arrival(progress, "r", "rr", 100, 50, "legacy", trustedClock);
+  arrival(progress, "p", "o", 100, 50, "legacy", trustedClock);
+  arrival(progress, "r", "rr", 250, 200, "legacy", trustedClock);
+  arrival(progress, "p", "ooo", 250, 200, "legacy", trustedClock);
+  notePartSnapshot(progress, { part: { id: "r", type: "reasoning", text: "rrrr" }, final: true });
+  notePartSnapshot(progress, { part: { id: "p", type: "text", text: "oooo" }, final: true });
+  const speed = measured(record(100, 100), progress);
+  assert.equal(speed.generation?.generatedTokens, 125);
+  assert.equal(speed.generation?.coverageGeneratedTokens, 200);
+  assert.equal(speed.generation?.durationMs, 150);
+  assert.equal(speed.generationEvidence?.observationCount, 2);
+  assert.equal(speed.generation?.observationQuality, "short");
+});
+
+test("long multipart completed span retains silence; trimming a first whitespace snapshot never moves receive boundaries", () => {
+  const progress = createContentProgress({ fromCurrentStart: true });
+  noteStepIdentity(progress, "step");
+  arrival(progress, "first", "\n", 100, 50); // Deliberately old, undeclared clock API.
+  notePartSnapshot(progress, { part: { id: "first", type: "text", text: "" }, final: true });
+  arrival(progress, "body", "h", 10667.61, 10617.61);
+  arrival(progress, "body", "ello", 10924, 10874);
+  notePartSnapshot(progress, { part: { id: "body", type: "text", text: "hello" }, final: true });
+  const speed = measured(record(100), progress);
+  assert.equal(speed.generation?.durationMs, 10824);
+  assert.equal(speed.generation?.generatedTokens, 100 * (5 / 6));
+  assert.equal(speed.generation?.observationQuality, "standard");
+  assert.equal(speed.generationEvidence?.firstReceiveMono, 50);
+  assert.equal(selectSpeedMeasurement({ ...record(), speed }).available, true);
 });
 
 test("receive-mono span survives backwards wall clock jumps and ignores part/Thinking/step boundaries", () => {

@@ -10,8 +10,9 @@ import { createElement as _$createElement } from "@opentui/solid";
 /** @jsxImportSource @opentui/solid */
 
 import { readFile } from "node:fs/promises";
+import { watch, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import { createBindingLookup } from "@opencode-ai/plugin/tui";
 import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calculateSpeedStats, calibrateResponseSamples, bytesToTokens, durationOf, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, measureRollingTokenRate, timeToFirstToken, utf8ByteLength } from "./core.js";
@@ -19,16 +20,22 @@ import { replayActivity, resolveRootSessionID } from "./activity.js";
 import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, parseModelDelta, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 import { getSessionAverageSummary } from "./statistics.js";
 import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteContentArrival, noteStepIdentity, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
-import { DEFAULT_MAX_RECORDS, readHistoryFile } from "./storage.js";
+import { RECEIVE_CLOCK_RESOLUTION_MS } from "./statistics.js";
+import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, isSessionScopeExcluded, mergeScopeEvidence } from "./scope.js";
+import { DEFAULT_MAX_RECORDS, readHistoryFile, filterHistoryRecords } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
-import { TOTALS_VERSION, projectTotalsGenerationBasis, resolveTotalsPath } from "./totals-storage.js";
+import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "./totals-storage.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
 const COMMAND_NAME = "oc-tps.history";
 export const DETAILS_COMMAND_NAME = "oc-tps.details";
 const SPARK_CHARS = ".:-=+#";
+const RECEIVE_CLOCK = Object.freeze({
+  clockSource: "performance.now",
+  clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS
+});
 const recordQualityByObject = new WeakMap();
 const observationRuntimes = new WeakMap();
 function observationRuntime(store) {
@@ -54,10 +61,102 @@ function knownNonAssistant(store, messageID) {
   const role = observationRuntime(store).metadata.roles.get(messageID);
   return role !== undefined && role !== "assistant";
 }
+const scopeSnapshots = new WeakMap();
+function scopedLedger(store) {
+  const cached = scopeSnapshots.get(store);
+  if (cached?.ledger === store.totalsLedger && cached.registry === store.sourceScopes && cached.revision === store.sourceScopes.revision && cached.records === store.records && cached.disk === store.diskRecords) return cached.ledgerView;
+  const scopes = {
+    ...collectSessionScopeEvidence([...store.diskRecords, ...store.records], store.totalsLedger.sessionScopes)
+  };
+  for (const [id, proof] of Object.entries(store.sourceScopes.serialize())) scopes[id] = mergeScopeEvidence(scopes[id], proof);
+  const ledgerView = {
+    ...store.totalsLedger,
+    sessionScopes: scopes
+  };
+  // Remove only positively excluded reversible contributions, never raw facts.
+  for (const [id, proof] of store.messageScopes) {
+    const contribution = Object.prototype.hasOwnProperty.call(ledgerView.open, id) ? ledgerView.open[id] : ledgerView.settled[id];
+    if (!contribution || contribution === true || contribution.excluded) continue;
+    const direct = ledgerView.sessions[contribution.sessionID];
+    if (!direct) continue;
+    ledgerView.sessions = {
+      ...ledgerView.sessions,
+      [contribution.sessionID]: cloneDirectTotals(direct)
+    };
+    subtractDirect(ledgerView.sessions[contribution.sessionID], contribution.tokens, contribution.cost, contribution.speed);
+    if (ledgerView.open[id]) ledgerView.open = {
+      ...ledgerView.open,
+      [id]: {
+        ...contribution,
+        excluded: proof
+      }
+    };else ledgerView.settled = {
+      ...ledgerView.settled,
+      [id]: {
+        ...contribution,
+        excluded: proof
+      }
+    };
+  }
+  scopeSnapshots.set(store, {
+    ledger: store.totalsLedger,
+    registry: store.sourceScopes,
+    revision: store.sourceScopes.revision,
+    records: store.records,
+    disk: store.diskRecords,
+    ledgerView
+  });
+  return ledgerView;
+}
+function scopeEligible(store, sessionID, messageID) {
+  const ledger = scopedLedger(store);
+  return !(messageID && getExcludedMessageIDs(ledger).has(messageID)) && isMeasurementScopeEligible({
+    sessionID,
+    scope: messageID ? store.messageScopes.get(messageID) : undefined
+  }, ledger.sessionScopes, store.sessionParents);
+}
+function scopedRecords(store, records) {
+  return filterHistoryRecords(records.map(record => {
+    const proof = store.messageScopes.get(record.messageID);
+    return proof ? {
+      ...record,
+      scope: mergeScopeEvidence(record.scope, proof)
+    } : record;
+  }), scopedLedger(store).sessionScopes, store.sessionParents, getExcludedMessageIDs(scopedLedger(store)));
+}
+function observeAssistantScope(store, sessionID, messageID, info) {
+  const previousRevision = store.sourceScopes.revision;
+  const proof = store.sourceScopes.observeMessageMetadata(sessionID, info);
+  if (proof.sourceScope === "magic-message" || proof.sourceScope === "magic-session") {
+    store.messageScopes.set(messageID, mergeScopeEvidence(store.messageScopes.get(messageID), proof));
+    scopeSnapshots.delete(store);
+  }
+  if (previousRevision !== store.sourceScopes.revision && store.sourceScopes.isExcluded(sessionID) || !scopeEligible(store, sessionID, messageID)) {
+    refreshScopeProjection(store);
+  }
+  return proof;
+}
+function refreshScopeProjection(store) {
+  store.records = scopedRecords(store, store.records);
+  store.activityReplay = replayActivity(store.activityEvents, {
+    sessionScopes: scopedLedger(store).sessionScopes,
+    parentBySessionID: store.sessionParents
+  });
+  for (const state of [...store.active.values()]) if (!scopeEligible(store, state.sessionID, state.messageID)) {
+    finalizeResponse(store, state.messageID, state.sessionID, state.responseEpoch, {
+      authoritative: true
+    });
+  }
+  for (const [id, last] of store.lastCompletedBySession) if (!scopeEligible(store, id, last.record.messageID)) store.lastCompletedBySession.delete(id);
+  for (const run of store.taskRuns.values()) for (const id of run.activeSessions) if (!scopeEligible(store, id)) run.activeSessions.delete(id);
+  store.bump();
+}
 export function recordTuiPartMetadata(store, properties, event = {}, receivedAt = Date.now()) {
   const observations = observationRuntime(store);
   const part = asRecord(properties.part);
   const messageID = readString(part?.messageID);
+  const sessionID = readString(part?.sessionID) ?? (messageID ? store.active.get(messageID)?.sessionID : undefined);
+  if (sessionID && !scopeEligible(store, sessionID, messageID)) return;
   const active = messageID ? store.active.get(messageID) : undefined;
   if (active && part?.sessionID !== undefined && part.sessionID !== active.sessionID) return;
   cachePartSnapshot(observations.metadata, properties);
@@ -298,7 +397,7 @@ function modelName(value) {
   const direct = readString(value.model);
   if (direct) return direct;
   const model = asRecord(value.model);
-  return readStringFrom([model, value], ["modelID", "modelId", "id", "name"]);
+  return readStringFrom([model], ["modelID", "modelId", "id", "name"]) ?? readStringFrom([value], ["modelID", "modelId"]);
 }
 function tokenFields(value) {
   const input = asRecord(value);
@@ -728,19 +827,59 @@ function getOrCreateActiveState(active, messageID, sessionID, timestamp) {
   const direct = messageID ? active.get(messageID) : undefined;
   const pendingID = pendingKey(sessionID);
   const pending = active.get(pendingID);
-  const state = direct ?? pending ?? createActiveState(messageID ?? pendingID, sessionID, timestamp);
+  const ownedPending = pending?.ownerMessageID === messageID ? pending : undefined;
+  const state = direct ?? ownedPending ?? createActiveState(messageID ?? pendingID, sessionID, timestamp);
+  if (direct && ownedPending && direct !== ownedPending && direct.responseEpoch === ownedPending.responseEpoch) {
+    direct.progress = mergeContentProgress(direct.progress, ownedPending.progress);
+    direct.fallbackTokens = mergeTokenFields(direct.fallbackTokens, ownedPending.fallbackTokens);
+    for (const source of ["legacy", "v2"]) {
+      direct[source].hasData ||= ownedPending[source].hasData;
+      direct[source].samples.push(...ownedPending[source].samples);
+    }
+  }
   if (messageID) state.messageID = messageID;
-  if (messageID && pending && state === pending) active.delete(pendingID);
+  if (messageID && ownedPending) active.delete(pendingID);
   return state;
 }
 export function takeActiveState(active, messageID, sessionID) {
   const direct = active.get(messageID);
   const pendingID = pendingKey(sessionID);
-  const state = direct ?? active.get(pendingID);
+  const pending = active.get(pendingID);
+  const state = direct ?? (pending?.ownerMessageID === messageID ? pending : undefined);
   if (!state || state.sessionID !== sessionID) return undefined;
   active.delete(messageID);
-  if (!direct) active.delete(pendingID);
+  if (pending?.ownerMessageID === messageID && (state.responseEpoch === undefined || pending.responseEpoch === state.responseEpoch)) active.delete(pendingID);
   state.messageID = messageID;
+  return state;
+}
+function ownedMessageID(store, sessionID) {
+  const id = store.sessionRuntime.get(sessionID)?.activeMessageID;
+  return id && observationRuntime(store).liveAssistantMessages.has(id) && !knownCompletedMessage(store, id) ? id : undefined;
+}
+
+/** Completion is a lifecycle fact, independent of whether its usage correction wins. */
+export function finalizeResponse(store, messageID, sessionID, epoch, completionFact) {
+  if (!completionFact.authoritative) return undefined;
+  const runtime = store.sessionRuntime.get(sessionID);
+  const direct = store.active.get(messageID);
+  if (direct && (direct.sessionID !== sessionID || epoch !== undefined && direct.responseEpoch !== epoch)) return undefined;
+  const pendingID = pendingKey(sessionID);
+  const pending = store.active.get(pendingID);
+  const ownedPending = pending?.sessionID === sessionID && pending.ownerMessageID === messageID && (epoch === undefined || pending.responseEpoch === epoch) ? pending : undefined;
+  const state = direct ?? ownedPending;
+  if (direct && ownedPending && direct !== ownedPending && direct.responseEpoch === ownedPending.responseEpoch) {
+    getOrCreateActiveState(store.active, messageID, sessionID, direct.startedAt);
+  }
+  if (state) state.messageID = messageID;
+  const sameCurrent = runtime?.activeMessageID === messageID && (epoch === undefined || runtime.runEpoch === epoch);
+  if (state) store.active.delete(messageID);
+  if (pending?.sessionID === sessionID && (pending.ownerMessageID === messageID || sameCurrent && pending.ownerMessageID === undefined) && (epoch === undefined || pending.responseEpoch === undefined || pending.responseEpoch === epoch)) store.active.delete(pendingID);
+  if (sameCurrent) runtime.activeMessageID = undefined;
+  store.completedMessageIDs.add(messageID);
+  const observations = observationRuntime(store);
+  observations.metadata.completed.add(messageID);
+  observations.liveAssistantMessages.delete(messageID);
+  if (state || sameCurrent || pending && !store.active.has(pendingID)) store.bump();
   return state;
 }
 export function selectedSamples(state) {
@@ -1014,7 +1153,8 @@ export function makeLastCompletedSnapshot(record, runEpoch = 0, _estimated = fal
     runEpoch,
     estimated: selected.estimated,
     available: selected.available,
-    basis: selected.basis
+    basis: selected.basis,
+    observationQuality: selected.measurement?.observationQuality
   };
 }
 function commitRecord(store, record, markCompleted) {
@@ -1041,6 +1181,7 @@ function commitRecord(store, record, markCompleted) {
   if (previousSnapshot === undefined || previousSnapshot.record.messageID === effectiveRecord.messageID || contributionEpoch > previousSnapshot.runEpoch || contributionEpoch === previousSnapshot.runEpoch && recordCompletedAt(effectiveRecord) >= recordCompletedAt(previousSnapshot.record)) {
     store.lastCompletedBySession.set(effectiveRecord.sessionID, snapshot);
   }
+  store.bump();
 }
 function parentSessionID(api, sessionID, info, store) {
   const explicit = readStringFrom([info], ["parentSessionID", "parentSessionId"]);
@@ -1270,7 +1411,10 @@ function migrateTaskWallRuns(store, rootSessionID) {
 function rememberSessionParent(store, sessionID, parentID) {
   if (!sessionID || !parentID || sessionID === parentID) return false;
   const previous = store.sessionParents.get(sessionID);
-  if (previous !== parentID) store.sessionParents.set(sessionID, parentID);
+  store.sourceScopes.observeSessionMetadata(sessionID, {
+    parentID
+  });
+  if (previous !== parentID) store.sessionParents = new Map(store.sessionParents).set(sessionID, parentID);
   const repaired = repairKnownParents(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
   const migrated = migrateTaskWallRuns(store, rootSessionID);
@@ -1298,11 +1442,25 @@ export function cacheSessionParentFromEvent(store, input) {
   if (type !== "session.created" && type !== "session.updated") return false;
   const properties = eventProperties(event);
   const sessionID = readSessionID(properties, event);
+  if (!sessionID) return false;
+  const before = store.sourceScopes.revision;
+  store.sourceScopes.observeSessionMetadata(sessionID, eventInfo(properties, event) ?? asRecord(properties.session) ?? properties);
   const parentID = sessionParentFromEvent(type, properties, event);
-  if (!sessionID || !parentID) return false;
-  return rememberSessionParent(store, sessionID, parentID);
+  const mapped = parentID ? rememberSessionParent(store, sessionID, parentID) : false;
+  if (store.sourceScopes.revision !== before) {
+    refreshScopeProjection(store);
+  }
+  return mapped || store.sourceScopes.revision !== before;
 }
 function rootSessionIDFor(store, api, sessionID, info) {
+  try {
+    const cached = api.state.session.get(sessionID);
+    if (cached) {
+      const previous = store.sourceScopes.revision;
+      store.sourceScopes.observeSessionMetadata(sessionID, cached);
+      if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
+    }
+  } catch {/* SDK state may not be ready; unknown is not exclusion evidence. */}
   const parent = parentSessionID(api, sessionID, info, store);
   if (parent) rememberSessionParent(store, sessionID, parent);
   const rootSessionID = knownRootSessionID(store, sessionID);
@@ -1332,22 +1490,50 @@ function findTaskWallRun(store, rootSessionID, sessionID) {
   if (direct) return direct;
   return taskWallRunsForActivityRoot(store, rootSessionID).find(run => run.rootSessionID === sessionID || run.participantSessions.has(sessionID));
 }
+const taskDisplaySnapshots = new WeakMap();
+function taskDisplayIntervals(store, run, now) {
+  const sources = [run.lifecycleHistory, run.lifecycleEvents, run.pendingLifecycleEvents, run.lastRunLifecycleEvents];
+  let cached = taskDisplaySnapshots.get(run);
+  const unchanged = cached?.store === store && cached.scopeRevision === store.sourceScopes.revision && cached.ledger === store.totalsLedger && cached.parents === store.sessionParents && cached.phase === run.phase && sources.every((source, index) => source === cached.sources[index] && source.size === cached.entries[index].length && cached.entries[index].every(([id, events]) => source.get(id) === events));
+  if (!unchanged) {
+    // Lifecycle arrays are replaced, not mutated, by recordLifecycleFact. Replay
+    // their closed facts once; a timer tick only extends the current open tail.
+    const history = new Map([...completeLifecycleHistoryForRun(run)].filter(([id]) => scopeEligible(store, id)));
+    const latest = [...history.values()].flatMap(events => events.at(-1) ? [events.at(-1).timestamp] : []);
+    const boundary = latest.length ? Math.max(...latest) : undefined;
+    cached = {
+      store,
+      scopeRevision: store.sourceScopes.revision,
+      ledger: store.totalsLedger,
+      parents: store.sessionParents,
+      phase: run.phase,
+      sources,
+      entries: sources.map(source => [...source]),
+      history,
+      intervals: lifecycleIntervals(history),
+      boundary,
+      open: run.phase === "active" && [...history.values()].some(events => activeTaskSessionState(events.at(-1)?.state))
+    };
+    taskDisplaySnapshots.set(run, cached);
+  }
+  if (!cached.history.size) return run.phase === "active" ? cloneIntervals(run.carriedIntervals) : [...run.lastRunIntervals, ...run.carriedIntervals];
+  const boundary = cached.boundary;
+  if (run.phase === "active" && boundary !== undefined && now < boundary) return lifecycleIntervals(cached.history, now);
+  return cached.open && boundary !== undefined && now > boundary ? [...cached.intervals, {
+    start: boundary,
+    end: now
+  }] : cached.intervals;
+}
 export function taskWallTimeForSession(store, sessionID, now = Date.now()) {
-  if (!sessionID) return undefined;
+  if (!sessionID || !scopeEligible(store, sessionID)) return undefined;
   const rootSessionID = activityRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
   const runs = taskWallRunsForActivityRoot(store, rootSessionID);
   const liveIntervals = [];
   let hasCompletedLiveActivity = false;
   for (const run of runs) {
-    if (run.phase === "active") {
-      rebuildActiveIntervals(run, now);
-      liveIntervals.push(...run.activeIntervals);
-      hasCompletedLiveActivity = run.lifecycleEvents.size > 0 || run.carriedIntervals.length > 0;
-    } else {
-      liveIntervals.push(...run.lastRunIntervals, ...run.carriedIntervals);
-      hasCompletedLiveActivity = run.lastRunWallTime !== undefined || run.lastRunLifecycleEvents.size > 0 || run.lastRunIntervals.length > 0 || run.carriedIntervals.length > 0;
-    }
+    liveIntervals.push(...taskDisplayIntervals(store, run, now));
+    hasCompletedLiveActivity ||= run.lifecycleEvents.size > 0 || run.lastRunWallTime !== undefined || run.lastRunLifecycleEvents.size > 0 || run.lastRunIntervals.length > 0 || run.carriedIntervals.length > 0;
   }
   const persistedIntervals = persistedActivityIntervalsForRoot(store.activityReplay, rootSessionID, store.sessionParents);
   const intervals = mergeTaskActivityIntervals(store.activityReplay, sessionID, liveIntervals, store.sessionParents);
@@ -1357,9 +1543,9 @@ export function taskWallTimeForSession(store, sessionID, now = Date.now()) {
   return undefined;
 }
 export function hasLiveTaskWallActivity(store) {
-  if (store.active.size > 0) return true;
+  for (const state of store.active.values()) if (observationRuntime(store).liveAssistantMessages.has(state.messageID) && !knownCompletedMessage(store, state.messageID) && scopeEligible(store, state.sessionID, state.messageID)) return true;
   for (const run of store.taskRuns.values()) {
-    if (run.phase === "active") return true;
+    if (run.phase === "active" && [...run.activeSessions].some(id => scopeEligible(store, id))) return true;
   }
   return false;
 }
@@ -1423,7 +1609,7 @@ export function noteTaskRecord(store, api, record) {
   const summary = noteTaskRunRecord(run, record.sessionID, record.time.start, record.time.completed);
   if (summary) store.bump();
 }
-export function recordDelta(store, properties, event, stream, _explicitKind, bytesPerToken, receivedAt = Date.now(), receivedMono = performance.now()) {
+export function recordDelta(store, properties, event, stream, _explicitKind, bytesPerToken, receivedAt = Date.now(), receivedMono = performance.now(), clock) {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
   if (isReplayEvent(event, properties)) {
@@ -1433,17 +1619,22 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
   }
   const parentID = sessionParentFromEvent("message.part.delta", properties, event);
   if (parentID) rememberSessionParent(store, sessionID, parentID);
-  const messageID = readMessageID(properties);
+  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
+  if (!scopeEligible(store, sessionID, messageID)) return;
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const delta = readDelta(properties, event);
   if (!delta) return;
   const timestamp = receivedAt;
-  const existingState = (messageID ? store.active.get(messageID) : undefined) ?? store.active.get(pendingKey(sessionID));
+  const pending = store.active.get(pendingKey(sessionID));
+  const existingState = messageID ? store.active.get(messageID) ?? (pending?.ownerMessageID === messageID ? pending : undefined) : pending;
   if (existingState && existingState.sessionID !== sessionID) return;
   const progress = existingState?.progress ?? cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
+  // Losing compatibility streams must not mutate hashes, timing or sticky taints.
+  const selected = existingState?.selectedSource ?? progress.selectedStream;
+  if (selected !== undefined && selected !== stream) return;
   const parsed = parseModelDelta(progress, properties, event, stream, delta);
   if (!parsed) return;
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID) ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
   const state = existingState ?? getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.progress = progress;
   bindTuiPendingTaints(store, state);
@@ -1461,7 +1652,7 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
     receivedAt,
     receivedMono,
     stream
-  });
+  }, clock);
   const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
   const sample = {
     timestamp,
@@ -1470,14 +1661,6 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
     bytes,
     kind: parsed.kind
   };
-  if (existingState?.selectedSource !== undefined && existingState.selectedSource !== stream) {
-    existingState[stream].hasData = true;
-    existingState[stream].samples.push(sample);
-    existingState[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
-    if (messageID) runtime.activeMessageID = messageID;
-    store.bump();
-    return;
-  }
   if (state.sessionID !== sessionID) return;
   state.selectedSource = lockStreamSource(state.selectedSource, stream);
   runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined ? timestamp : Math.min(runtime.runFirstTokenAt, timestamp);
@@ -1485,17 +1668,20 @@ export function recordDelta(store, properties, event, stream, _explicitKind, byt
   state[stream].hasData = true;
   state[stream].samples.push(sample);
   state[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
-  store.active.set(messageID ?? pendingKey(sessionID), state);
+  state.responseEpoch ??= runtime.runEpoch;
+  state.ownerMessageID ??= messageID;
+  store.active.set(state.messageID, state);
   store.bump();
 }
 export function recordStepStarted(store, properties, event) {
   if (isReplayEvent(event, properties)) return;
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
-  const messageID = readMessageID(properties);
+  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
+  if (!scopeEligible(store, sessionID, messageID)) return;
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const timestamp = eventTimestamp(event, properties);
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID) ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   state.startedAt = Math.min(state.startedAt, timestamp);
   state.model = state.model ?? modelName(properties);
@@ -1503,17 +1689,20 @@ export function recordStepStarted(store, properties, event) {
   noteStepIdentity(state.progress, stepIdentity(properties));
   bindTuiPendingTaints(store, state);
   if (messageID) runtime.activeMessageID = messageID;
-  store.active.set(messageID ?? pendingKey(sessionID), state);
+  state.responseEpoch ??= runtime.runEpoch;
+  state.ownerMessageID ??= messageID;
+  store.active.set(state.messageID, state);
   store.bump();
 }
 export function recordStepFallback(store, properties, event) {
   if (isReplayEvent(event, properties)) return;
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return;
-  const messageID = readMessageID(properties);
+  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
+  if (!scopeEligible(store, sessionID, messageID)) return;
   if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
   const timestamp = eventTimestamp(event, properties);
-  const runtime = ensureSessionRun(store, sessionID, timestamp);
+  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID) ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
   const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
   const info = eventInfo(properties, event);
   state.fallbackTokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
@@ -1523,7 +1712,9 @@ export function recordStepFallback(store, properties, event) {
   state.model = state.model ?? modelName(properties);
   state.cost = readNumber(info?.cost ?? properties.cost) ?? state.cost;
   if (messageID) runtime.activeMessageID = messageID;
-  store.active.set(messageID ?? pendingKey(sessionID), state);
+  state.responseEpoch ??= runtime.runEpoch;
+  state.ownerMessageID ??= messageID;
+  store.active.set(state.messageID, state);
   store.bump();
 }
 function preferredUpdateLayer(candidate, existing) {
@@ -1547,9 +1738,9 @@ function preferredUpdateLayer(candidate, existing) {
   return next ? candidate : existing;
 }
 function baseHistoryRecords(store) {
-  if (store.diskRecords.length > 0 || store.records.length === 0) return store.diskRecords;
+  if (store.diskRecords.length > 0 || store.records.length === 0) return scopedRecords(store, store.diskRecords);
   const optimisticIDs = new Set(store.optimistic.keys());
-  return store.records.filter(record => !optimisticIDs.has(record.messageID));
+  return scopedRecords(store, store.records.filter(record => !optimisticIDs.has(record.messageID)));
 }
 function preferredHistoryLayer(candidate, existing) {
   const authoritative = preferredUpdateLayer(candidate, existing);
@@ -1635,6 +1826,14 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
   const messageID = readMessageID(properties, info);
   const sessionID = readStringFrom([info, properties, event], ["sessionID", "sessionId", "session.id"]);
   if (!messageID || !sessionID) return false;
+  rootSessionIDFor(store, api, sessionID);
+  observeAssistantScope(store, sessionID, messageID, info);
+  if (!scopeEligible(store, sessionID, messageID)) {
+    finalizeResponse(store, messageID, sessionID, store.active.get(messageID)?.responseEpoch, {
+      authoritative: true
+    });
+    return false;
+  }
   const observations = observationRuntime(store);
   recordTuiObservationLifecycle(store, "message.updated", properties, event, receivedAt);
   if (typeof info.role === "string") observations.metadata.roles.set(messageID, info.role);
@@ -1658,10 +1857,14 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     observations.liveAssistantMessages.add(messageID);
     const runtime = ensureSessionRun(store, sessionID, timestamp);
     const state = getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
+    state.responseEpoch = runtime.runEpoch;
+    state.ownerMessageID = messageID;
     state.startedAt = Math.min(state.startedAt, created);
     if (state.observedFromStart === undefined) {
       const cached = cachedContentProgress(observations.metadata, messageID);
-      state.observedFromStart = !(existing?.legacy.hasData || existing?.v2.hasData) && ![...cached.parts.values()].some(part => part.snapshotBytes > 0 || part.deltaBytes > 0);
+      const usage = tokenFields(info.tokens);
+      const alreadyGenerating = (usage.output ?? 0) > 0 || (usage.reasoning ?? 0) > 0 || infoTimeValue(info, ["firstToken", "firstContent", "firstResponse"]) !== undefined || ["in_progress", "in-progress", "recovering", "recovered"].includes(readString(info.status) ?? "");
+      state.observedFromStart = !alreadyGenerating && !(existing?.legacy.hasData || existing?.v2.hasData) && ![...cached.parts.values()].some(part => part.snapshotBytes > 0 || part.deltaBytes > 0);
       state.progress = mergeContentProgress(createContentProgress({
         fromCurrentStart: state.observedFromStart
       }), state.progress ?? cached);
@@ -1678,6 +1881,10 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     return false;
   }
   if (isReplayEvent(event, properties)) return false;
+  const finalized = finalizeResponse(store, messageID, sessionID, store.active.get(messageID)?.responseEpoch, {
+    completedAt: infoTimeValue(info, ["completed", "end"]),
+    authoritative: true
+  });
   const previous = previousTuiRecord(store, messageID);
   const openSnapshot = store.totalsLedger.open[messageID];
   const snapshot = openSnapshot ?? store.totalsLedger.settled[messageID];
@@ -1711,13 +1918,13 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     store.active.delete(messageID);
     return false;
   }
-  const pendingState = store.active.get(messageID) ?? store.active.get(pendingKey(sessionID));
+  const pendingState = finalized;
   const candidateTokens = makeTokens(info, pendingState, bytesPerToken);
   const exactFields = tokenFields(info.tokens);
   if (prior && (prior.quality ?? "exact") === "exact" && prior.tokens.reasoning > 0 && exactFields.reasoning === undefined) return false;
   const quality = exactFields.output !== undefined && exactFields.input !== undefined && (exactFields.reasoning !== undefined || candidateTokens.reasoning === 0) ? "exact" : "provisional";
   if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") return false;
-  const state = takeActiveState(store.active, messageID, sessionID);
+  const state = finalized;
   const tokens = makeTokens(info, state, bytesPerToken);
   const record = makeHistoryRecord({
     messageID,
@@ -1849,14 +2056,17 @@ function sessionLifecycleFactBelongsToCurrentEpoch(runtime, timestamp) {
   return previousCompletion === undefined || timestamp >= previousCompletion;
 }
 export function handleSessionLifecycle(store, api, type, properties, event, bytesPerToken) {
-  recordTuiObservationLifecycle(store, type, properties, event);
   const sessionID = readSessionID(properties, event);
+  if (!sessionID || !scopeEligible(store, sessionID) || isReplayEvent(event, properties)) return false;
+  recordTuiObservationLifecycle(store, type, properties, event);
   const status = sessionRunStatus(type, properties, event);
   if (!sessionID || status === undefined) return false;
   const timestamp = eventTimestamp(event, properties);
+  if (status !== "idle" && timestamp < observationRuntime(store).observedSince) return false;
   const eventParent = sessionParentFromEvent(type, properties, event);
   if (eventParent) rememberSessionParent(store, sessionID, eventParent);
   const rootSessionID = rootSessionIDFor(store, api, sessionID);
+  if (!scopeEligible(store, sessionID)) return false;
   const taskRun = status === "idle" ? findTaskWallRun(store, rootSessionID, sessionID) ?? getTaskWallRun(store, rootSessionID) : getTaskWallRun(store, rootSessionID);
   if (status === "idle") {
     const historyBefore = taskRun ? lifecycleHistorySignature(taskRun) : undefined;
@@ -1929,6 +2139,11 @@ function removeOptimisticRecord(store, messageID) {
 }
 export function hydrateHistoryState(store, diskRecords) {
   for (const record of diskRecords) {
+    if (record.time.completed !== undefined && record.quality !== "provisional") finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch, {
+      completedAt: record.time.completed,
+      authoritative: true
+    });
+    if (!scopeEligible(store, record.sessionID, record.messageID) || !isMeasurementScopeEligible(record, scopedLedger(store).sessionScopes, store.sessionParents) || getExcludedMessageIDs(scopedLedger(store)).has(record.messageID)) continue;
     const overlay = store.optimistic.get(record.messageID);
     let selected = record;
     if (overlay) {
@@ -1981,7 +2196,19 @@ export async function reloadHistory(store, api, path, totalsPath, maxRecords, ge
     warnWithToast(api, "history read failed", error);
     return;
   }
-  if (store.disposed || generation !== store.historyGeneration) return;
+  if (store.disposed) return;
+  // Completion ownership is independent of the usage snapshot's generation.
+  // Once disk supplied an authoritative same-ID completion, late content must
+  // not revive it while the latest history/totals read is still draining.
+  for (const record of diskRecords) {
+    if (record.time.completed !== undefined && record.quality !== "provisional") {
+      finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch, {
+        completedAt: record.time.completed,
+        authoritative: true
+      });
+    }
+  }
+  if (generation !== store.historyGeneration) return;
   let totalsLedger;
   try {
     totalsLedger = await readTotalsSnapshot(totalsPath);
@@ -1992,6 +2219,7 @@ export async function reloadHistory(store, api, path, totalsPath, maxRecords, ge
   if (store.disposed || generation !== store.historyGeneration) return;
   if (totalsLedger) store.totalsLedger = totalsLedger;
   store.diskRecords = diskRecords.map(record => withCanonicalLedgerSpeed(store.totalsLedger, record));
+  store.sourceScopes = createScopeRegistry(scopedLedger(store).sessionScopes);
   for (const [id, record] of store.optimistic) {
     store.optimistic.set(id, withCanonicalLedgerSpeed(store.totalsLedger, record));
   }
@@ -2001,14 +2229,17 @@ export async function reloadHistory(store, api, path, totalsPath, maxRecords, ge
   }
   repairKnownParents(store);
   hydrateHistoryState(store, store.diskRecords);
-  store.records = mergeHistoryLayers(store.diskRecords, store.optimistic, maxRecords, store.optimisticQuality, store.optimisticOrder);
-  store.bump();
+  store.records = scopedRecords(store, mergeHistoryLayers(store.diskRecords, store.optimistic, maxRecords, store.optimisticQuality, store.optimisticOrder));
+  refreshScopeProjection(store);
 }
-async function reloadActivity(store, api, path, generation = store.activityGeneration) {
+export async function reloadActivity(store, api, path, generation = store.activityGeneration) {
   if (store.disposed) return;
   try {
     const activityEvents = await readActivityFile(path);
-    const activityReplay = replayActivity(activityEvents);
+    const activityReplay = replayActivity(activityEvents, {
+      sessionScopes: scopedLedger(store).sessionScopes,
+      parentBySessionID: store.sessionParents
+    });
     if (store.disposed || generation !== store.activityGeneration) return;
     store.activityEvents = activityEvents;
     store.activityReplay = activityReplay;
@@ -2016,13 +2247,39 @@ async function reloadActivity(store, api, path, generation = store.activityGener
     let parentChanged = false;
     for (const [sessionID, parentSessionID] of activityReplay.parentBySessionID) {
       if (!parentSessionID || store.sessionParents.get(sessionID) === parentSessionID) continue;
-      store.sessionParents.set(sessionID, parentSessionID);
+      store.sessionParents = new Map(store.sessionParents).set(sessionID, parentSessionID);
+      store.sourceScopes.observeSessionMetadata(sessionID, {
+        parentID: parentSessionID
+      });
       parentChanged = true;
     }
     if (parentChanged) {
       repairKnownParents(store);
       for (const sessionID of activityReplay.parentBySessionID.keys()) {
         migrateTaskWallRuns(store, activityRootSessionID(store, sessionID));
+      }
+    }
+    // A closed canonical SDK epoch retracts its matching local open overlay.
+    // Old completions cannot close a newer response, tool run or child epoch.
+    for (const participant of activityReplay.participants) {
+      if (!scopeEligible(store, participant.sessionID)) continue;
+      const rootID = activityRootSessionID(store, participant.sessionID);
+      const run = findTaskWallRun(store, rootID, participant.sessionID);
+      if (!run || run.phase !== "active" || run.runStartedAt === undefined) continue;
+      const lastActive = run.lastActivityAt.get(participant.sessionID) ?? run.runStartedAt;
+      for (const instance of participant.instances) {
+        const terminal = instance.events.at(-1);
+        if (!terminal || instance.open || terminal.state === "busy" || terminal.state === "retry" || terminal.timestamp < lastActive || terminal.observedAt < observationRuntime(store).observedSince) continue;
+        if (!instance.events.some(fact => (fact.state === "busy" || fact.state === "retry") && fact.timestamp >= observationRuntime(store).observedSince && fact.timestamp <= lastActive)) continue;
+        const current = latestActive(store, participant.sessionID);
+        if (current && current.startedAt > terminal.timestamp) continue;
+        if (knownToolWaiting(api, store, participant.sessionID)) continue;
+        handleSessionLifecycle(store, api, "session.idle", {
+          sessionID: participant.sessionID
+        }, {
+          type: "session.idle",
+          timestamp: terminal.timestamp
+        }, DEFAULT_BYTES_PER_TOKEN);
       }
     }
     store.bump();
@@ -2081,6 +2338,7 @@ function resolveHistoryPath(api, configuredPath) {
 export function createRuntimeStore(maxRecords, observedSince = Date.now()) {
   return createRoot(disposeSignals => {
     const [revision, setRevision] = createSignal(0);
+    const [clockRevision, setClockRevision] = createSignal(0);
     const store = {
       maxRecords,
       diskRecords: [],
@@ -2094,6 +2352,8 @@ export function createRuntimeStore(maxRecords, observedSince = Date.now()) {
       sessionRuntime: new Map(),
       taskRuns: new Map(),
       sessionParents: new Map(),
+      sourceScopes: createScopeRegistry(),
+      messageScopes: new Map(),
       totalsLedger: emptyTotalsLedger(),
       lastCompletedBySession: new Map(),
       activityEvents: [],
@@ -2102,6 +2362,8 @@ export function createRuntimeStore(maxRecords, observedSince = Date.now()) {
       pulseExpanded: false,
       historyGeneration: 0,
       revision,
+      clockRevision,
+      tick: () => setClockRevision(value => value + 1),
       bump: () => setRevision(value => value + 1),
       disposed: false,
       disposeSignals
@@ -2189,6 +2451,9 @@ export function formatPulseMetrics(tokens, speed, width = Number.POSITIVE_INFINI
   const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactRate(speed)}` : "-- tok/s";
   const timeLabel = taskTimeMs !== undefined && Number.isFinite(taskTimeMs) && taskTimeMs >= 0 ? formatDuration(taskTimeMs).replace(/\s+/g, "") : "--";
   const fields = [`${formatCompactNumber(totalTokens(tokens))} total`, speedLabel, `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`];
+  return wrapMetricFields(fields, width);
+}
+function wrapMetricFields(fields, width) {
   const lines = [];
   for (const field of fields) {
     const previous = lines[lines.length - 1];
@@ -2231,7 +2496,8 @@ export function recordSpeedSummary(record) {
     available: selected.available,
     generated,
     estimated: selected.estimated,
-    basis: selected.basis
+    basis: selected.basis,
+    observationQuality: selected.measurement?.observationQuality
   };
 }
 export function formatResponseTimingDetails(record) {
@@ -2292,7 +2558,7 @@ export function formatHistoryRow(record) {
   const speed = recordSpeedSummary(record);
   const ttft = timeToFirstToken(record);
   const duration = durationOf(record);
-  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(speed.available ? `${speed.estimated ? "~" : ""}${formatCompactNumber(speed.avg)}` : "--", 7), padRight(speed.basis ?? "--", 10), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.max)}` : "--", 7), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.min)}` : "--", 7), padLeft(formatOptionalDuration(ttft), 7), padLeft(formatOptionalDuration(duration), 7), padLeft(formatCost(record.cost), 9), sparkline(record.samples)].join(" ");
+  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(speed.available ? `${speed.estimated ? "~" : ""}${formatCompactNumber(speed.avg)}` : "--", 7), padRight(speed.observationQuality === "short" ? "generation short" : speed.basis ?? "--", 10), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.max)}` : "--", 7), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.min)}` : "--", 7), padLeft(formatOptionalDuration(ttft), 7), padLeft(formatOptionalDuration(duration), 7), padLeft(formatCost(record.cost), 9), sparkline(record.samples)].join(" ");
 }
 function summaryLines(label, tokens, cost, responseCount) {
   return [label, `  Total tokens (input + generated + cache) ${formatCompactNumber(totalTokens(tokens))}`, `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`, `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`, `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`, `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`, `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
@@ -2497,13 +2763,13 @@ function recentRecords(records, sessionID, store) {
 const TOTALS_TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"];
 export function projectSessionTotals(ledger, records, parentBySessionID, sessionID) {
   const projected = projectTotals(ledger, records, parentBySessionID);
-  return rollupSessionTotals(projected.sessions, projected.parents, sessionID);
+  return rollupSessionTotals(projected.sessions, projected.parents, sessionID, ledger.sessionScopes);
 }
 function totalsForSession(store, sessionID) {
   if (!sessionID) return undefined;
   // Detail-window trimming must not discard unconfirmed direct contributions.
   const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
-  return projectSessionTotals(store.totalsLedger, contributions, store.sessionParents, sessionID);
+  return projectSessionTotals(scopedLedger(store), scopedRecords(store, contributions), store.sessionParents, sessionID);
 }
 export function sessionUsageSummary(store, sessionID) {
   return getSessionAverageSummary(totalsForSession(store, sessionID)?.direct ?? zeroDirectTotals());
@@ -2517,16 +2783,22 @@ export function sessionAverageDisplay(summary, isChild = false) {
   return {
     label: isChild ? "Session avg TPS" : "Main avg TPS",
     value: measured.available && measured.rate !== undefined ? `~${formatCompactRate(measured.rate)}` : "--",
-    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls`,
+    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls${measured.shortResponseCount ? ` · ${formatCompactNumber(measured.shortResponseCount)} short (low confidence)` : ""}`,
     ...(!measured.available && measured.coveredResponseCount === 0 && summary.totalResponseCount > 0 ? {
       diagnostic: "No qualified generation timing."
     } : {})
   };
 }
 function averageCoverage(summary, total) {
-  return `Observed usage ${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured`;
+  return `Observed usage ${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured${summary.shortResponseCount ? ` · ${formatCompactNumber(summary.shortResponseCount)} short (low confidence)` : ""}`;
 }
 export function TokenPulseDetails(props) {
+  if (!scopeEligible(props.store, props.sessionID)) return (() => {
+    var _el$12 = _$createElement("text");
+    _$insertNode(_el$12, _$createTextNode(`Maintenance session excluded`));
+    _$effect(_$p => _$setProp(_el$12, "fg", props.api.theme.current.textMuted, _$p));
+    return _el$12;
+  })();
   const [dimensions, setDimensions] = createSignal({
     width: props.api.renderer.width,
     height: props.api.renderer.height
@@ -2585,96 +2857,96 @@ export function TokenPulseDetails(props) {
   };
   const theme = props.api.theme.current;
   return (() => {
-    var _el$12 = _$createElement("box"),
-      _el$13 = _$createElement("text"),
+    var _el$14 = _$createElement("box"),
       _el$15 = _$createElement("text"),
-      _el$16 = _$createElement("scrollbox"),
-      _el$17 = _$createElement("box"),
-      _el$18 = _$createElement("text"),
+      _el$17 = _$createElement("text"),
+      _el$18 = _$createElement("scrollbox"),
+      _el$19 = _$createElement("box"),
       _el$20 = _$createElement("text"),
-      _el$21 = _$createElement("text"),
+      _el$22 = _$createElement("text"),
       _el$23 = _$createElement("text"),
-      _el$24 = _$createElement("text"),
       _el$25 = _$createElement("text"),
       _el$26 = _$createElement("text"),
       _el$27 = _$createElement("text"),
+      _el$28 = _$createElement("text"),
       _el$29 = _$createElement("text"),
       _el$31 = _$createElement("text"),
       _el$33 = _$createElement("text"),
-      _el$34 = _$createElement("text"),
+      _el$35 = _$createElement("text"),
       _el$36 = _$createElement("text"),
       _el$38 = _$createElement("text"),
-      _el$40 = _$createElement("text");
-    _$insertNode(_el$12, _el$13);
-    _$insertNode(_el$12, _el$15);
-    _$insertNode(_el$12, _el$16);
-    _$insertNode(_el$12, _el$40);
-    _$setProp(_el$12, "flexDirection", "column");
-    _$setProp(_el$12, "width", "100%");
-    _$setProp(_el$12, "flexShrink", 0);
-    _$setProp(_el$12, "overflow", "hidden");
-    _$insertNode(_el$13, _$createTextNode(`Token Pulse details`));
-    _$setProp(_el$13, "flexShrink", 0);
+      _el$40 = _$createElement("text"),
+      _el$42 = _$createElement("text");
+    _$insertNode(_el$14, _el$15);
+    _$insertNode(_el$14, _el$17);
+    _$insertNode(_el$14, _el$18);
+    _$insertNode(_el$14, _el$42);
+    _$setProp(_el$14, "flexDirection", "column");
+    _$setProp(_el$14, "width", "100%");
+    _$setProp(_el$14, "flexShrink", 0);
+    _$setProp(_el$14, "overflow", "hidden");
+    _$insertNode(_el$15, _$createTextNode(`Token Pulse details`));
     _$setProp(_el$15, "flexShrink", 0);
-    _$setProp(_el$15, "wrapMode", "word");
-    _$insert(_el$15, () => `Scope ${props.sessionID} + descendants`);
-    _$insert(_el$12, (() => {
+    _$setProp(_el$17, "flexShrink", 0);
+    _$setProp(_el$17, "wrapMode", "word");
+    _$insert(_el$17, () => `Scope ${props.sessionID} + descendants`);
+    _$insert(_el$14, (() => {
       var _c$ = _$memo(() => tree().nodes.length > 1);
       return () => _c$() && (() => {
-        var _el$42 = _$createElement("box"),
-          _el$43 = _$createElement("text"),
-          _el$44 = _$createElement("select"),
-          _el$45 = _$createElement("box"),
-          _el$46 = _$createElement("text"),
+        var _el$44 = _$createElement("box"),
+          _el$45 = _$createElement("text"),
+          _el$46 = _$createElement("select"),
+          _el$47 = _$createElement("box"),
           _el$48 = _$createElement("text"),
           _el$50 = _$createElement("text"),
-          _el$52 = _$createElement("text");
-        _$insertNode(_el$42, _el$43);
-        _$insertNode(_el$42, _el$44);
-        _$insertNode(_el$42, _el$45);
-        _$setProp(_el$42, "flexDirection", "column");
-        _$setProp(_el$42, "flexShrink", 0);
-        _$insert(_el$43, () => `SESSION TREE · ${tree().nodes.length} sessions`);
+          _el$52 = _$createElement("text"),
+          _el$54 = _$createElement("text");
+        _$insertNode(_el$44, _el$45);
+        _$insertNode(_el$44, _el$46);
+        _$insertNode(_el$44, _el$47);
+        _$setProp(_el$44, "flexDirection", "column");
+        _$setProp(_el$44, "flexShrink", 0);
+        _$insert(_el$45, () => `SESSION TREE · ${tree().nodes.length} sessions`);
         _$use(node => {
           selector = node;
           onMount(() => node.focus());
-        }, _el$44);
-        _$setProp(_el$44, "flexShrink", 0);
-        _$setProp(_el$44, "showDescription", false);
-        _$setProp(_el$44, "showScrollIndicator", true);
-        _$setProp(_el$44, "wrapSelection", false);
-        _$setProp(_el$44, "itemSpacing", 0);
-        _$setProp(_el$44, "onChange", (_index, option) => choose(option?.value));
-        _$setProp(_el$44, "onSelect", (_index, option) => {
+        }, _el$46);
+        _$setProp(_el$46, "flexShrink", 0);
+        _$setProp(_el$46, "showDescription", false);
+        _$setProp(_el$46, "showScrollIndicator", true);
+        _$setProp(_el$46, "wrapSelection", false);
+        _$setProp(_el$46, "itemSpacing", 0);
+        _$setProp(_el$46, "onChange", (_index, option) => choose(option?.value));
+        _$setProp(_el$46, "onSelect", (_index, option) => {
           choose(option?.value);
           body?.focus();
         });
-        _$setProp(_el$44, "onKeyDown", key => {
+        _$setProp(_el$46, "onKeyDown", key => {
           if (key.name === "tab") {
             key.preventDefault();
             key.stopPropagation();
             body?.focus();
           }
         });
-        _$insertNode(_el$45, _el$46);
-        _$insertNode(_el$45, _el$48);
-        _$insertNode(_el$45, _el$50);
-        _$insertNode(_el$45, _el$52);
-        _$setProp(_el$45, "flexDirection", "row");
-        _$setProp(_el$45, "height", 1);
-        _$setProp(_el$45, "flexShrink", 0);
-        _$insertNode(_el$46, _$createTextNode(`[prev]`));
-        _$setProp(_el$46, "onMouseDown", () => {
+        _$insertNode(_el$47, _el$48);
+        _$insertNode(_el$47, _el$50);
+        _$insertNode(_el$47, _el$52);
+        _$insertNode(_el$47, _el$54);
+        _$setProp(_el$47, "flexDirection", "row");
+        _$setProp(_el$47, "height", 1);
+        _$setProp(_el$47, "flexShrink", 0);
+        _$insertNode(_el$48, _$createTextNode(`[prev]`));
+        _$setProp(_el$48, "onMouseDown", () => {
           selector?.focus();
           selector?.moveUp();
         });
-        _$insertNode(_el$48, _$createTextNode(` `));
-        _$insertNode(_el$50, _$createTextNode(`[next]`));
-        _$setProp(_el$50, "onMouseDown", () => {
+        _$insertNode(_el$50, _$createTextNode(` `));
+        _$insertNode(_el$52, _$createTextNode(`[next]`));
+        _$setProp(_el$52, "onMouseDown", () => {
           selector?.focus();
           selector?.moveDown();
         });
-        _$insertNode(_el$52, _$createTextNode(` · ↑/↓ · Enter/Tab`));
+        _$insertNode(_el$54, _$createTextNode(` · ↑/↓ · Enter/Tab`));
         _$effect(_p$ => {
           var _v$26 = theme.accent,
             _v$27 = Math.min(tree().nodes.length, compact() ? 2 : 3),
@@ -2689,19 +2961,19 @@ export function TokenPulseDetails(props) {
             _v$36 = theme.textMuted,
             _v$37 = theme.accent,
             _v$38 = theme.textMuted;
-          _v$26 !== _p$.e && (_p$.e = _$setProp(_el$43, "fg", _v$26, _p$.e));
-          _v$27 !== _p$.t && (_p$.t = _$setProp(_el$44, "height", _v$27, _p$.t));
-          _v$28 !== _p$.a && (_p$.a = _$setProp(_el$44, "options", _v$28, _p$.a));
-          _v$29 !== _p$.o && (_p$.o = _$setProp(_el$44, "selectedIndex", _v$29, _p$.o));
-          _v$30 !== _p$.i && (_p$.i = _$setProp(_el$44, "textColor", _v$30, _p$.i));
-          _v$31 !== _p$.n && (_p$.n = _$setProp(_el$44, "backgroundColor", _v$31, _p$.n));
-          _v$32 !== _p$.s && (_p$.s = _$setProp(_el$44, "focusedBackgroundColor", _v$32, _p$.s));
-          _v$33 !== _p$.h && (_p$.h = _$setProp(_el$44, "selectedBackgroundColor", _v$33, _p$.h));
-          _v$34 !== _p$.r && (_p$.r = _$setProp(_el$44, "selectedTextColor", _v$34, _p$.r));
-          _v$35 !== _p$.d && (_p$.d = _$setProp(_el$46, "fg", _v$35, _p$.d));
-          _v$36 !== _p$.l && (_p$.l = _$setProp(_el$48, "fg", _v$36, _p$.l));
-          _v$37 !== _p$.u && (_p$.u = _$setProp(_el$50, "fg", _v$37, _p$.u));
-          _v$38 !== _p$.c && (_p$.c = _$setProp(_el$52, "fg", _v$38, _p$.c));
+          _v$26 !== _p$.e && (_p$.e = _$setProp(_el$45, "fg", _v$26, _p$.e));
+          _v$27 !== _p$.t && (_p$.t = _$setProp(_el$46, "height", _v$27, _p$.t));
+          _v$28 !== _p$.a && (_p$.a = _$setProp(_el$46, "options", _v$28, _p$.a));
+          _v$29 !== _p$.o && (_p$.o = _$setProp(_el$46, "selectedIndex", _v$29, _p$.o));
+          _v$30 !== _p$.i && (_p$.i = _$setProp(_el$46, "textColor", _v$30, _p$.i));
+          _v$31 !== _p$.n && (_p$.n = _$setProp(_el$46, "backgroundColor", _v$31, _p$.n));
+          _v$32 !== _p$.s && (_p$.s = _$setProp(_el$46, "focusedBackgroundColor", _v$32, _p$.s));
+          _v$33 !== _p$.h && (_p$.h = _$setProp(_el$46, "selectedBackgroundColor", _v$33, _p$.h));
+          _v$34 !== _p$.r && (_p$.r = _$setProp(_el$46, "selectedTextColor", _v$34, _p$.r));
+          _v$35 !== _p$.d && (_p$.d = _$setProp(_el$48, "fg", _v$35, _p$.d));
+          _v$36 !== _p$.l && (_p$.l = _$setProp(_el$50, "fg", _v$36, _p$.l));
+          _v$37 !== _p$.u && (_p$.u = _$setProp(_el$52, "fg", _v$37, _p$.u));
+          _v$38 !== _p$.c && (_p$.c = _$setProp(_el$54, "fg", _v$38, _p$.c));
           return _p$;
         }, {
           e: undefined,
@@ -2718,165 +2990,171 @@ export function TokenPulseDetails(props) {
           u: undefined,
           c: undefined
         });
-        return _el$42;
+        return _el$44;
       })();
-    })(), _el$16);
-    _$insertNode(_el$16, _el$17);
+    })(), _el$18);
+    _$insertNode(_el$18, _el$19);
     _$use(scroll => {
       body = scroll;
       onMount(() => {
         if (tree().nodes.length === 1) scroll.focus();
       });
-    }, _el$16);
-    _$setProp(_el$16, "flexGrow", 1);
-    _$setProp(_el$16, "flexShrink", 1);
-    _$setProp(_el$16, "minHeight", 0);
-    _$setProp(_el$16, "focusable", true);
-    _$setProp(_el$16, "scrollY", true);
-    _$setProp(_el$16, "scrollX", false);
-    _$setProp(_el$16, "viewportOptions", {
+    }, _el$18);
+    _$setProp(_el$18, "flexGrow", 1);
+    _$setProp(_el$18, "flexShrink", 1);
+    _$setProp(_el$18, "minHeight", 0);
+    _$setProp(_el$18, "focusable", true);
+    _$setProp(_el$18, "scrollY", true);
+    _$setProp(_el$18, "scrollX", false);
+    _$setProp(_el$18, "viewportOptions", {
       minHeight: 0,
       overflow: "hidden"
     });
-    _$setProp(_el$16, "contentOptions", {
+    _$setProp(_el$18, "contentOptions", {
       flexDirection: "column",
       flexShrink: 0
     });
-    _$setProp(_el$16, "onKeyDown", key => {
+    _$setProp(_el$18, "onKeyDown", key => {
       if (key.name === "tab" && selector) {
         key.preventDefault();
         key.stopPropagation();
         selector.focus();
       }
     });
-    _$insertNode(_el$17, _el$18);
-    _$insertNode(_el$17, _el$20);
-    _$insertNode(_el$17, _el$21);
-    _$insertNode(_el$17, _el$23);
-    _$insertNode(_el$17, _el$24);
-    _$insertNode(_el$17, _el$25);
-    _$insertNode(_el$17, _el$26);
-    _$insertNode(_el$17, _el$27);
-    _$insertNode(_el$17, _el$29);
-    _$insertNode(_el$17, _el$31);
-    _$insertNode(_el$17, _el$33);
-    _$insertNode(_el$17, _el$34);
-    _$insertNode(_el$17, _el$36);
-    _$insertNode(_el$17, _el$38);
-    _$setProp(_el$17, "flexDirection", "column");
-    _$setProp(_el$17, "flexShrink", 0);
-    _$setProp(_el$17, "width", "100%");
-    _$insertNode(_el$18, _$createTextNode(`SELECTED SESSION · direct only`));
-    _$setProp(_el$20, "wrapMode", "word");
-    _$insert(_el$20, () => `${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`);
-    _$insert(_el$17, (() => {
+    _$insertNode(_el$19, _el$20);
+    _$insertNode(_el$19, _el$22);
+    _$insertNode(_el$19, _el$23);
+    _$insertNode(_el$19, _el$25);
+    _$insertNode(_el$19, _el$26);
+    _$insertNode(_el$19, _el$27);
+    _$insertNode(_el$19, _el$28);
+    _$insertNode(_el$19, _el$29);
+    _$insertNode(_el$19, _el$31);
+    _$insertNode(_el$19, _el$33);
+    _$insertNode(_el$19, _el$35);
+    _$insertNode(_el$19, _el$36);
+    _$insertNode(_el$19, _el$38);
+    _$insertNode(_el$19, _el$40);
+    _$setProp(_el$19, "flexDirection", "column");
+    _$setProp(_el$19, "flexShrink", 0);
+    _$setProp(_el$19, "width", "100%");
+    _$insertNode(_el$20, _$createTextNode(`SELECTED SESSION · direct only`));
+    _$setProp(_el$22, "wrapMode", "word");
+    _$insert(_el$22, () => `${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`);
+    _$insert(_el$19, (() => {
       var _c$2 = _$memo(() => details().direct.responseCount === 0);
       return () => _c$2() && (() => {
-        var _el$54 = _$createElement("text");
-        _$insertNode(_el$54, _$createTextNode(`No recorded usage for this session`));
-        _$setProp(_el$54, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$54, "fg", theme.textMuted, _$p));
-        return _el$54;
+        var _el$56 = _$createElement("text");
+        _$insertNode(_el$56, _$createTextNode(`No recorded usage for this session`));
+        _$setProp(_el$56, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$56, "fg", theme.textMuted, _$p));
+        return _el$56;
       })();
-    })(), _el$21);
-    _$insertNode(_el$21, _$createTextNode(`SESSION AVERAGES`));
-    _$setProp(_el$23, "wrapMode", "word");
-    _$insert(_el$23, () => `Generation avg TPS  ${formatAverageRate(details().average.generation)}`);
-    _$setProp(_el$24, "wrapMode", "word");
-    _$insert(_el$24, () => averageCoverage(details().average.generation, details().average));
+    })(), _el$23);
+    _$insertNode(_el$23, _$createTextNode(`SESSION AVERAGES`));
     _$setProp(_el$25, "wrapMode", "word");
-    _$insert(_el$25, () => `Response throughput  ${formatAverageRate(details().average.response)}`);
+    _$insert(_el$25, () => `Generation avg TPS  ${formatAverageRate(details().average.generation)}`);
     _$setProp(_el$26, "wrapMode", "word");
-    _$insert(_el$26, () => averageCoverage(details().average.response, details().average));
-    _$insertNode(_el$27, _$createTextNode(`Response time includes TTFT and may include tool waits. Generation TPS requires complete content and at least 1s between observed arrivals.`));
+    _$insert(_el$26, () => averageCoverage(details().average.generation, details().average));
     _$setProp(_el$27, "wrapMode", "word");
-    _$insertNode(_el$29, _$createTextNode(`SESSION USAGE`));
-    _$setProp(_el$29, "paddingTop", 1);
-    _$insert(_el$17, _$createComponent(PulseMetricGrid, {
+    _$insert(_el$27, () => `Response throughput  ${formatAverageRate(details().average.response)}`);
+    _$setProp(_el$28, "wrapMode", "word");
+    _$insert(_el$28, () => averageCoverage(details().average.response, details().average));
+    _$insertNode(_el$29, _$createTextNode(`Response time includes TTFT and may include tool waits. Completed TPS needs complete content and at least 100ms of verified arrival timing. Under 1s is short, low confidence. LIVE and peaks still need 1s.`));
+    _$setProp(_el$29, "wrapMode", "word");
+    _$insertNode(_el$31, _$createTextNode(`SESSION USAGE`));
+    _$setProp(_el$31, "paddingTop", 1);
+    _$insert(_el$19, _$createComponent(PulseMetricGrid, {
       get theme() {
         return props.api.theme;
       },
       get rows() {
         return pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map(metric => [metric]);
       }
-    }), _el$31);
-    _$insertNode(_el$31, _$createTextNode(`LAST RESPONSE`));
-    _$setProp(_el$31, "paddingTop", 1);
-    _$setProp(_el$33, "wrapMode", "word");
-    _$insert(_el$33, (() => {
+    }), _el$33);
+    _$insertNode(_el$33, _$createTextNode(`LAST RESPONSE`));
+    _$setProp(_el$33, "paddingTop", 1);
+    _$setProp(_el$35, "wrapMode", "word");
+    _$insert(_el$35, (() => {
       var _c$3 = _$memo(() => !!details().last);
-      return () => _c$3() ? `${details().lastSpeed.available ? `~${formatCompactRate(details().lastSpeed.avg)} (generation)` : "Generation TPS --"} · TTFT ${formatOptionalDuration(details().last.ttft)} · response time ${formatOptionalDuration(durationOf(details().last.record))}` : "No completed response in the loaded history";
+      return () => _c$3() ? `${details().lastSpeed.available ? `~${formatCompactRate(details().lastSpeed.avg)} (generation)${details().lastSpeed.observationQuality === "short" ? " · short, low confidence" : ""}` : "Generation TPS --"} · TTFT ${formatOptionalDuration(details().last.ttft)} · response time ${formatOptionalDuration(durationOf(details().last.record))}` : "No completed response in the loaded history";
     })());
-    _$insert(_el$17, (() => {
+    _$insert(_el$19, (() => {
       var _c$4 = _$memo(() => !!details().last);
       return () => _c$4() && [(() => {
-        var _el$56 = _$createElement("text");
-        _$setProp(_el$56, "wrapMode", "word");
-        _$insert(_el$56, () => formatResponseThroughput(details().last.record));
-        _$effect(_$p => _$setProp(_el$56, "fg", theme.textMuted, _$p));
-        return _el$56;
-      })(), (() => {
-        var _el$57 = _$createElement("text");
-        _$setProp(_el$57, "wrapMode", "word");
-        _$insert(_el$57, () => formatResponseTimingDetails(details().last.record));
-        _$effect(_$p => _$setProp(_el$57, "fg", theme.textMuted, _$p));
-        return _el$57;
-      })(), (() => {
         var _el$58 = _$createElement("text");
         _$setProp(_el$58, "wrapMode", "word");
-        _$insert(_el$58, () => formatArrivalPeaks(details().last.record));
+        _$insert(_el$58, () => formatResponseThroughput(details().last.record));
         _$effect(_$p => _$setProp(_el$58, "fg", theme.textMuted, _$p));
         return _el$58;
-      })()];
-    })(), _el$34);
-    _$insert(_el$17, (() => {
-      var _c$5 = _$memo(() => !!details().last?.record.model);
-      return () => _c$5() && (() => {
+      })(), (() => {
         var _el$59 = _$createElement("text");
         _$setProp(_el$59, "wrapMode", "word");
-        _$insert(_el$59, () => `Last model: ${details().last.record.model}`);
+        _$insert(_el$59, () => formatResponseTimingDetails(details().last.record));
         _$effect(_$p => _$setProp(_el$59, "fg", theme.textMuted, _$p));
         return _el$59;
-      })();
-    })(), _el$34);
-    _$insert(_el$17, (() => {
-      var _c$6 = _$memo(() => tree().nodes.length > 1);
-      return () => _c$6() ? [(() => {
-        var _el$60 = _$createElement("text");
-        _$insertNode(_el$60, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
-        _$setProp(_el$60, "paddingTop", 1);
-        _$effect(_$p => _$setProp(_el$60, "fg", theme.accent, _$p));
-        return _el$60;
       })(), (() => {
+        var _el$60 = _$createElement("text");
+        _$setProp(_el$60, "wrapMode", "word");
+        _$insert(_el$60, () => formatArrivalPeaks(details().last.record));
+        _$effect(_$p => _$setProp(_el$60, "fg", theme.textMuted, _$p));
+        return _el$60;
+      })(), _$memo(() => _$memo(() => !!!details().lastSpeed?.available)() && (() => {
+        var _el$61 = _$createElement("text");
+        _$setProp(_el$61, "wrapMode", "word");
+        _$insert(_el$61, () => responseMeasurementStatus(details().last.record));
+        _$effect(_$p => _$setProp(_el$61, "fg", theme.textMuted, _$p));
+        return _el$61;
+      })())];
+    })(), _el$36);
+    _$insert(_el$19, (() => {
+      var _c$5 = _$memo(() => !!details().last?.record.model);
+      return () => _c$5() && (() => {
         var _el$62 = _$createElement("text");
-        _$insertNode(_el$62, _$createTextNode(`Measured token/time sums, not wall-clock throughput. Includes every descendant once.`));
         _$setProp(_el$62, "wrapMode", "word");
+        _$insert(_el$62, () => `Last model: ${details().last.record.model}`);
         _$effect(_$p => _$setProp(_el$62, "fg", theme.textMuted, _$p));
         return _el$62;
-      })(), (() => {
-        var _el$64 = _$createElement("text");
-        _$setProp(_el$64, "wrapMode", "word");
-        _$insert(_el$64, () => `Generation avg TPS  ${formatAverageRate(tree().average.generation)}`);
-        _$effect(_$p => _$setProp(_el$64, "fg", theme.text, _$p));
-        return _el$64;
+      })();
+    })(), _el$36);
+    _$insert(_el$19, (() => {
+      var _c$6 = _$memo(() => tree().nodes.length > 1);
+      return () => _c$6() ? [(() => {
+        var _el$63 = _$createElement("text");
+        _$insertNode(_el$63, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
+        _$setProp(_el$63, "paddingTop", 1);
+        _$effect(_$p => _$setProp(_el$63, "fg", theme.accent, _$p));
+        return _el$63;
       })(), (() => {
         var _el$65 = _$createElement("text");
+        _$insertNode(_el$65, _$createTextNode(`Measured token/time sums, not wall-clock throughput. Includes every descendant once.`));
         _$setProp(_el$65, "wrapMode", "word");
-        _$insert(_el$65, () => averageCoverage(tree().average.generation, tree().average));
         _$effect(_$p => _$setProp(_el$65, "fg", theme.textMuted, _$p));
         return _el$65;
       })(), (() => {
-        var _el$66 = _$createElement("text");
-        _$setProp(_el$66, "wrapMode", "word");
-        _$insert(_el$66, () => `Response throughput  ${formatAverageRate(tree().average.response)}`);
-        _$effect(_$p => _$setProp(_el$66, "fg", theme.text, _$p));
-        return _el$66;
-      })(), (() => {
         var _el$67 = _$createElement("text");
         _$setProp(_el$67, "wrapMode", "word");
-        _$insert(_el$67, () => averageCoverage(tree().average.response, tree().average));
-        _$effect(_$p => _$setProp(_el$67, "fg", theme.textMuted, _$p));
+        _$insert(_el$67, () => `Generation avg TPS  ${formatAverageRate(tree().average.generation)}`);
+        _$effect(_$p => _$setProp(_el$67, "fg", theme.text, _$p));
         return _el$67;
+      })(), (() => {
+        var _el$68 = _$createElement("text");
+        _$setProp(_el$68, "wrapMode", "word");
+        _$insert(_el$68, () => averageCoverage(tree().average.generation, tree().average));
+        _$effect(_$p => _$setProp(_el$68, "fg", theme.textMuted, _$p));
+        return _el$68;
+      })(), (() => {
+        var _el$69 = _$createElement("text");
+        _$setProp(_el$69, "wrapMode", "word");
+        _$insert(_el$69, () => `Response throughput  ${formatAverageRate(tree().average.response)}`);
+        _$effect(_$p => _$setProp(_el$69, "fg", theme.text, _$p));
+        return _el$69;
+      })(), (() => {
+        var _el$70 = _$createElement("text");
+        _$setProp(_el$70, "wrapMode", "word");
+        _$insert(_el$70, () => averageCoverage(tree().average.response, tree().average));
+        _$effect(_$p => _$setProp(_el$70, "fg", theme.textMuted, _$p));
+        return _el$70;
       })(), _$createComponent(PulseMetricGrid, {
         get theme() {
           return props.api.theme;
@@ -2885,23 +3163,23 @@ export function TokenPulseDetails(props) {
           return pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map(metric => [metric]);
         }
       })] : (() => {
-        var _el$68 = _$createElement("text");
-        _$insertNode(_el$68, _$createTextNode(`No known subagents in this scope`));
-        _$setProp(_el$68, "paddingTop", 1);
-        _$setProp(_el$68, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$68, "fg", theme.textMuted, _$p));
-        return _el$68;
+        var _el$71 = _$createElement("text");
+        _$insertNode(_el$71, _$createTextNode(`No known subagents in this scope`));
+        _$setProp(_el$71, "paddingTop", 1);
+        _$setProp(_el$71, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$71, "fg", theme.textMuted, _$p));
+        return _el$71;
       })();
-    })(), _el$34);
-    _$insertNode(_el$34, _$createTextNode(`Average = estimated interval tokens / observed time, not an average of call speeds. The first arrival batch is excluded. Coverage counts accepted calls' full output + reasoning usage, not interval tokens.`));
-    _$setProp(_el$34, "paddingTop", 1);
-    _$setProp(_el$34, "wrapMode", "word");
-    _$insertNode(_el$36, _$createTextNode(`incl TPS includes this session + subagents. Older or incomplete observations do not count toward generation speed.`));
+    })(), _el$36);
+    _$insertNode(_el$36, _$createTextNode(`Average = estimated interval tokens / observed time, not an average of call speeds. The first arrival batch is excluded. Coverage counts accepted calls' full output + reasoning usage, not interval tokens.`));
+    _$setProp(_el$36, "paddingTop", 1);
     _$setProp(_el$36, "wrapMode", "word");
-    _$insertNode(_el$38, _$createTextNode(`~ means a host-observed estimate, not provider-internal speed. LIVE and peaks use byte-based windowed event arrivals, not token generation inside the model.`));
+    _$insertNode(_el$38, _$createTextNode(`incl TPS includes this session + subagents. Older or incomplete observations do not count toward generation speed.`));
     _$setProp(_el$38, "wrapMode", "word");
-    _$insertNode(_el$40, _$createTextNode(`esc / ctrl+c to close`));
-    _$setProp(_el$40, "flexShrink", 0);
+    _$insertNode(_el$40, _$createTextNode(`~ means a host-observed estimate, not provider-internal speed. LIVE and peaks use byte-based windowed event arrivals, not token generation inside the model.`));
+    _$setProp(_el$40, "wrapMode", "word");
+    _$insertNode(_el$42, _$createTextNode(`esc / ctrl+c to close`));
+    _$setProp(_el$42, "flexShrink", 0);
     _$effect(_p$ => {
       var _v$6 = dimensions().width < 50 ? 1 : 2,
         _v$7 = compact() ? 0 : 1,
@@ -2925,28 +3203,28 @@ export function TokenPulseDetails(props) {
         _v$23 = theme.textMuted,
         _v$24 = theme.textMuted,
         _v$25 = compact() ? 0 : 1;
-      _v$6 !== _p$.e && (_p$.e = _$setProp(_el$12, "paddingX", _v$6, _p$.e));
-      _v$7 !== _p$.t && (_p$.t = _$setProp(_el$12, "paddingY", _v$7, _p$.t));
-      _v$8 !== _p$.a && (_p$.a = _$setProp(_el$12, "height", _v$8, _p$.a));
-      _v$9 !== _p$.o && (_p$.o = _$setProp(_el$13, "fg", _v$9, _p$.o));
-      _v$0 !== _p$.i && (_p$.i = _$setProp(_el$15, "fg", _v$0, _p$.i));
-      _v$1 !== _p$.n && (_p$.n = _$setProp(_el$16, "paddingTop", _v$1, _p$.n));
-      _v$10 !== _p$.s && (_p$.s = _$setProp(_el$18, "fg", _v$10, _p$.s));
-      _v$11 !== _p$.h && (_p$.h = _$setProp(_el$20, "fg", _v$11, _p$.h));
-      _v$12 !== _p$.r && (_p$.r = _$setProp(_el$21, "fg", _v$12, _p$.r));
-      _v$13 !== _p$.d && (_p$.d = _$setProp(_el$23, "fg", _v$13, _p$.d));
-      _v$14 !== _p$.l && (_p$.l = _$setProp(_el$24, "fg", _v$14, _p$.l));
-      _v$15 !== _p$.u && (_p$.u = _$setProp(_el$25, "fg", _v$15, _p$.u));
-      _v$16 !== _p$.c && (_p$.c = _$setProp(_el$26, "fg", _v$16, _p$.c));
-      _v$17 !== _p$.w && (_p$.w = _$setProp(_el$27, "fg", _v$17, _p$.w));
-      _v$18 !== _p$.m && (_p$.m = _$setProp(_el$29, "fg", _v$18, _p$.m));
-      _v$19 !== _p$.f && (_p$.f = _$setProp(_el$31, "fg", _v$19, _p$.f));
-      _v$20 !== _p$.y && (_p$.y = _$setProp(_el$33, "fg", _v$20, _p$.y));
-      _v$21 !== _p$.g && (_p$.g = _$setProp(_el$34, "fg", _v$21, _p$.g));
-      _v$22 !== _p$.p && (_p$.p = _$setProp(_el$36, "fg", _v$22, _p$.p));
-      _v$23 !== _p$.b && (_p$.b = _$setProp(_el$38, "fg", _v$23, _p$.b));
-      _v$24 !== _p$.T && (_p$.T = _$setProp(_el$40, "fg", _v$24, _p$.T));
-      _v$25 !== _p$.A && (_p$.A = _$setProp(_el$40, "paddingTop", _v$25, _p$.A));
+      _v$6 !== _p$.e && (_p$.e = _$setProp(_el$14, "paddingX", _v$6, _p$.e));
+      _v$7 !== _p$.t && (_p$.t = _$setProp(_el$14, "paddingY", _v$7, _p$.t));
+      _v$8 !== _p$.a && (_p$.a = _$setProp(_el$14, "height", _v$8, _p$.a));
+      _v$9 !== _p$.o && (_p$.o = _$setProp(_el$15, "fg", _v$9, _p$.o));
+      _v$0 !== _p$.i && (_p$.i = _$setProp(_el$17, "fg", _v$0, _p$.i));
+      _v$1 !== _p$.n && (_p$.n = _$setProp(_el$18, "paddingTop", _v$1, _p$.n));
+      _v$10 !== _p$.s && (_p$.s = _$setProp(_el$20, "fg", _v$10, _p$.s));
+      _v$11 !== _p$.h && (_p$.h = _$setProp(_el$22, "fg", _v$11, _p$.h));
+      _v$12 !== _p$.r && (_p$.r = _$setProp(_el$23, "fg", _v$12, _p$.r));
+      _v$13 !== _p$.d && (_p$.d = _$setProp(_el$25, "fg", _v$13, _p$.d));
+      _v$14 !== _p$.l && (_p$.l = _$setProp(_el$26, "fg", _v$14, _p$.l));
+      _v$15 !== _p$.u && (_p$.u = _$setProp(_el$27, "fg", _v$15, _p$.u));
+      _v$16 !== _p$.c && (_p$.c = _$setProp(_el$28, "fg", _v$16, _p$.c));
+      _v$17 !== _p$.w && (_p$.w = _$setProp(_el$29, "fg", _v$17, _p$.w));
+      _v$18 !== _p$.m && (_p$.m = _$setProp(_el$31, "fg", _v$18, _p$.m));
+      _v$19 !== _p$.f && (_p$.f = _$setProp(_el$33, "fg", _v$19, _p$.f));
+      _v$20 !== _p$.y && (_p$.y = _$setProp(_el$35, "fg", _v$20, _p$.y));
+      _v$21 !== _p$.g && (_p$.g = _$setProp(_el$36, "fg", _v$21, _p$.g));
+      _v$22 !== _p$.p && (_p$.p = _$setProp(_el$38, "fg", _v$22, _p$.p));
+      _v$23 !== _p$.b && (_p$.b = _$setProp(_el$40, "fg", _v$23, _p$.b));
+      _v$24 !== _p$.T && (_p$.T = _$setProp(_el$42, "fg", _v$24, _p$.T));
+      _v$25 !== _p$.A && (_p$.A = _$setProp(_el$42, "paddingTop", _v$25, _p$.A));
       return _p$;
     }, {
       e: undefined,
@@ -2972,13 +3250,13 @@ export function TokenPulseDetails(props) {
       T: undefined,
       A: undefined
     });
-    return _el$12;
+    return _el$14;
   })();
 }
 /** Read-only UI selection: keep ledger-only descendants, and visit cycles once. */
 export function buildSessionDetailsTree(store, rootID, parents = store.sessionParents) {
   const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
-  const projected = projectTotals(store.totalsLedger, contributions, parents);
+  const projected = projectTotals(scopedLedger(store), scopedRecords(store, contributions), parents);
   const children = new Map();
   for (const [id, parent] of projected.parents) {
     const siblings = children.get(parent) ?? [];
@@ -2993,6 +3271,7 @@ export function buildSessionDetailsTree(store, rootID, parents = store.sessionPa
   }];
   while (pending.length) {
     const node = pending.pop();
+    if (isSessionScopeExcluded(node.sessionID, scopedLedger(store).sessionScopes, parents)) continue;
     if (visited.has(node.sessionID)) continue;
     visited.add(node.sessionID);
     const direct = Object.prototype.hasOwnProperty.call(projected.sessions, node.sessionID) ? projected.sessions[node.sessionID] : zeroDirectTotals();
@@ -3007,7 +3286,7 @@ export function buildSessionDetailsTree(store, rootID, parents = store.sessionPa
       depth: node.depth + 1
     });
   }
-  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID).including;
+  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID, scopedLedger(store).sessionScopes).including;
   return {
     rootID,
     nodes,
@@ -3045,6 +3324,7 @@ export function createDetailsController(api, store) {
         });
         return undefined;
       }
+      if (!scopeEligible(store, sessionID)) return undefined;
       api.ui.dialog.replace(() => _$createComponent(TokenPulseDetails, {
         api: api,
         store: store,
@@ -3094,15 +3374,27 @@ export function registerTokenPulseCommands(api, store, options, openHistory) {
   return details;
 }
 function projectTotals(ledger, records, parentBySessionID) {
-  const unique = mergeHistoryLayers(records, new Map(), Number.MAX_SAFE_INTEGER);
-  const basis = projectTotalsGenerationBasis({
+  const scope = collectSessionScopeEvidence(records, ledger.sessionScopes);
+  const canonical = {
     ...ledger,
     version: TOTALS_VERSION,
     generationBasisVersion: ledger.generationBasisVersion === 3 ? 3 : undefined,
     settled: ledger.settled ?? {}
+  };
+  const parents = new Map(parentBySessionID); // Shared caches require immutable parent snapshots.
+  const unique = filterHistoryRecords(mergeHistoryLayers(records, new Map(), Number.MAX_SAFE_INTEGER), scope, parents, getExcludedMessageIDs(canonical));
+  const basis = projectTotalsGenerationBasis({
+    ...ledger,
+    version: TOTALS_VERSION,
+    generationBasisVersion: ledger.generationBasisVersion === 3 ? 3 : undefined,
+    settled: ledger.settled ?? {},
+    sessionScopes: scope
   });
   return {
-    sessions: applyWindowAdjustments(basis, unique),
+    sessions: projectTotalsMeasurementScope({
+      ...basis,
+      sessions: applyWindowAdjustments(basis, unique)
+    }, parents).sessions,
     parents: projectionParents(parentBySessionID, unique)
   };
 }
@@ -3120,6 +3412,7 @@ function applyWindowAdjustments(ledger, records) {
     const next = contributionNumbers(withCanonicalLedgerSpeed(ledger, record));
     if (!next) continue;
     const previous = settledValue ?? open[record.messageID];
+    if (previous?.excluded) continue;
     if (previous) {
       if (previous.quality === "exact" && record.quality === "provisional") continue;
       const priorUpdate = coerceCompletionUpdate(previous.update);
@@ -3315,15 +3608,27 @@ function coerceTotalsSnapshot(value) {
     if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
     open[messageID] = coerceOpenContribution(contribution);
   }
-  return projectTotalsGenerationBasis({
+  const sessionScopes = {};
+  if (isRecord(value.sessionScopes)) for (const [id, raw] of Object.entries(value.sessionScopes)) {
+    const proof = coerceScopeEvidence(raw);
+    if (proof) sessionScopes[id] = proof;
+  }
+  const messageScopes = {};
+  if (isRecord(value.messageScopes)) for (const [id, raw] of Object.entries(value.messageScopes)) {
+    const proof = coerceScopeEvidence(raw);
+    if (proof && value.settled && asRecord(value.settled)?.[id] === true) messageScopes[id] = proof;
+  }
+  return {
     version: TOTALS_VERSION,
     ...(value.generationBasisVersion === 3 ? {
       generationBasisVersion: 3
     } : {}),
     sessions,
     open,
-    settled: coerceSettled(value.settled)
-  });
+    settled: coerceSettled(value.settled),
+    sessionScopes,
+    messageScopes
+  };
 }
 function coerceSettled(value) {
   if (value === undefined) return {};
@@ -3374,6 +3679,9 @@ function coerceOpenContribution(value) {
     ...(value.update !== undefined ? {
       update: coerceCompletionUpdate(value.update)
     } : {}),
+    ...(coerceScopeEvidence(value.excluded) ? {
+      excluded: coerceScopeEvidence(value.excluded)
+    } : {}),
     ...(isRecord(value.speedBackfill) && value.speedBackfill.version === 1 && value.speedBackfill.source === "server" ? {
       speedBackfill: {
         version: 1,
@@ -3403,14 +3711,17 @@ function isNodeError(value) {
 }
 export function childRows(records, sessionID, store) {
   if (!sessionID || !store) return [];
-  const projected = projectTotals(store.totalsLedger, records, store.sessionParents);
-  const root = rollupSessionTotals(projected.sessions, projected.parents, sessionID);
+  records = scopedRecords(store, records);
+  const ledger = scopedLedger(store);
+  const projected = projectTotals(ledger, records, store.sessionParents);
+  const root = rollupSessionTotals(projected.sessions, projected.parents, sessionID, ledger.sessionScopes);
   const rows = [];
   const visited = new Set([sessionID]);
   const append = (childID, depth) => {
     if (visited.has(childID)) return;
+    if (isSessionScopeExcluded(childID, ledger.sessionScopes, projected.parents)) return;
     visited.add(childID);
-    const rollup = rollupSessionTotals(projected.sessions, projected.parents, childID);
+    const rollup = rollupSessionTotals(projected.sessions, projected.parents, childID, ledger.sessionScopes);
     const directRecords = records.filter(record => record.sessionID === childID);
     const show = directRecords.length > 0 || totalsHaveUsage(rollup.including);
     if (show) {
@@ -3450,36 +3761,40 @@ function activeStats(state, now, bytesPerToken) {
     elapsed: Math.max(0, now - state.startedAt)
   };
 }
-function latestActive(active, sessionID, preferredMessageID) {
-  const preferred = preferredMessageID ? active.get(preferredMessageID) : undefined;
-  if (preferred?.sessionID === sessionID) return preferred;
-  return [...active.values()].filter(state => state.sessionID === sessionID && !state.messageID.startsWith("__pending__:")).sort((left, right) => right.startedAt - left.startedAt)[0] ?? [...active.values()].filter(state => state.sessionID === sessionID).sort((left, right) => right.startedAt - left.startedAt)[0];
+function latestActive(store, sessionID, preferredMessageID) {
+  const id = preferredMessageID ?? ownedMessageID(store, sessionID);
+  const state = id ? store.active.get(id) : undefined;
+  return state?.sessionID === sessionID && observationRuntime(store).liveAssistantMessages.has(state.messageID) && !knownCompletedMessage(store, state.messageID) && scopeEligible(store, sessionID, state.messageID) ? state : undefined;
+}
+export function responseMeasurementStatus(record) {
+  if (selectSpeedMeasurement(record).available) return "";
+  if (record.samples.length === 1) return "Single batch; TPS unavailable.";
+  const reasons = record.speed?.generationCoverage?.reasons ?? [];
+  if (reasons.includes("insufficient-receive-span")) return "Insufficient arrival timing.";
+  if (reasons.includes("unknown-receive-clock")) return "Receive clock not verified.";
+  if (reasons.includes("hidden-reasoning") || reasons.includes("unobserved-output")) return "Incomplete content observation.";
+  if (reasons.includes("tool-usage-uncertain")) return "Tool usage timing not verified.";
+  return "No qualified generation timing.";
 }
 export function liveLabel(store, sessionID, bytesPerToken, width, now = Date.now(), toolWaiting = false) {
+  if (!scopeEligible(store, sessionID)) return "";
   const runtime = store.sessionRuntime.get(sessionID);
-  const state = latestActive(store.active, sessionID, runtime?.activeMessageID);
+  const state = latestActive(store, sessionID, runtime?.activeMessageID);
   const stats = activeStats(state, now, bytesPerToken);
   const runGenerated = runtime ? generatedTokens(runtime.runTotals) : 0;
   if (state) {
-    const rate = toolWaiting || stats.status === "inactive" ? "WAIT --" : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
-    if (width < 34) return rate;
-    if (width < 58) {
-      return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)}`;
-    }
-    return `${rate} gen ~${formatCompactNumber(stats.generated)} ttft ${formatOptionalDuration(stats.ttft)} elapsed ${formatDuration(stats.elapsed)} total ${formatCompactNumber(runGenerated)}`;
+    const hasContent = selectedSamples(state).length > 0;
+    const rate = toolWaiting ? "WAIT TOOL --" : !hasContent ? "WAITING --" : stats.status === "inactive" ? "WAIT --" : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
+    return wrapMetricFields([rate, `gen ${hasContent ? `~${formatCompactNumber(stats.generated)}` : "--"}`, `ttft ${formatOptionalDuration(stats.ttft)}`, `elapsed ${formatDuration(stats.elapsed)}`, `total ${formatCompactNumber(runGenerated)}`], width);
   }
   const last = store.lastCompletedBySession.get(sessionID);
-  if (last) {
+  if (last && scopeEligible(store, sessionID, last.record.messageID)) {
     const prefix = last.estimated ? "LAST ~" : "LAST ";
     const rate = last.available === false ? "LAST --" : `${prefix}${formatCompactRate(last.rate)} ${last.basis ?? ""}`.trimEnd();
-    const totalGenerated = runtime && runtime.runEpoch > 0 ? runGenerated : last.generated;
-    if (width < 34) return rate;
-    if (width < 58) {
-      return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)}`;
-    }
-    return `${rate} gen ${formatCompactNumber(last.generated)} ttft ${formatOptionalDuration(last.ttft)} measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)} total ${formatCompactNumber(totalGenerated)}`;
+    const totalGenerated = runtime && runtime.runResponseCount > 0 ? runGenerated : last.generated;
+    return wrapMetricFields([rate, ...(last.observationQuality === "short" ? ["short, low confidence"] : []), `gen ${formatCompactNumber(last.generated)}`, `ttft ${formatOptionalDuration(last.ttft)}`, `measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)}`, `total ${formatCompactNumber(totalGenerated)}`, ...(last.available === false ? [responseMeasurementStatus(last.record)] : [])], width);
   }
-  return "IDLE";
+  return runtime?.status === "busy" || runtime?.status === "retry" ? "TASK BUSY" : "IDLE";
 }
 function currentSessionID(api) {
   const route = api.route.current;
@@ -3511,34 +3826,34 @@ function warnWithToast(api, message, error) {
 }
 function Header(props) {
   return (() => {
-    var _el$70 = _$createElement("box"),
-      _el$71 = _$createElement("text"),
-      _el$73 = _$createElement("text"),
-      _el$74 = _$createTextNode(`session `);
-    _$insertNode(_el$70, _el$71);
-    _$insertNode(_el$70, _el$73);
-    _$setProp(_el$70, "height", 2);
-    _$setProp(_el$70, "paddingX", 1);
-    _$setProp(_el$70, "flexDirection", "column");
-    _$insertNode(_el$71, _$createTextNode(`OC TPS / history`));
+    var _el$73 = _$createElement("box"),
+      _el$74 = _$createElement("text"),
+      _el$76 = _$createElement("text"),
+      _el$77 = _$createTextNode(`session `);
     _$insertNode(_el$73, _el$74);
-    _$setProp(_el$73, "truncate", true);
-    _$setProp(_el$73, "wrapMode", "none");
-    _$insert(_el$73, () => shortTail(props.sessionID, 18), null);
+    _$insertNode(_el$73, _el$76);
+    _$setProp(_el$73, "height", 2);
+    _$setProp(_el$73, "paddingX", 1);
+    _$setProp(_el$73, "flexDirection", "column");
+    _$insertNode(_el$74, _$createTextNode(`OC TPS / history`));
+    _$insertNode(_el$76, _el$77);
+    _$setProp(_el$76, "truncate", true);
+    _$setProp(_el$76, "wrapMode", "none");
+    _$insert(_el$76, () => shortTail(props.sessionID, 18), null);
     _$effect(_p$ => {
       var _v$39 = props.theme.current.backgroundPanel,
         _v$40 = props.theme.current.primary,
         _v$41 = props.theme.current.textMuted;
-      _v$39 !== _p$.e && (_p$.e = _$setProp(_el$70, "backgroundColor", _v$39, _p$.e));
-      _v$40 !== _p$.t && (_p$.t = _$setProp(_el$71, "fg", _v$40, _p$.t));
-      _v$41 !== _p$.a && (_p$.a = _$setProp(_el$73, "fg", _v$41, _p$.a));
+      _v$39 !== _p$.e && (_p$.e = _$setProp(_el$73, "backgroundColor", _v$39, _p$.e));
+      _v$40 !== _p$.t && (_p$.t = _$setProp(_el$74, "fg", _v$40, _p$.t));
+      _v$41 !== _p$.a && (_p$.a = _$setProp(_el$76, "fg", _v$41, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined
     });
-    return _el$70;
+    return _el$73;
   })();
 }
 function SummaryBlock(props) {
@@ -3550,30 +3865,30 @@ function SummaryBlock(props) {
     return [...summaryLines("Session only", rollup.direct.tokens, rollup.direct.cost, rollup.direct.responseCount), ...summaryLines("Including subagents", rollup.including.tokens, rollup.including.cost, rollup.including.responseCount)];
   });
   return (() => {
-    var _el$75 = _$createElement("box"),
-      _el$76 = _$createElement("text");
-    _$insertNode(_el$75, _el$76);
-    _$setProp(_el$75, "paddingX", 1);
-    _$setProp(_el$75, "flexDirection", "column");
-    _$insertNode(_el$76, _$createTextNode(`totals`));
-    _$insert(_el$75, () => lines().map(line => (() => {
-      var _el$78 = _$createElement("text");
-      _$setProp(_el$78, "wrapMode", "word");
-      _$insert(_el$78, line);
-      _$effect(_$p => _$setProp(_el$78, "fg", props.theme.current.text, _$p));
-      return _el$78;
+    var _el$78 = _$createElement("box"),
+      _el$79 = _$createElement("text");
+    _$insertNode(_el$78, _el$79);
+    _$setProp(_el$78, "paddingX", 1);
+    _$setProp(_el$78, "flexDirection", "column");
+    _$insertNode(_el$79, _$createTextNode(`totals`));
+    _$insert(_el$78, () => lines().map(line => (() => {
+      var _el$81 = _$createElement("text");
+      _$setProp(_el$81, "wrapMode", "word");
+      _$insert(_el$81, line);
+      _$effect(_$p => _$setProp(_el$81, "fg", props.theme.current.text, _$p));
+      return _el$81;
     })()), null);
     _$effect(_p$ => {
       var _v$42 = props.theme.current.background,
         _v$43 = props.theme.current.secondary;
-      _v$42 !== _p$.e && (_p$.e = _$setProp(_el$75, "backgroundColor", _v$42, _p$.e));
-      _v$43 !== _p$.t && (_p$.t = _$setProp(_el$76, "fg", _v$43, _p$.t));
+      _v$42 !== _p$.e && (_p$.e = _$setProp(_el$78, "backgroundColor", _v$42, _p$.e));
+      _v$43 !== _p$.t && (_p$.t = _$setProp(_el$79, "fg", _v$43, _p$.t));
       return _p$;
     }, {
       e: undefined,
       t: undefined
     });
-    return _el$75;
+    return _el$78;
   })();
 }
 function HistoryView(props) {
@@ -3582,25 +3897,25 @@ function HistoryView(props) {
     return recentRecords(props.store.records, props.sessionID, props.store);
   });
   return (() => {
-    var _el$79 = _$createElement("box"),
-      _el$80 = _$createElement("box"),
-      _el$81 = _$createElement("text"),
-      _el$83 = _$createElement("text"),
-      _el$85 = _$createElement("scrollbox");
-    _$insertNode(_el$79, _el$80);
-    _$insertNode(_el$79, _el$83);
-    _$insertNode(_el$79, _el$85);
-    _$setProp(_el$79, "flexDirection", "column");
-    _$setProp(_el$79, "flexGrow", 1);
-    _$insert(_el$79, _$createComponent(Header, {
+    var _el$82 = _$createElement("box"),
+      _el$83 = _$createElement("box"),
+      _el$84 = _$createElement("text"),
+      _el$86 = _$createElement("text"),
+      _el$88 = _$createElement("scrollbox");
+    _$insertNode(_el$82, _el$83);
+    _$insertNode(_el$82, _el$86);
+    _$insertNode(_el$82, _el$88);
+    _$setProp(_el$82, "flexDirection", "column");
+    _$setProp(_el$82, "flexGrow", 1);
+    _$insert(_el$82, _$createComponent(Header, {
       get theme() {
         return props.api.theme;
       },
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$80);
-    _$insert(_el$79, _$createComponent(SummaryBlock, {
+    }), _el$83);
+    _$insert(_el$82, _$createComponent(SummaryBlock, {
       get theme() {
         return props.api.theme;
       },
@@ -3610,35 +3925,35 @@ function HistoryView(props) {
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$80);
-    _$insertNode(_el$80, _el$81);
-    _$setProp(_el$80, "height", 1);
-    _$setProp(_el$80, "paddingX", 1);
-    _$insertNode(_el$81, _$createTextNode(`TIME SESSION MODEL OUT/REAS GEN~ BASIS MAX~ MIN~ TTFT DUR COST SPARK`));
-    _$setProp(_el$81, "truncate", true);
-    _$setProp(_el$81, "wrapMode", "none");
-    _$insertNode(_el$83, _$createTextNode(`GEN is host-observed generation TPS; ~ is estimated, not provider-internal speed. MAX/MIN use byte-based arrival windows; -- means insufficient observations.`));
+    }), _el$83);
+    _$insertNode(_el$83, _el$84);
+    _$setProp(_el$83, "height", 1);
     _$setProp(_el$83, "paddingX", 1);
-    _$setProp(_el$83, "wrapMode", "word");
-    _$setProp(_el$85, "flexGrow", 1);
-    _$setProp(_el$85, "flexDirection", "column");
-    _$setProp(_el$85, "paddingX", 1);
-    _$setProp(_el$85, "stickyScroll", true);
-    _$setProp(_el$85, "stickyStart", "top");
-    _$insert(_el$85, (() => {
+    _$insertNode(_el$84, _$createTextNode(`TIME SESSION MODEL OUT/REAS GEN~ BASIS MAX~ MIN~ TTFT DUR COST SPARK`));
+    _$setProp(_el$84, "truncate", true);
+    _$setProp(_el$84, "wrapMode", "none");
+    _$insertNode(_el$86, _$createTextNode(`GEN is host-observed generation TPS; ~ is estimated, not provider-internal speed. MAX/MIN use byte-based arrival windows; -- means insufficient observations.`));
+    _$setProp(_el$86, "paddingX", 1);
+    _$setProp(_el$86, "wrapMode", "word");
+    _$setProp(_el$88, "flexGrow", 1);
+    _$setProp(_el$88, "flexDirection", "column");
+    _$setProp(_el$88, "paddingX", 1);
+    _$setProp(_el$88, "stickyScroll", true);
+    _$setProp(_el$88, "stickyStart", "top");
+    _$insert(_el$88, (() => {
       var _c$7 = _$memo(() => rows().length === 0);
       return () => _c$7() ? (() => {
-        var _el$86 = _$createElement("text");
-        _$insertNode(_el$86, _$createTextNode(`No completed responses yet`));
-        _$effect(_$p => _$setProp(_el$86, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$86;
+        var _el$89 = _$createElement("text");
+        _$insertNode(_el$89, _$createTextNode(`No completed responses yet`));
+        _$effect(_$p => _$setProp(_el$89, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$89;
       })() : rows().map(record => (() => {
-        var _el$88 = _$createElement("text");
-        _$setProp(_el$88, "truncate", true);
-        _$setProp(_el$88, "wrapMode", "none");
-        _$insert(_el$88, () => formatHistoryRow(record));
-        _$effect(_$p => _$setProp(_el$88, "fg", props.api.theme.current.text, _$p));
-        return _el$88;
+        var _el$91 = _$createElement("text");
+        _$setProp(_el$91, "truncate", true);
+        _$setProp(_el$91, "wrapMode", "none");
+        _$insert(_el$91, () => formatHistoryRow(record));
+        _$effect(_$p => _$setProp(_el$91, "fg", props.api.theme.current.text, _$p));
+        return _el$91;
       })());
     })());
     _$effect(_p$ => {
@@ -3647,11 +3962,11 @@ function HistoryView(props) {
         _v$46 = props.api.theme.current.textMuted,
         _v$47 = props.api.theme.current.textMuted,
         _v$48 = props.api.theme.current.background;
-      _v$44 !== _p$.e && (_p$.e = _$setProp(_el$79, "backgroundColor", _v$44, _p$.e));
-      _v$45 !== _p$.t && (_p$.t = _$setProp(_el$80, "backgroundColor", _v$45, _p$.t));
-      _v$46 !== _p$.a && (_p$.a = _$setProp(_el$81, "fg", _v$46, _p$.a));
-      _v$47 !== _p$.o && (_p$.o = _$setProp(_el$83, "fg", _v$47, _p$.o));
-      _v$48 !== _p$.i && (_p$.i = _$setProp(_el$85, "backgroundColor", _v$48, _p$.i));
+      _v$44 !== _p$.e && (_p$.e = _$setProp(_el$82, "backgroundColor", _v$44, _p$.e));
+      _v$45 !== _p$.t && (_p$.t = _$setProp(_el$83, "backgroundColor", _v$45, _p$.t));
+      _v$46 !== _p$.a && (_p$.a = _$setProp(_el$84, "fg", _v$46, _p$.a));
+      _v$47 !== _p$.o && (_p$.o = _$setProp(_el$86, "fg", _v$47, _p$.o));
+      _v$48 !== _p$.i && (_p$.i = _$setProp(_el$88, "backgroundColor", _v$48, _p$.i));
       return _p$;
     }, {
       e: undefined,
@@ -3660,26 +3975,36 @@ function HistoryView(props) {
       o: undefined,
       i: undefined
     });
-    return _el$79;
+    return _el$82;
   })();
 }
 function PromptRight(props) {
   rememberVisibleSession(props.store, props.sessionID);
+  const [width, setWidth] = createSignal(0);
   const label = createMemo(() => {
     props.store.revision();
-    return liveLabel(props.store, props.sessionID, props.options.bytesPerToken, Math.max(1, props.api.renderer.width), Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
+    props.store.clockRevision();
+    return liveLabel(props.store, props.sessionID, props.options.bytesPerToken, width(), Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
   });
   return (() => {
-    var _el$89 = _$createElement("text");
-    _$setProp(_el$89, "truncate", true);
-    _$setProp(_el$89, "wrapMode", "none");
-    _$insert(_el$89, label);
-    _$effect(_$p => _$setProp(_el$89, "fg", props.api.theme.current.accent, _$p));
-    return _el$89;
+    var _el$92 = _$createElement("box"),
+      _el$93 = _$createElement("text");
+    _$insertNode(_el$92, _el$93);
+    _$setProp(_el$92, "flexDirection", "column");
+    _$setProp(_el$92, "width", "100%");
+    _$setProp(_el$92, "flexShrink", 0);
+    _$setProp(_el$92, "onSizeChange", function () {
+      setWidth(Math.max(1, this.width));
+    });
+    _$setProp(_el$93, "wrapMode", "word");
+    _$setProp(_el$93, "flexShrink", 0);
+    _$insert(_el$93, label);
+    _$effect(_$p => _$setProp(_el$93, "fg", props.api.theme.current.accent, _$p));
+    return _el$92;
   })();
 }
 function knownToolWaiting(api, store, sessionID) {
-  const state = latestActive(store.active, sessionID, store.sessionRuntime.get(sessionID)?.activeMessageID);
+  const state = latestActive(store, sessionID, store.sessionRuntime.get(sessionID)?.activeMessageID);
   if (!state) return false;
   const latest = selectedSamples(state).at(-1)?.timestamp ?? state.startedAt;
   try {
@@ -3709,6 +4034,10 @@ function BottomContent(props) {
     props.store.revision();
     return displayedSessionID(props.store, props.sessionID);
   });
+  const visible = createMemo(() => {
+    props.store.revision();
+    return scopeEligible(props.store, sessionID());
+  });
   const view = createMemo(() => {
     props.store.revision();
     return {
@@ -3719,6 +4048,7 @@ function BottomContent(props) {
   });
   const taskWallTime = createMemo(() => {
     props.store.revision();
+    props.store.clockRevision();
     return taskWallTimeForSession(props.store, sessionID());
   });
   const rows = createMemo(() => childRows(view().records, sessionID(), props.store));
@@ -3765,141 +4095,154 @@ function BottomContent(props) {
     togglePulse(props.store);
   };
   return (() => {
-    var _el$90 = _$createElement("box"),
-      _el$91 = _$createElement("box"),
-      _el$92 = _$createElement("text"),
-      _el$93 = _$createElement("box"),
-      _el$94 = _$createElement("text");
-    _$insertNode(_el$90, _el$91);
-    _$insertNode(_el$90, _el$93);
-    _$setProp(_el$90, "flexDirection", "column");
-    _$setProp(_el$90, "width", "100%");
-    _$setProp(_el$90, "paddingTop", 1);
-    _$setProp(_el$90, "paddingX", 1);
-    _$setProp(_el$90, "overflow", "hidden");
-    _$setProp(_el$90, "flexShrink", 0);
-    _$insertNode(_el$91, _el$92);
-    _$setProp(_el$91, "focusable", true);
-    _$setProp(_el$91, "width", "100%");
-    _$setProp(_el$91, "height", 1);
-    _$setProp(_el$91, "paddingX", 1);
-    _$setProp(_el$91, "onMouseDown", onPulseMouseDown);
-    _$setProp(_el$92, "truncate", true);
-    _$setProp(_el$92, "wrapMode", "none");
-    _$insert(_el$92, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
-    _$insertNode(_el$93, _el$94);
-    _$setProp(_el$93, "flexDirection", "column");
-    _$setProp(_el$93, "width", "100%");
-    _$setProp(_el$93, "paddingX", 1);
-    _$setProp(_el$93, "flexShrink", 0);
-    _$setProp(_el$93, "onSizeChange", function () {
-      setMetricWidth(Math.max(1, this.width - 2));
-    });
+    var _el$94 = _$createElement("box");
+    _$setProp(_el$94, "flexDirection", "column");
     _$setProp(_el$94, "width", "100%");
-    _$setProp(_el$94, "wrapMode", "word");
+    _$setProp(_el$94, "paddingTop", 1);
+    _$setProp(_el$94, "paddingX", 1);
+    _$setProp(_el$94, "overflow", "hidden");
     _$setProp(_el$94, "flexShrink", 0);
-    _$insert(_el$94, metricLabel);
-    _$insert(_el$90, (() => {
-      var _c$8 = _$memo(() => !!expanded());
-      return () => _c$8() && (!sessionID() ? (() => {
-        var _el$95 = _$createElement("text");
-        _$insertNode(_el$95, _$createTextNode(`No active session`));
-        _$setProp(_el$95, "paddingTop", 1);
-        _$setProp(_el$95, "truncate", true);
-        _$setProp(_el$95, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$95, "fg", props.api.theme.current.textMuted, _$p));
+    _$insert(_el$94, (() => {
+      var _c$8 = _$memo(() => !!visible());
+      return () => _c$8() && [(() => {
+        var _el$95 = _$createElement("box"),
+          _el$96 = _$createElement("text");
+        _$insertNode(_el$95, _el$96);
+        _$setProp(_el$95, "focusable", true);
+        _$setProp(_el$95, "width", "100%");
+        _$setProp(_el$95, "height", 1);
+        _$setProp(_el$95, "paddingX", 1);
+        _$setProp(_el$95, "onMouseDown", onPulseMouseDown);
+        _$setProp(_el$96, "truncate", true);
+        _$setProp(_el$96, "wrapMode", "none");
+        _$insert(_el$96, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
+        _$effect(_p$ => {
+          var _v$49 = props.api.theme.current.backgroundElement,
+            _v$50 = props.api.theme.current.primary;
+          _v$49 !== _p$.e && (_p$.e = _$setProp(_el$95, "backgroundColor", _v$49, _p$.e));
+          _v$50 !== _p$.t && (_p$.t = _$setProp(_el$96, "fg", _v$50, _p$.t));
+          return _p$;
+        }, {
+          e: undefined,
+          t: undefined
+        });
         return _el$95;
-      })() : [(() => {
-        var _el$97 = _$createElement("text"),
-          _el$98 = _$createTextNode(`session `);
+      })(), (() => {
+        var _el$97 = _$createElement("box"),
+          _el$98 = _$createElement("text");
         _$insertNode(_el$97, _el$98);
-        _$setProp(_el$97, "paddingTop", 1);
-        _$setProp(_el$97, "wrapMode", "word");
+        _$setProp(_el$97, "flexDirection", "column");
+        _$setProp(_el$97, "width", "100%");
+        _$setProp(_el$97, "paddingX", 1);
         _$setProp(_el$97, "flexShrink", 0);
-        _$insert(_el$97, sessionID, null);
-        _$effect(_$p => _$setProp(_el$97, "fg", props.api.theme.current.secondary, _$p));
+        _$setProp(_el$97, "onSizeChange", function () {
+          setMetricWidth(Math.max(1, this.width - 2));
+        });
+        _$setProp(_el$98, "width", "100%");
+        _$setProp(_el$98, "wrapMode", "word");
+        _$setProp(_el$98, "flexShrink", 0);
+        _$insert(_el$98, metricLabel);
+        _$effect(_$p => _$setProp(_el$98, "fg", props.api.theme.current.textMuted, _$p));
         return _el$97;
+      })(), _$memo(() => _$memo(() => !!expanded())() && (!sessionID() ? (() => {
+        var _el$99 = _$createElement("text");
+        _$insertNode(_el$99, _$createTextNode(`No active session`));
+        _$setProp(_el$99, "paddingTop", 1);
+        _$setProp(_el$99, "truncate", true);
+        _$setProp(_el$99, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$99, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$99;
+      })() : [(() => {
+        var _el$101 = _$createElement("text"),
+          _el$102 = _$createTextNode(`session `);
+        _$insertNode(_el$101, _el$102);
+        _$setProp(_el$101, "paddingTop", 1);
+        _$setProp(_el$101, "wrapMode", "word");
+        _$setProp(_el$101, "flexShrink", 0);
+        _$insert(_el$101, sessionID, null);
+        _$effect(_$p => _$setProp(_el$101, "fg", props.api.theme.current.secondary, _$p));
+        return _el$101;
       })(), _$memo(() => sections().map((section, index) => [_$createComponent(PulseSection, {
         get theme() {
           return props.api.theme;
         },
         section: section
       }), index === 0 && (() => {
-        var _el$102 = _$createElement("box"),
-          _el$103 = _$createElement("text"),
-          _el$104 = _$createElement("text"),
-          _el$105 = _$createElement("text");
-        _$insertNode(_el$102, _el$103);
-        _$insertNode(_el$102, _el$104);
-        _$insertNode(_el$102, _el$105);
-        _$setProp(_el$102, "flexDirection", "column");
-        _$setProp(_el$102, "width", "100%");
-        _$setProp(_el$102, "paddingX", 1);
-        _$setProp(_el$102, "flexShrink", 0);
-        _$setProp(_el$103, "wrapMode", "word");
-        _$setProp(_el$103, "flexShrink", 0);
-        _$insert(_el$103, () => average().label);
-        _$setProp(_el$104, "wrapMode", "word");
-        _$setProp(_el$104, "flexShrink", 0);
-        _$insert(_el$104, () => average().value);
-        _$insert(_el$102, (() => {
+        var _el$106 = _$createElement("box"),
+          _el$107 = _$createElement("text"),
+          _el$108 = _$createElement("text"),
+          _el$109 = _$createElement("text");
+        _$insertNode(_el$106, _el$107);
+        _$insertNode(_el$106, _el$108);
+        _$insertNode(_el$106, _el$109);
+        _$setProp(_el$106, "flexDirection", "column");
+        _$setProp(_el$106, "width", "100%");
+        _$setProp(_el$106, "paddingX", 1);
+        _$setProp(_el$106, "flexShrink", 0);
+        _$setProp(_el$107, "wrapMode", "word");
+        _$setProp(_el$107, "flexShrink", 0);
+        _$insert(_el$107, () => average().label);
+        _$setProp(_el$108, "wrapMode", "word");
+        _$setProp(_el$108, "flexShrink", 0);
+        _$insert(_el$108, () => average().value);
+        _$insert(_el$106, (() => {
           var _c$9 = _$memo(() => !!average().coverage);
           return () => _c$9() && (() => {
-            var _el$107 = _$createElement("text");
-            _$setProp(_el$107, "wrapMode", "word");
-            _$setProp(_el$107, "flexShrink", 0);
-            _$insert(_el$107, () => average().coverage);
-            _$effect(_$p => _$setProp(_el$107, "fg", props.api.theme.current.textMuted, _$p));
-            return _el$107;
+            var _el$111 = _$createElement("text");
+            _$setProp(_el$111, "wrapMode", "word");
+            _$setProp(_el$111, "flexShrink", 0);
+            _$insert(_el$111, () => average().coverage);
+            _$effect(_$p => _$setProp(_el$111, "fg", props.api.theme.current.textMuted, _$p));
+            return _el$111;
           })();
-        })(), _el$105);
-        _$insert(_el$102, (() => {
+        })(), _el$109);
+        _$insert(_el$106, (() => {
           var _c$0 = _$memo(() => !!average().diagnostic);
           return () => _c$0() && (() => {
-            var _el$108 = _$createElement("text");
-            _$setProp(_el$108, "wrapMode", "word");
-            _$setProp(_el$108, "flexShrink", 0);
-            _$insert(_el$108, () => average().diagnostic);
-            _$effect(_$p => _$setProp(_el$108, "fg", props.api.theme.current.textMuted, _$p));
-            return _el$108;
+            var _el$112 = _$createElement("text");
+            _$setProp(_el$112, "wrapMode", "word");
+            _$setProp(_el$112, "flexShrink", 0);
+            _$insert(_el$112, () => average().diagnostic);
+            _$effect(_$p => _$setProp(_el$112, "fg", props.api.theme.current.textMuted, _$p));
+            return _el$112;
           })();
-        })(), _el$105);
-        _$insertNode(_el$105, _$createTextNode(`Compact usage and TPS include subagents. Time is recorded task activity.`));
-        _$setProp(_el$105, "wrapMode", "word");
-        _$setProp(_el$105, "flexShrink", 0);
+        })(), _el$109);
+        _$insertNode(_el$109, _$createTextNode(`Compact usage and TPS include subagents. Time is recorded task activity.`));
+        _$setProp(_el$109, "wrapMode", "word");
+        _$setProp(_el$109, "flexShrink", 0);
         _$effect(_p$ => {
-          var _v$52 = props.api.theme.current.textMuted,
-            _v$53 = props.api.theme.current.accent,
-            _v$54 = props.api.theme.current.textMuted;
-          _v$52 !== _p$.e && (_p$.e = _$setProp(_el$103, "fg", _v$52, _p$.e));
-          _v$53 !== _p$.t && (_p$.t = _$setProp(_el$104, "fg", _v$53, _p$.t));
-          _v$54 !== _p$.a && (_p$.a = _$setProp(_el$105, "fg", _v$54, _p$.a));
+          var _v$51 = props.api.theme.current.textMuted,
+            _v$52 = props.api.theme.current.accent,
+            _v$53 = props.api.theme.current.textMuted;
+          _v$51 !== _p$.e && (_p$.e = _$setProp(_el$107, "fg", _v$51, _p$.e));
+          _v$52 !== _p$.t && (_p$.t = _$setProp(_el$108, "fg", _v$52, _p$.t));
+          _v$53 !== _p$.a && (_p$.a = _$setProp(_el$109, "fg", _v$53, _p$.a));
           return _p$;
         }, {
           e: undefined,
           t: undefined,
           a: undefined
         });
-        return _el$102;
+        return _el$106;
       })()])), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
-        var _el$109 = _$createElement("text");
-        _$insertNode(_el$109, _$createTextNode(`No completed responses yet`));
-        _$setProp(_el$109, "paddingTop", 1);
-        _$setProp(_el$109, "truncate", true);
-        _$setProp(_el$109, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$109, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$109;
+        var _el$113 = _$createElement("text");
+        _$insertNode(_el$113, _$createTextNode(`No completed responses yet`));
+        _$setProp(_el$113, "paddingTop", 1);
+        _$setProp(_el$113, "truncate", true);
+        _$setProp(_el$113, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$113, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$113;
       })()), (() => {
-        var _el$99 = _$createElement("box"),
-          _el$100 = _$createElement("text");
-        _$insertNode(_el$99, _el$100);
-        _$setProp(_el$99, "flexDirection", "column");
-        _$setProp(_el$99, "width", "100%");
-        _$setProp(_el$99, "paddingTop", 1);
-        _$insertNode(_el$100, _$createTextNode(`SESSION RUN`));
-        _$setProp(_el$100, "truncate", true);
-        _$setProp(_el$100, "wrapMode", "none");
-        _$insert(_el$99, _$createComponent(PulseMetricGrid, {
+        var _el$103 = _$createElement("box"),
+          _el$104 = _$createElement("text");
+        _$insertNode(_el$103, _el$104);
+        _$setProp(_el$103, "flexDirection", "column");
+        _$setProp(_el$103, "width", "100%");
+        _$setProp(_el$103, "paddingTop", 1);
+        _$insertNode(_el$104, _$createTextNode(`SESSION RUN`));
+        _$setProp(_el$104, "truncate", true);
+        _$setProp(_el$104, "wrapMode", "none");
+        _$insert(_el$103, _$createComponent(PulseMetricGrid, {
           get theme() {
             return props.api.theme;
           },
@@ -3910,8 +4253,8 @@ function BottomContent(props) {
             }]];
           }
         }), null);
-        _$effect(_$p => _$setProp(_el$100, "fg", props.api.theme.current.accent, _$p));
-        return _el$99;
+        _$effect(_$p => _$setProp(_el$104, "fg", props.api.theme.current.accent, _$p));
+        return _el$103;
       })(), _$memo(() => _$memo(() => rows().length > 0)() && _$createComponent(ChildAgentRows, {
         get theme() {
           return props.api.theme;
@@ -3919,22 +4262,9 @@ function BottomContent(props) {
         get rows() {
           return rows();
         }
-      }))]);
-    })(), null);
-    _$effect(_p$ => {
-      var _v$49 = props.api.theme.current.backgroundElement,
-        _v$50 = props.api.theme.current.primary,
-        _v$51 = props.api.theme.current.textMuted;
-      _v$49 !== _p$.e && (_p$.e = _$setProp(_el$91, "backgroundColor", _v$49, _p$.e));
-      _v$50 !== _p$.t && (_p$.t = _$setProp(_el$92, "fg", _v$50, _p$.t));
-      _v$51 !== _p$.a && (_p$.a = _$setProp(_el$94, "fg", _v$51, _p$.a));
-      return _p$;
-    }, {
-      e: undefined,
-      t: undefined,
-      a: undefined
-    });
-    return _el$90;
+      }))]))];
+    })());
+    return _el$94;
   })();
 }
 export function createTuiSlotPlugin(api, store, options) {
@@ -3993,6 +4323,142 @@ function legacyBinding(options, name, fallback) {
   const value = options.keybinds[name];
   return typeof value === "string" && value !== "none" ? value : undefined;
 }
+
+/** Watch only ledger names. Directory watches survive atomic file replacement;
+ * a missing directory is reached through its nearest existing ancestor, without
+ * recursive watches, scans, polling, or any inference of task completion. */
+function watchLedgerPaths(paths) {
+  let disposed = false;
+  const disposers = [];
+  const groups = new Map();
+  for (const item of paths) {
+    const path = resolve(item.path);
+    const directory = dirname(path);
+    const files = groups.get(directory) ?? new Map();
+    files.set(basename(path), item.changed);
+    groups.set(directory, files);
+  }
+  for (const [target, files] of groups) {
+    let watcher;
+    let current;
+    let disabled = false;
+    let probeTimer;
+    const fingerprint = name => {
+      try {
+        const stat = statSync(join(target, name));
+        return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") return undefined;
+        throw error;
+      }
+    };
+    const fingerprints = new Map();
+    const probeRenames = () => {
+      if (probeTimer !== undefined) clearTimeout(probeTimer);
+      // Bun can coalesce an atomic rename to the staging filename only. One
+      // event-driven metadata flush checks ONLY our two known ledger paths;
+      // unchanged history/temp/unrelated files never cause a ledger replay.
+      probeTimer = setTimeout(() => {
+        probeTimer = undefined;
+        if (disposed || disabled) return;
+        try {
+          for (const [name, changed] of files) {
+            const next = fingerprint(name);
+            if (next === fingerprints.get(name)) continue;
+            fingerprints.set(name, next);
+            changed();
+          }
+        } catch (error) {
+          disable(error);
+        }
+      }, 30);
+    };
+    const locate = () => {
+      let directory = target;
+      while (true) {
+        try {
+          const stat = statSync(directory);
+          if (!stat.isDirectory()) throw new Error("Ledger parent is not a directory");
+          return {
+            directory,
+            dev: stat.dev,
+            ino: stat.ino
+          };
+        } catch (error) {
+          if (!isNodeError(error) || error.code !== "ENOENT" || dirname(directory) === directory) throw error;
+          directory = dirname(directory);
+        }
+      }
+    };
+    const same = next => current?.directory === next.directory && current.dev === next.dev && current.ino === next.ino;
+    const disable = error => {
+      if (disposed || disabled) return;
+      disabled = true;
+      if (probeTimer !== undefined) clearTimeout(probeTimer);
+      watcher?.close();
+      watcher = undefined;
+      // Finite fallback: existing host-event reloads remain available. Do not
+      // restart an unsupported watcher in a timer/CPU loop or invent idle facts.
+      console.warn(`[oc-tps] ledger watcher unavailable for ${target}; updates rely on host events`, error);
+    };
+    const arm = refresh => {
+      if (disposed || disabled) return;
+      try {
+        // Re-check after attaching: creation between stat and watch must not
+        // leave us stranded at an ancestor after its last mkdir/rename event.
+        for (let remaining = target.split(sep).length + 1; remaining > 0; remaining--) {
+          const next = locate();
+          if (same(next)) break;
+          const previous = watcher;
+          watcher = watch(next.directory, {
+            persistent: false,
+            encoding: "buffer"
+          }, (kind, filename) => {
+            if (disposed || disabled) return;
+            try {
+              if (kind === "rename" && !same(locate())) {
+                arm(true);
+                return;
+              }
+              const name = filename === null ? undefined : Buffer.isBuffer(filename) ? filename.toString() : String(filename);
+              if (current?.directory !== target) {
+                const child = relative(current.directory, target).split(sep)[0];
+                if (name === undefined || name === child) arm(true);
+                return;
+              }
+              if (name === undefined) probeRenames();else if (files.has(name)) {
+                fingerprints.set(name, fingerprint(name));
+                files.get(name)();
+              }
+              if (kind === "rename") probeRenames();
+            } catch (error) {
+              disable(error);
+            }
+          });
+          watcher.on("error", disable);
+          current = next;
+          previous?.close();
+          if (current.directory === target) for (const name of files.keys()) fingerprints.set(name, fingerprint(name));
+          if (refresh && current.directory === target) for (const changed of files.values()) changed();
+          refresh = true;
+        }
+      } catch (error) {
+        disable(error);
+      }
+    };
+    arm(false);
+    disposers.push(() => {
+      if (probeTimer !== undefined) clearTimeout(probeTimer);
+      watcher?.close();
+      watcher = undefined;
+    });
+  }
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    for (const dispose of disposers) dispose();
+  };
+}
 const tui = async (api, rawOptions) => {
   const options = resolveOptions(rawOptions);
   if (!options.enabled) return;
@@ -4008,42 +4474,74 @@ const tui = async (api, rawOptions) => {
   let activityReloadTimer;
   let reloadGeneration = 0;
   let activityReloadGeneration = 0;
+  let historyAppliedGeneration = 0;
+  let activityAppliedGeneration = -1;
+  let historyDrain;
+  let activityDrain;
+  const drainHistory = () => {
+    if (historyDrain) return historyDrain;
+    historyDrain = (async () => {
+      while (!disposed) {
+        const generation = reloadGeneration;
+        if (reloadTimer !== undefined) clearTimeout(reloadTimer);
+        reloadTimer = undefined;
+        await reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, generation);
+        if (generation !== reloadGeneration) continue;
+        historyAppliedGeneration = generation;
+        return;
+      }
+    })().finally(() => {
+      historyDrain = undefined;
+    });
+    return historyDrain;
+  };
+  const drainActivity = () => {
+    if (activityDrain) return activityDrain;
+    activityDrain = (async () => {
+      while (!disposed) {
+        const generation = activityReloadGeneration;
+        if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
+        activityReloadTimer = undefined;
+        await reloadActivity(store, api, runsPath, generation);
+        if (generation !== activityReloadGeneration) continue;
+        activityAppliedGeneration = generation;
+        return;
+      }
+    })().finally(() => {
+      activityDrain = undefined;
+    });
+    return activityDrain;
+  };
   const scheduleReload = () => {
+    if (disposed) return;
     reloadGeneration += 1;
     const generation = reloadGeneration;
     store.historyGeneration = generation;
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
-    const run = async attempt => {
-      if (disposed || generation !== reloadGeneration) return;
+    const run = async (attempt, expectedGeneration) => {
+      if (disposed || expectedGeneration !== reloadGeneration) return;
       reloadTimer = undefined;
-      await reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, generation);
-      if (!disposed && generation === reloadGeneration && attempt < 3 && store.optimistic.size > 0) {
+      await drainHistory();
+      if (!disposed && attempt < 3 && store.optimistic.size > 0 && reloadTimer === undefined) {
+        const latestGeneration = reloadGeneration;
         reloadTimer = setTimeout(() => {
-          void run(attempt + 1);
+          void run(attempt + 1, latestGeneration);
         }, 100);
       }
     };
     reloadTimer = setTimeout(() => {
-      void run(0);
+      void run(0, generation);
     }, 30);
   };
   const scheduleActivityReload = () => {
+    if (disposed) return;
     activityReloadGeneration += 1;
     const generation = activityReloadGeneration;
     store.activityGeneration = generation;
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
-    const run = async attempt => {
-      if (disposed || generation !== activityReloadGeneration) return;
-      activityReloadTimer = undefined;
-      await reloadActivity(store, api, runsPath, generation);
-      if (!disposed && generation === activityReloadGeneration && attempt < 3) {
-        activityReloadTimer = setTimeout(() => {
-          void run(attempt + 1);
-        }, 100);
-      }
-    };
     activityReloadTimer = setTimeout(() => {
-      void run(0);
+      activityReloadTimer = undefined;
+      if (!disposed && generation === activityReloadGeneration) void drainActivity();
     }, 30);
   };
   const openHistory = () => {
@@ -4106,7 +4604,7 @@ const tui = async (api, rawOptions) => {
       console.warn(`[oc-tps] event subscription unavailable for ${type}`, error);
     }
   };
-  const handleEvent = input => {
+  const handleEvent = (input, _metadata) => {
     if (disposed) return;
     const receivedAt = Date.now();
     const receivedMono = performance.now();
@@ -4134,11 +4632,11 @@ const tui = async (api, rawOptions) => {
         return;
       }
       if (type === "message.part.delta") {
-        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken, receivedAt, receivedMono);
+        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken, receivedAt, receivedMono, RECEIVE_CLOCK);
         return;
       }
       if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
-        recordDelta(store, properties, event, "v2", type.endsWith("reasoning.delta") ? "reasoning" : "output", options.bytesPerToken, receivedAt, receivedMono);
+        recordDelta(store, properties, event, "v2", type.endsWith("reasoning.delta") ? "reasoning" : "output", options.bytesPerToken, receivedAt, receivedMono, RECEIVE_CLOCK);
         return;
       }
       if (type === "session.next.step.started") {
@@ -4193,12 +4691,20 @@ const tui = async (api, rawOptions) => {
   subscribe("workspace.status.changed", handleEvent);
   subscribe("workspace.disposed", handleEvent);
   subscribe("workspace.deleted", handleEvent);
+  const stopLedgerWatchers = watchLedgerPaths([{
+    path: runsPath,
+    changed: scheduleActivityReload
+  }, {
+    path: totalsPath,
+    changed: scheduleReload
+  }]);
   const interval = setInterval(() => {
-    if (!disposed && hasLiveTaskWallActivity(store)) store.bump();
+    if (!disposed && hasLiveTaskWallActivity(store)) store.tick();
   }, 500);
   api.lifecycle.onDispose(() => {
     disposed = true;
     store.disposed = true;
+    stopLedgerWatchers();
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
     clearInterval(interval);
@@ -4218,8 +4724,12 @@ const tui = async (api, rawOptions) => {
     store.focusSessionID = undefined;
     store.disposeSignals();
   });
-  store.historyGeneration += 1;
-  await Promise.all([reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, store.historyGeneration), reloadActivity(store, api, runsPath, store.activityGeneration)]);
+  store.historyGeneration = ++reloadGeneration;
+  // Watcher/host requests received during an in-flight initial read are part of
+  // initialization, not fire-and-forget work after a stale promise has returned.
+  do {
+    await Promise.all([historyAppliedGeneration < reloadGeneration ? drainHistory() : Promise.resolve(), activityAppliedGeneration < activityReloadGeneration ? drainActivity() : Promise.resolve()]);
+  } while (!disposed && (historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration));
 };
 const plugin = {
   id: "oc-tps",

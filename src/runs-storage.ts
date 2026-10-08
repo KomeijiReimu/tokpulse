@@ -12,7 +12,9 @@ import {
   dedupeActivityEvents,
   normalizeActivityEvent,
   replayActivity,
+  filterActivityEvents,
 } from "./activity.js";
+import type { ScopeParents, SessionScopes } from "./scope.js";
 
 export const DEFAULT_RUNS_FILENAME = "runs.jsonl";
 
@@ -25,6 +27,9 @@ export interface RunsPathOptions {
 
 export interface ActivityReadOptions {
   dedupe?: boolean;
+  /** Optional display projection. Default reads and compaction preserve raw facts. */
+  sessionScopes?: SessionScopes;
+  parentBySessionID?: ScopeParents;
 }
 
 export interface ActivityLedgerAPI {
@@ -101,7 +106,10 @@ export function parseActivityJsonl(
       // A partial final line or a corrupt line must not hide valid facts.
     }
   }
-  return options.dedupe === false ? parsed : dedupeActivityEvents(parsed);
+  const events = options.dedupe === false ? parsed : dedupeActivityEvents(parsed);
+  if (!options.sessionScopes && !options.parentBySessionID) return events;
+  const eligible = new Set(filterActivityEvents(events, options.sessionScopes, options.parentBySessionID).map((event) => event.sessionID));
+  return events.filter((event) => eligible.has(event.sessionID) && event.scope?.sourceScope !== "magic-message");
 }
 
 export function serializeActivityJsonl(events: readonly ActivityEventInput[]): string {

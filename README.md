@@ -88,16 +88,18 @@ file URLs above.
 
 The primary speed is **generation TPS**, including output and observable reasoning.
 `~` marks a host-observed estimate: event arrival timing cannot reveal the
-provider's exact internal generation speed. A completed measurement needs at least
-**1 second** between the first and last nonempty deltas and **two distinct arrival
-batches**, with complete content observations matching the final response.
+provider's exact internal generation speed. A completed measurement needs **two
+distinct arrival batches**, with complete content observations matching the final
+response. Short observations of **100–999ms** can qualify when every arrival has
+verified monotonic clock provenance; they are marked as low-confidence estimates.
+A single batch or an extremely short burst cannot establish generation TPS.
 Tokens in the first batch are excluded using each category's share of observed
 bytes and its final usage; this interval token count is always an estimate.
 Retry-contaminated, interrupted, or incomplete observations have no generation TPS.
 
 - **Main average** uses the current session's own cumulative generation measurements,
   excluding child agents. Expand Token Pulse to see this average and its coverage.
-- **Compact speed** uses cumulative generation measurements including descendant
+- **Compact speed** uses cumulative generation measurements including user-task descendant
   agents, matching the inclusive usage totals.
 - **Response throughput** is separate: it uses the full response duration,
   including TTFT and possibly tool wait time. It never substitutes for generation
@@ -106,12 +108,25 @@ Retry-contaminated, interrupted, or incomplete observations have no generation T
 Cumulative generation TPS is **total estimated interval tokens / total measured
 seconds**, persisted in `totals.json` beside history and retained after history
 trimming. Coverage reports qualified responses and their **full generated usage**,
-not just the interval token estimates. Speed measurements start fresh with this
-observation basis; existing token, cost, call, and response-throughput totals are
-retained. Older history cannot supply the missing generation observations.
+not just the interval token estimates. Stored qualified measurements survive
+restarts and history trimming. Older history cannot supply missing generation
+observations.
 
-Live speed estimates token arrivals. It needs at least **1 second** and **two
-distinct observation timestamps**; until then, the display shows `WARMUP`.
+Live speed and historical peaks need at least **1 second** and **two distinct
+observation timestamps**. Waiting for content is separate from warming up an
+observed stream; after completion, the last result or its unavailability reason
+replaces the live state.
+
+Magic Context maintenance runs, including historian, dreamer and their descendants,
+are excluded from token, cost, call, speed and task-time statistics and from agent
+views. Maintenance summaries inside a user session are excluded per message;
+the rest of that session remains counted. Historical data without verifiable
+source information or the original contribution needed for safe reversal is
+retained rather than deducted by guesswork.
+
+Task time is the union of active intervals for the user task and its eligible
+child agents, so parallel work is counted once. It stops increasing when all
+eligible work has ended; maintenance work cannot extend it.
 
 Open details with `/tps-details`, **Token Pulse details** in the command palette,
 or the default `Ctrl+Shift+Y`. The view covers the session where it was opened and

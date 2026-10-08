@@ -2,6 +2,23 @@ import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promise
 import { dirname, basename, join } from "node:path";
 import { HISTORY_VERSION } from "./core.js";
 import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, mergeRecordSpeed } from './statistics.js';
+import { coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, mergeScopeEvidence } from "./scope.js";
+/** Display-only filtering; never deletes raw historical facts. */
+export function filterHistoryRecords(records, sessionScopes = {}, parents, excludedMessageIDs) {
+  sessionScopes = collectSessionScopeEvidence(records, sessionScopes);
+  const links = new Map();
+  for (const record of records) if (record.parentSessionID) links.set(record.sessionID, record.parentSessionID);
+  if (parents instanceof Map) for (const [id, parent] of parents) links.set(id, parent);else if (parents) for (const [id, parent] of Object.entries(parents)) links.set(id, parent);
+  const eligible = new Map();
+  return records.filter(record => {
+    if (excludedMessageIDs?.has(record.messageID)) return false;
+    const scoped = record;
+    if (scoped.scope?.sourceScope === "magic-message") return false;
+    if (!eligible.has(record.sessionID)) eligible.set(record.sessionID, isMeasurementScopeEligible(scoped, sessionScopes, links));
+    return eligible.get(record.sessionID);
+  });
+}
+export const projectHistoryRecords = filterHistoryRecords;
 export const DEFAULT_MAX_RECORDS = 1000;
 
 /** Persist this marker: normalization's zero is not an original timing fact. */
@@ -88,6 +105,8 @@ export function mergeHistoryRecords(mainRecords, recoveredRecords) {
     const existing = byMessage.get(normalized.messageID);
     if (!existing || isPreferredRecord(normalized, existing)) {
       byMessage.set(normalized.messageID, mergeAcceptedRecord(normalized, existing));
+    } else {
+      byMessage.set(normalized.messageID, mergeHistoryScope(existing, normalized));
     }
   }
   return [...byMessage.values()];
@@ -154,6 +173,8 @@ export function parseHistoryJsonl(content) {
         const existing = byMessage.get(record.messageID);
         if (!existing || isPreferredRecord(record, existing)) {
           byMessage.set(record.messageID, mergeAcceptedRecord(record, existing));
+        } else {
+          byMessage.set(record.messageID, mergeHistoryScope(existing, record));
         }
       }
     } catch {
@@ -170,6 +191,8 @@ export function serializeHistoryJsonl(records) {
     const existing = unique.get(normalized.messageID);
     if (!existing || isPreferredRecord(normalized, existing)) {
       unique.set(normalized.messageID, mergeAcceptedRecord(normalized, existing));
+    } else {
+      unique.set(normalized.messageID, mergeHistoryScope(existing, normalized));
     }
   }
   if (unique.size === 0) return "";
@@ -208,6 +231,9 @@ export function normalizeHistoryRecord(value) {
     } : {}),
     ...(coerceCompletionUpdate(value.update) ? {
       update: coerceCompletionUpdate(value.update)
+    } : {}),
+    ...(coerceScopeEvidence(value.scope) ? {
+      scope: coerceScopeEvidence(value.scope)
     } : {})
   };
 }
@@ -215,7 +241,7 @@ function upsertRecord(records, record) {
   const normalized = normalizeHistoryRecord(record);
   if (!normalized) throw new TypeError("Invalid history record");
   const existing = records.find(entry => entry.messageID === normalized.messageID);
-  const chosen = existing && !isPreferredRecord(normalized, existing) ? existing : mergeAcceptedRecord(normalized, existing);
+  const chosen = existing && !isPreferredRecord(normalized, existing) ? mergeHistoryScope(existing, normalized) : mergeAcceptedRecord(normalized, existing);
   const result = records.filter(entry => entry.messageID !== normalized.messageID);
   result.push(chosen);
   return result;
@@ -225,10 +251,17 @@ function upsertRecord(records, record) {
 function mergeAcceptedRecord(candidate, existing) {
   if (!existing) return candidate;
   const speed = coerceSpeedContribution(mergeRecordSpeed(candidate, existing, candidate.update && candidate.speed !== undefined && !candidate.speed.generation ? "invalidated" : "unobserved"));
+  const merged = mergeHistoryScope(candidate, existing);
+  if (speed) merged.speed = speed;else if (candidate.speed !== undefined) merged.speed = {};else delete merged.speed;
+  return merged;
+}
+function mergeHistoryScope(candidate, existing) {
   const merged = {
     ...candidate
   };
-  if (speed) merged.speed = speed;else if (candidate.speed !== undefined) merged.speed = {};else delete merged.speed;
+  const oldScope = existing.scope;
+  const nextScope = candidate.scope;
+  if (oldScope || nextScope) merged.scope = nextScope ? mergeScopeEvidence(oldScope, nextScope) : oldScope;
   return merged;
 }
 function isPreferredRecord(candidate, existing) {
