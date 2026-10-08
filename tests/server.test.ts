@@ -50,9 +50,23 @@ const thinking = (id = "m", start: number | undefined = 100, timestamp = 200, ex
     ...(start === undefined ? {} : { time: { start } }), ...extra } } });
 const delta = (id = "m", timestamp = 500, partID = `${id}-r`, text = "think") => ({ type: "message.part.delta", timestamp,
   properties: { sessionID: "s", messageID: id, partID, field: "text", delta: text } });
-const completed = (id = "m", output = 0, reasoning = 10, end = 1000) => ({ type: "message.updated", timestamp: end,
-  properties: { info: { id, sessionID: "s", role: "assistant", tokens: { input: 1, output, reasoning }, cost: 2,
-    time: { created: 0, completed: end } } } });
+const completed = (id = "m", output = 0, reasoning = 10, end = 1000) => {
+  const info: {
+    id: string;
+    sessionID: string;
+    role: string;
+    tokens: { input: number; output: number; reasoning: number };
+    cost: number;
+    time: { created: number; completed: number };
+    agent?: string;
+    mode?: string;
+    title?: string;
+  } = {
+    id, sessionID: "s", role: "assistant", tokens: { input: 1, output, reasoning }, cost: 2,
+    time: { created: 0, completed: end },
+  };
+  return { type: "message.updated", timestamp: end, properties: { info } };
+};
 async function records(path: string) { return parseHistoryJsonl(await readFile(path, "utf8")); }
 
 test("metadata-only Thinking precedes content, keeps earliest provenance and adds no samples", async () => {
@@ -561,4 +575,67 @@ test("server v3 migration preserves legacy usage across replay/restart/pruning w
     assert.equal(after.sessions.s.cost, 6);
     assert.equal(after.sessions.s.speed, undefined);
   }, [legacy("good"), legacy("missing", { completed: 1000 })], 1);
+});
+
+test("assistant completion keeps fixer then oracle without recounting, and ignores mode, title, and compaction", async () => {
+  await backend(async ({ path, send }) => {
+    await send({ ...started(), properties: { info: { ...started().properties.info, agent: " fixer " } } });
+    await send(completed("m", 4, 0, 100));
+    assert.equal((await records(path))[0].agent, "fixer");
+    const oracle = completed("m", 4, 0, 200);
+    oracle.properties.info = { ...oracle.properties.info, agent: "oracle" };
+    await send(oracle);
+    const [record] = await records(path);
+    assert.equal(record.agent, "oracle");
+    assert.equal(record.tokens.output, 4);
+    assert.equal(record.cost, 2);
+    assert.equal(record.samples.length, 0);
+    const ledger = await createTotalsStorage({ historyPath: path }).read();
+    assert.deepEqual(ledger.sessionAgents?.s, ["fixer", "oracle"]);
+    assert.equal(ledger.sessions.s.tokens.output, 4);
+    assert.equal(ledger.sessions.s.cost, 2);
+    assert.equal(ledger.sessions.s.responseCount, 1);
+    const plain = completed("plain", 3, 0, 300);
+    plain.properties.info = { ...plain.properties.info, mode: "designer", title: "fixer" };
+    await send(plain);
+    assert.equal((await records(path)).find((entry) => entry.messageID === "plain")?.agent, undefined);
+    const hidden = completed("hidden", 9, 0, 400);
+    hidden.properties.info = { ...hidden.properties.info, agent: "compaction", mode: "designer", title: "oracle" };
+    await send(hidden);
+    const stored = await records(path);
+    assert.equal(stored.find((entry) => entry.messageID === "hidden"), undefined);
+    assert.equal(stored.find((entry) => entry.messageID === "m")?.agent, "oracle");
+    const after = await createTotalsStorage({ historyPath: path }).read();
+    assert.deepEqual(after.sessionAgents?.s, ["fixer", "oracle"]);
+    assert.equal(after.sessions.s.tokens.output, 7);
+    assert.equal(after.sessions.s.responseCount, 2);
+    assert.equal(after.sessions.s.cost, 4);
+  });
+});
+
+test("delta and part updates do not store agent names or rewrite history and totals", async () => {
+  await backend(async ({ path, send }) => {
+    const totals = createTotalsStorage({ historyPath: path });
+    const before = await readFile(totals.path, "utf8");
+    await send({ ...delta(), properties: { ...delta().properties, agent: "delta-must-not-be-read", info: { id: "m", agent: "delta-must-not-be-read" } } });
+    await send({ type: "message.part.updated", timestamp: 220, properties: {
+      agent: "part-must-not-be-read",
+      part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "think", agent: "part-must-not-be-read" },
+    } });
+    assert.equal(await readFile(totals.path, "utf8"), before);
+    await send({ ...started(), properties: { info: { ...started().properties.info, agent: "fixer" } } });
+    await send(completed("m", 4, 0, 100));
+    const historyBefore = await readFile(path, "utf8");
+    const totalsBefore = await readFile(totals.path, "utf8");
+    await send({ ...delta("m", 150), properties: { ...delta("m", 150).properties, agent: "delta-must-not-be-read", info: { agent: "delta-must-not-be-read" } } });
+    await send({ type: "message.part.updated", timestamp: 180, properties: {
+      agent: "part-must-not-be-read",
+      part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "later", agent: "part-must-not-be-read" },
+    } });
+    assert.equal(await readFile(path, "utf8"), historyBefore);
+    assert.equal(await readFile(totals.path, "utf8"), totalsBefore);
+    assert.equal((await records(path))[0].agent, "fixer");
+    assert.equal((await records(path))[0].samples.length, 0);
+    assert.equal((await records(path))[0].speed, undefined);
+  });
 });

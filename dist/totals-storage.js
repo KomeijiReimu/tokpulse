@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { addTokenCounts, emptyTokenCounts, normalizeTokenCounts } from "./core.js";
 import { GENERATION_BASIS_VERSION, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, emptySpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
 import { coerceScopeEvidence, isSessionScopeExcluded, mergeScopeEvidence } from "./scope.js";
 export const TOTALS_VERSION = 1;
 export { GENERATION_BASIS_VERSION } from './statistics.js';
@@ -64,6 +65,11 @@ export function createTotalsStorage(pathOrOptions) {
       ledger.sessionScopes[sessionID] = mergeScopeEvidence(ledger.sessionScopes[sessionID], proof);
       return persistLedger(path, ledger);
     }),
+    setSessionAgent: (sessionID, agent) => enqueuePath(path, async () => {
+      const ledger = await loadLedger(path);
+      if (!rememberSessionAgent(ledger, sessionID, agent)) return cloneLedger(ledger);
+      return persistLedger(path, ledger);
+    }),
     excludeMessage: (messageID, scopeProof) => enqueuePath(path, async () => {
       const proof = coerceScopeEvidence(scopeProof);
       if (!messageID || !proof || !["magic-message", "magic-session"].includes(proof.sourceScope)) throw new TypeError("Invalid message exclusion");
@@ -89,7 +95,9 @@ async function seedLedger(path, records) {
   if (!Array.isArray(records)) throw new TypeError("Totals seed records must be an array");
   const existing = await readExistingLedger(path);
   if (existing) {
-    if (migrateGenerationBasis(existing)) return persistLedger(path, existing);
+    let changed = migrateGenerationBasis(existing);
+    for (const record of records) if (rememberRecordAgent(existing, record)) changed = true;
+    if (changed) return persistLedger(path, existing);
     return cloneLedger(existing);
   }
   const ledger = emptyLedger();
@@ -154,6 +162,26 @@ function applyRecord(ledger, record, options = {}) {
   applyOpenRecord(ledger, record);
   freezeRetained(ledger, options.retainedMessageIDs);
 }
+function rememberSessionAgent(ledger, sessionID, agent) {
+  if (typeof sessionID !== "string" || sessionID.length === 0) return false;
+  const name = normalizeAgentName(agent);
+  if (!name) return false;
+  const current = ledger.sessionAgents?.[sessionID];
+  const next = normalizeAgentNames([...(current ?? []), name]);
+  if (current && current.length === next.length && current.every((entry, index) => entry === next[index])) return false;
+  ledger.sessionAgents = {
+    ...ledger.sessionAgents,
+    [sessionID]: next
+  };
+  return true;
+}
+
+/** Names are metadata. Magic exclusions stay on the scope path and are not reclassified here. */
+function rememberRecordAgent(ledger, record) {
+  const proof = coerceScopeEvidence(record.scope);
+  if (proof?.sourceScope === "magic-message" || proof?.sourceScope === "magic-session") return false;
+  return rememberSessionAgent(ledger, record.sessionID, record.agent);
+}
 function applyOpenRecord(ledger, record) {
   const messageID = requireMessageID(record);
   const proof = coerceScopeEvidence(record.scope);
@@ -175,20 +203,26 @@ function applyOpenRecord(ledger, record) {
     const frozen = ledger.settled[messageID];
     if (frozen === true) return;
     if (frozen) {
-      if (sameContribution(frozen, contribution)) return;
+      if (sameContribution(frozen, contribution)) {
+        rememberRecordAgent(ledger, record);
+        return;
+      }
       replaceContribution(ledger, frozen, contribution);
       delete ledger.settled[messageID];
       ledger.open[messageID] = contribution;
+      rememberRecordAgent(ledger, record);
       return;
     }
     addContribution(ensureSession(ledger, contribution.sessionID), contribution);
     ledger.open[messageID] = contribution;
+    rememberRecordAgent(ledger, record);
     return;
   }
   if (!sameContribution(previous, contribution)) {
     replaceContribution(ledger, previous, contribution);
     ledger.open[messageID] = contribution;
   }
+  rememberRecordAgent(ledger, record);
 }
 function excludeContribution(ledger, messageID, proof) {
   const prior = ledger.settled[messageID] ?? ledger.open[messageID];
@@ -402,6 +436,7 @@ function cloneLedger(ledger) {
   for (const [messageID, contribution] of Object.entries(ledger.open)) {
     open[messageID] = cloneContribution(contribution);
   }
+  const sessionAgents = cloneSessionAgents(ledger.sessionAgents);
   return {
     version: TOTALS_VERSION,
     ...(ledger.generationBasisVersion === GENERATION_BASIS_VERSION ? {
@@ -415,6 +450,9 @@ function cloneLedger(ledger) {
     } : {}),
     ...(ledger.messageScopes ? {
       messageScopes: cloneMessageScopes(ledger.messageScopes, ledger.settled)
+    } : {}),
+    ...(sessionAgents ? {
+      sessionAgents
     } : {})
   };
 }
@@ -492,8 +530,21 @@ function coerceLedger(value) {
     } : {}),
     ...(value.messageScopes !== undefined ? {
       messageScopes: cloneMessageScopes(value.messageScopes, settled)
+    } : {}),
+    ...(cloneSessionAgents(value.sessionAgents) ? {
+      sessionAgents: cloneSessionAgents(value.sessionAgents)
     } : {})
   };
+}
+function cloneSessionAgents(value) {
+  if (!isPlainObject(value)) return undefined;
+  const sessionAgents = {};
+  for (const [sessionID, raw] of Object.entries(value)) {
+    if (sessionID.length === 0) continue;
+    const names = normalizeAgentNames(raw);
+    if (names.length > 0) sessionAgents[sessionID] = names;
+  }
+  return Object.keys(sessionAgents).length > 0 ? sessionAgents : undefined;
 }
 function cloneSessionScopes(value) {
   if (!isPlainObject(value)) throw new TypeError("Invalid totals ledger");

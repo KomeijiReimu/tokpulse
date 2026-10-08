@@ -82,6 +82,82 @@ function beginObserved(store: ReturnType<typeof createRuntimeStore>, id = "m", c
     properties: { sessionID: "s", messageID: id, stepID: `${id}-step` } });
 }
 
+test("TUI optimistic completions retain validated info or active agent and preserve it on legacy corrections", () => {
+  const store = createRuntimeStore(10, 0);
+  try {
+    send(store, { type: "message.updated", timestamp: 10, properties: { info: {
+      id: "m", sessionID: "s", role: "assistant", agent: " custom-fixer ", time: { created: 0 },
+    } } });
+    assert.equal(store.active.get("m")!.agent, "custom-fixer");
+    send(store, completion("m", 10, 0, 0, 100), 100);
+    assert.equal(store.records[0].agent, "custom-fixer", "completion lacking agent retains active identity");
+    send(store, completion("m", 20, 0, 0, 200), 200);
+    assert.equal(store.records[0].agent, "custom-fixer", "legacy correction cannot erase previous identity");
+    const next = completion("next", 10, 0, 250, 300);
+    Object.assign(next.properties.info, { agent: " oracle " });
+    send(store, next, 300);
+    assert.equal(store.records.find((record) => record.messageID === "next")?.agent, "oracle");
+    const unknown = completion("unknown", 10, 0, 350, 400);
+    Object.assign(unknown.properties.info, { agent: "bad\u001bname", mode: "designer", title: "fixer" });
+    send(store, unknown, 400);
+    assert.equal(store.records.find((record) => record.messageID === "unknown")?.agent, undefined);
+    const compaction = completion("compact", 100, 0, 450, 500);
+    Object.assign(compaction.properties.info, { agent: "compaction" });
+    send(store, compaction, 500);
+    assert.equal(store.records.some((record) => record.messageID === "compact"), false);
+  } finally { store.disposeSignals(); }
+});
+
+test("TUI totals snapshot parses normalized cumulative names, survives empty history and reads legacy maps safely", async () => {
+  const directory = await testDirectory("agent-names-");
+  const store = createRuntimeStore(1, 0);
+  try {
+    const historyPath = join(directory, "history.jsonl");
+    const totalsPath = join(directory, "totals.json");
+    await writeFile(historyPath, "");
+    store.sessionParents.set("child", "root");
+    const base = { ...store.totalsLedger, sessions: { child: { tokens: { input: 1, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 1, responseCount: 2 } } };
+    for (const sessionAgents of [
+      { child: [" oracle ", "fixer", "fixer", "compaction", "", "bad\nname", "x".repeat(257)], blank: [" "], malformed: "designer" },
+      undefined, null, 42, ["fixer"],
+    ]) {
+      const bytes = JSON.stringify({ ...base, ...(sessionAgents !== undefined ? { sessionAgents } : {}) });
+      await writeFile(totalsPath, bytes);
+      await reloadHistory(store, api, historyPath, totalsPath, 1);
+      assert.deepEqual(childRows(store.records, "root", store)[0].agents, sessionAgents && typeof sessionAgents === "object" && !Array.isArray(sessionAgents) ? ["fixer", "oracle"] : []);
+      assert.equal(store.totalsLedger.sessionAgents?.malformed, undefined);
+      assert.equal(store.totalsLedger.sessionAgents?.blank, undefined);
+      assert.equal(await readFile(totalsPath, "utf8"), bytes, "TUI reads names without rewriting the server ledger");
+    }
+  } finally { store.disposeSignals(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("TUI legacy disk confirmation retains observed agent while accepting canonical usage and LAST", async () => {
+  const directory = await testDirectory("agent-confirmation-");
+  const store = createRuntimeStore(1, 0);
+  try {
+    const historyPath = join(directory, "history.jsonl");
+    const totalsPath = join(directory, "totals.json");
+    const event = completion("m", 10, 0, 0, 100);
+    Object.assign(event.properties.info, { agent: "fixer" });
+    send(store, event, 100);
+    const local = store.records[0];
+    const { agent: _agent, ...legacy } = local;
+    const disk = { ...legacy, tokens: { ...local.tokens, output: 20 } };
+    await writeFile(historyPath, JSON.stringify(disk) + "\n");
+    for (let reload = 0; reload < 2; reload++) {
+      await reloadHistory(store, api, historyPath, totalsPath, 1);
+      assert.equal(store.records[0].agent, "fixer");
+      assert.equal(store.records[0].tokens.output, 20, "metadata retention must not pin old usage");
+      assert.equal(store.lastCompletedBySession.get("s")?.record.agent, "fixer");
+    }
+    await writeFile(historyPath, JSON.stringify({ ...disk, agent: "fixer" }) + "\n");
+    await reloadHistory(store, api, historyPath, totalsPath, 1);
+    assert.equal(store.optimistic.has("m"), false, "named disk confirmation retires the overlay normally");
+    assert.equal(store.records[0].agent, "fixer");
+  } finally { store.disposeSignals(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("TUI live corrections allow explicit zero, smaller usage and shorter duration without old replay rollback", () => {
   const store = createRuntimeStore(1, 0);
   try {

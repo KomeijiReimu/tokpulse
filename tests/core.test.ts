@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeAgentName, normalizeAgentNames } from "../src/agent-names.js";
 import {
   HistoryRecord,
   type SpeedSample,
@@ -458,4 +459,22 @@ test("response stats include speed and TTFT boundaries", () => {
   assert.equal(formatNumber(1234.5), "1,234.5");
   assert.equal(formatTokens(1234.5), "1,235");
   assert.equal(formatDuration(65_000), "1m 05s");
+});
+
+test("agent names trim, reject controls and compaction, and sort without a whitelist", () => {
+  const max = "a".repeat(256);
+  assert.equal(normalizeAgentName(`  custom-worker  `), "custom-worker");
+  assert.equal(normalizeAgentName(max), max);
+  assert.equal(normalizeAgentName(` ${max} `), max);
+  assert.equal(normalizeAgentName(`${max}b`), undefined);
+  assert.equal(normalizeAgentName(" compaction "), undefined);
+  assert.equal(normalizeAgentName("Compaction"), "Compaction");
+  assert.equal(normalizeAgentName("bad\u001bname"), undefined);
+  assert.equal(normalizeAgentName("bad\nname"), undefined);
+  assert.equal(normalizeAgentName("  "), undefined);
+  assert.equal(normalizeAgentName(1), undefined);
+  assert.equal(normalizeAgentName({ agent: "fixer" }), undefined);
+  assert.deepEqual(normalizeAgentNames([" oracle ", "fixer", "fixer", "compaction", "", "bad\nname", "x".repeat(257), "bad\u001bname"]), ["fixer", "oracle"]);
+  assert.deepEqual(normalizeAgentNames("fixer"), []);
+  assert.deepEqual(normalizeAgentNames(null), []);
 });

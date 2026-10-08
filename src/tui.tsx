@@ -49,6 +49,7 @@ import {
   filterHistoryRecords,
 } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
+import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import type { TotalsRollup } from "./totals-aggregate.js";
 import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "./totals-storage.js";
@@ -318,6 +319,7 @@ export interface ActiveState {
   progress?: ContentProgress;
   observedFromStart?: boolean;
   model?: string;
+  agent?: string;
   cost?: number;
   fallbackTokens: Partial<TokenCounts>;
   legacy: CandidateStream;
@@ -591,6 +593,7 @@ interface AggregateView {
 interface ChildRow {
   depth: number;
   sessionID: string;
+  agents: string[];
   responseCount: number;
   generated: number;
   model: string;
@@ -1445,6 +1448,7 @@ function makeHistoryRecord(input: {
   sessionID: string;
   parentSessionID?: string;
   model?: string;
+  agent?: string;
   cost: number;
   tokens: TokenCounts;
   samples: SpeedSample[];
@@ -1468,12 +1472,14 @@ function makeHistoryRecord(input: {
   }
   const ttft = timeToFirstToken({ time: timing });
   const duration = Math.max(0, completed - start);
+  const agent = normalizeAgentName(input.agent);
   const record: HistoryRecord = {
     version: HISTORY_VERSION,
     messageID: input.messageID,
     sessionID: input.sessionID,
     ...(input.parentSessionID ? { parentSessionID: input.parentSessionID } : {}),
     ...(input.model ? { model: input.model } : {}),
+    ...(agent ? { agent } : {}),
     tokens: input.tokens,
     cost: Math.max(0, Number.isFinite(input.cost) ? input.cost : 0),
     time: {
@@ -2485,6 +2491,20 @@ function preferredHistoryLayer(
   candidate: HistoryLayerCandidate,
   existing: HistoryLayerCandidate,
 ): HistoryLayerCandidate {
+  const selected = selectPreferredHistoryLayer(candidate, existing);
+  const other = selected === candidate ? existing : candidate;
+  // Legacy snapshots can confirm usage without supplying agent metadata. Keep
+  // observed identity only for this same message and session, never a parent.
+  if (selected.record.messageID !== other.record.messageID || selected.record.sessionID !== other.record.sessionID
+    || normalizeAgentName(selected.record.agent)) return selected;
+  const agent = normalizeAgentName(other.record.agent);
+  return agent ? { ...selected, record: { ...selected.record, agent } } : selected;
+}
+
+function selectPreferredHistoryLayer(
+  candidate: HistoryLayerCandidate,
+  existing: HistoryLayerCandidate,
+): HistoryLayerCandidate {
   const authoritative = preferredUpdateLayer(candidate, existing);
   if (authoritative) return authoritative;
   const candidateQuality = candidate.quality ?? "exact";
@@ -2674,6 +2694,7 @@ export function handleMessageUpdated(
     bindTuiPendingTaints(store, state);
     if (observations.taintedMessages.has(messageID)) taintTuiState(store, state, "previous-response-disruption");
     state.model = state.model ?? modelName(info);
+    state.agent = normalizeAgentName(info.agent) ?? state.agent;
     state.cost = state.cost ?? readNumber(info.cost);
     state.fallbackTokens = mergeTokenFields(state.fallbackTokens, tokenFields(info.tokens));
     runtime.activeMessageID = messageID;
@@ -2722,6 +2743,7 @@ export function handleMessageUpdated(
     sessionID,
     parentSessionID: parentSessionID(api, sessionID, info, store),
     model: modelName(info) ?? state?.model,
+    agent: normalizeAgentName(info.agent) ?? state?.agent ?? (previous?.sessionID === sessionID ? previous.agent : undefined),
     cost: readNumber(info.cost) ?? state?.cost ?? 0,
     tokens,
     samples: calibrateResponseSamples(state ? finalSamples(state) : previous?.samples ?? [], {
@@ -2793,6 +2815,7 @@ function flushIdleStates(
       sessionID,
       parentSessionID: parentSessionID(api, sessionID, undefined, store),
       model: state.model,
+      agent: state.agent,
       cost: state.cost ?? 0,
       tokens,
       samples: calibrateResponseSamples(finalSamples(state), {
@@ -2992,6 +3015,7 @@ export function historyRecordsEquivalent(
     && left.sessionID === right.sessionID
     && left.parentSessionID === right.parentSessionID
     && left.model === right.model
+    && normalizeAgentName(left.agent) === normalizeAgentName(right.agent)
     && left.cost === right.cost
     && tokenCountsEqual(left.tokens, right.tokens)
     && left.time.start === right.time.start
@@ -3060,8 +3084,10 @@ export function hydrateHistoryState(
           order: store.optimisticOrder.get(record.messageID) ?? 0,
         },
       );
-      if (preferred.record === overlay) {
-        selected = overlay;
+      selected = preferred.record;
+      if (preferred.source === "optimistic") {
+        const overlay = preferred.record;
+        store.optimistic.set(record.messageID, overlay);
         if (overlayQuality === "exact") store.completedMessageIDs.add(record.messageID);
         const existing = store.lastCompletedBySession.get(overlay.sessionID);
         if (
@@ -3081,7 +3107,12 @@ export function hydrateHistoryState(
         }
         continue;
       }
-      removeOptimisticRecord(store, record.messageID);
+      if (preferred.record !== record) {
+        // Disk has confirmed canonical usage but still lacks observed identity.
+        // Retain that metadata on the confirmed snapshot until disk catches up.
+        store.optimistic.set(record.messageID, selected);
+        store.optimisticQuality.set(record.messageID, diskRecordQuality(record));
+      } else removeOptimisticRecord(store, record.messageID);
     }
     store.completedMessageIDs.add(record.messageID);
     const runtime = store.sessionRuntime.get(record.sessionID);
@@ -3095,7 +3126,7 @@ export function hydrateHistoryState(
     ) {
       store.lastCompletedBySession.set(
         record.sessionID,
-        makeLastCompletedSnapshot(record, runtime?.runEpoch ?? 0),
+        makeLastCompletedSnapshot(selected, runtime?.runEpoch ?? 0),
       );
     }
   }
@@ -3585,6 +3616,11 @@ function ChildAgentRows(props: {
           border={["left"]}
           borderColor={props.theme.current.borderSubtle}
         >
+          {row.agents.length > 0 && (
+            <text fg={props.theme.current.text} wrapMode="word" flexShrink={0}>
+              <b>{`${"  ".repeat(row.depth)}${row.agents.join(" / ")}`}</b>
+            </text>
+          )}
           <text fg={props.theme.current.info} wrapMode="word" flexShrink={0}>
             {`${"  ".repeat(row.depth)}${row.sessionID}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`}
           </text>
@@ -3675,6 +3711,7 @@ interface TotalsProjectionLedger {
   settled?: Record<string, OpenContribution | true>;
   sessionScopes?: Record<string, CompactScopeEvidence>;
   messageScopes?: Record<string, CompactScopeEvidence>;
+  sessionAgents?: Record<string, string[]>;
 }
 
 export function projectSessionTotals(
@@ -4169,6 +4206,11 @@ function coerceTotalsSnapshot(value: unknown): TotalsLedger {
     const proof = coerceScopeEvidence(raw);
     if (proof && value.settled && asRecord(value.settled)?.[id] === true) messageScopes[id] = proof;
   }
+  const sessionAgents: Record<string, string[]> = Object.create(null);
+  if (isRecord(value.sessionAgents) && !Array.isArray(value.sessionAgents)) for (const [id, raw] of Object.entries(value.sessionAgents)) {
+    const agents = normalizeAgentNames(raw);
+    if (id && agents.length > 0) sessionAgents[id] = agents;
+  }
   return {
     version: TOTALS_VERSION,
     ...(value.generationBasisVersion === 3 ? { generationBasisVersion: 3 } : {}),
@@ -4177,6 +4219,7 @@ function coerceTotalsSnapshot(value: unknown): TotalsLedger {
     settled: coerceSettled(value.settled),
     sessionScopes,
     messageScopes,
+    sessionAgents,
   };
 }
 
@@ -4281,6 +4324,10 @@ export function childRows(
       rows.push({
         depth,
         sessionID: childID,
+        agents: normalizeAgentNames([
+          ...normalizeAgentNames(ledger.sessionAgents?.[childID]),
+          ...directRecords.map((record) => record.agent),
+        ]),
         responseCount: rollup.direct.responseCount,
         generated: generatedTokens(rollup.direct.tokens),
         model: modelRecord?.model ?? "-",

@@ -62,10 +62,21 @@ async function backendCase(run: (context: { path: string; send: (event: any) => 
   finally { await rm(directory, { recursive: true, force: true }); }
 }
 function completionFact(id: string, output: number, reasoning: number, start: number, end: number) {
-  return { type: "message.updated", timestamp: end, properties: { info: {
+  const info: {
+    id: string;
+    sessionID: string;
+    role: string;
+    tokens: { input: number; output: number; reasoning: number };
+    cost: number;
+    time: { created: number; completed: number };
+    agent?: string;
+    mode?: string;
+    title?: string;
+  } = {
     id, sessionID: "s", role: "assistant", tokens: { input: 1, output, reasoning }, cost: output,
     time: { created: start, completed: end },
-  } } };
+  };
+  return { type: "message.updated", timestamp: end, properties: { info } };
 }
 
 function officialStatusResult(directory: string, data: any = {}) {
@@ -654,6 +665,7 @@ for (const sdk of ["v1", "v2"] as const) {
         await send({ type: "unrelated" });
         const ledger = await readTotals(path);
         assert.equal(ledger.sessionScopes?.s, undefined);
+        assert.equal(ledger.sessionAgents, undefined);
         assert.equal(projectTotalsMeasurementScope(ledger).sessions.s.tokens.output, 9);
         assert.equal((await new ActivityLedger(join(dirname(path), "runs.jsonl")).read()).some((e) => e.kind === "parent"), false);
         assert.equal(calls, 1);
@@ -1868,4 +1880,111 @@ test("an idle totals write failure keeps the active state for a later retry", as
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("clipped history keeps both fixer and oracle on the same session", async () => {
+  await backendCase(async ({ path, send }) => {
+    const fixer = completionFact("old", 4, 0, 0, 100);
+    fixer.properties.info = { ...fixer.properties.info, agent: "fixer" };
+    const oracle = completionFact("new", 6, 0, 200, 300);
+    oracle.properties.info = { ...oracle.properties.info, agent: "oracle" };
+    await send(fixer);
+    await send(oracle);
+    const history = await readRecords(path);
+    assert.equal(history.length, 1);
+    assert.equal(history[0].messageID, "new");
+    assert.equal(history[0].agent, "oracle");
+    const ledger = await readTotals(path);
+    assert.deepEqual(ledger.sessionAgents.s, ["fixer", "oracle"]);
+    assert.equal(ledger.sessions.s.tokens.output, 10);
+    assert.equal(ledger.sessions.s.cost, 10);
+    assert.equal(ledger.sessions.s.responseCount, 2);
+    assert.equal(ledger.settled.old.tokens.output, 4);
+  }, 1);
+});
+
+test("startup session lookup backfills a stored name without recounting usage", async () => {
+  let lookups = 0;
+  await backendCase(async ({ path, restart }) => {
+    await writeFile(join(dirname(path), "totals.json"), JSON.stringify({
+      version: 1, generationBasisVersion: 3,
+      sessions: { s: { tokens: { input: 1, output: 4, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 2, responseCount: 1 } },
+      open: {}, settled: {}, sessionAgents: { s: ["fixer"] },
+    }));
+    const restarted = await restart();
+    await eventually(async () => lookups === 1 && (await readTotals(path)).sessionAgents?.s?.includes("oracle"));
+    await restarted({ type: "unrelated", timestamp: 1 });
+    const ledger = await readTotals(path);
+    assert.deepEqual(ledger.sessionAgents.s, ["fixer", "oracle"]);
+    assert.equal(ledger.sessions.s.tokens.output, 4);
+    assert.equal(ledger.sessions.s.cost, 2);
+    assert.equal(ledger.sessions.s.responseCount, 1);
+    assert.equal(lookups, 1);
+  }, 1000, { get: (options: any) => {
+    lookups++;
+    const id = options?.path?.id ?? options?.sessionID;
+    return { data: { id, agent: id === "s" ? " oracle " : "historian" } };
+  } });
+});
+
+test("merged pending state keeps its agent when completion info omits the field", async () => {
+  await backendCase(async ({ path, send }) => {
+    await send({ type: "message.updated", timestamp: 0, properties: { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 0 } } } });
+    await send({ type: "session.next.step.ended", timestamp: 20, properties: {
+      sessionID: "s", info: { agent: "fixer", tokens: { input: 1, output: 2, reasoning: 0 } }, tokens: { input: 1, output: 2, reasoning: 0 },
+    } });
+    await send({ type: "session.next.step.ended", timestamp: 30, properties: {
+      sessionID: "s", messageID: "m", info: { tokens: { input: 1, output: 2, reasoning: 0 } }, tokens: { input: 1, output: 2, reasoning: 0 },
+    } });
+    await send(completionFact("m", 4, 0, 0, 100));
+    const [record] = await readRecords(path);
+    assert.equal(record.agent, "fixer");
+    assert.equal(record.tokens.output, 4);
+    assert.equal(record.samples.length, 0);
+    const ledger = await readTotals(path);
+    assert.deepEqual(ledger.sessionAgents.s, ["fixer"]);
+    assert.equal(ledger.sessions.s.responseCount, 1);
+    assert.equal(ledger.sessions.s.cost, 4);
+  });
+});
+
+test("session.updated names only the matching session entity", async () => {
+  await backendCase(async ({ path, send }) => {
+    await send({ type: "session.updated", properties: { info: { id: "m", sessionID: "s", role: "assistant", agent: "fixer", title: "fixer", mode: "oracle" } } });
+    await send({ type: "session.updated", timestamp: 1, properties: { id: "s", title: "fixer", mode: "oracle" } });
+    assert.equal((await readTotals(path)).sessionAgents, undefined);
+    await send({ type: "session.updated", timestamp: 2, properties: { info: { id: "s", agent: " custom-worker ", title: "fixer", mode: "oracle" } } });
+    const ledger = await readTotals(path);
+    assert.deepEqual(ledger.sessionAgents.s, ["custom-worker"]);
+    assert.equal(ledger.sessions.s, undefined);
+  });
+});
+
+test("delta and part updates add no agent lookup or totals write", async () => {
+  let lookups = 0;
+  await backendCase(async ({ path, send }) => {
+    const fact = completionFact("m", 4, 0, 0, 100);
+    fact.properties.info = { ...fact.properties.info, agent: "fixer" };
+    await send(fact);
+    await eventually(async () => lookups === 1);
+    await send({ type: "unrelated", timestamp: 120 });
+    const totalsPath = join(dirname(path), "totals.json");
+    const historyBefore = await readFile(path, "utf8");
+    const totalsBefore = await readFile(totalsPath, "utf8");
+    const seen = lookups;
+    await send({ type: "message.part.delta", timestamp: 150, properties: {
+      sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "x",
+      agent: "delta-must-not-be-read", info: { id: "m", agent: "delta-must-not-be-read" },
+    } });
+    await send({ type: "message.part.updated", timestamp: 180, properties: {
+      agent: "part-must-not-be-read",
+      part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "x", agent: "part-must-not-be-read" },
+    } });
+    assert.equal(lookups, seen);
+    assert.equal(await readFile(path, "utf8"), historyBefore);
+    assert.equal(await readFile(totalsPath, "utf8"), totalsBefore);
+    assert.equal((await readRecords(path))[0].agent, "fixer");
+    assert.equal((await readRecords(path))[0].samples.length, 0);
+    assert.equal((await readRecords(path))[0].speed, undefined);
+  }, 1000, { get: () => { lookups++; return { data: { id: "s", agent: "fixer" } }; } });
 });

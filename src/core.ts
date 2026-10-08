@@ -55,6 +55,8 @@ export interface HistoryRecord {
   sessionID: string;
   parentSessionID?: string;
   model?: string;
+  /** Exact assistant agent. Never inferred from mode, title, or model. */
+  agent?: string;
   tokens: TokenCounts;
   cost: number;
   time: ResponseTiming;

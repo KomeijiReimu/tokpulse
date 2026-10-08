@@ -23,6 +23,7 @@ import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress,
 import { createHistoryStorage, HistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage } from "./totals-storage.js";
+import { normalizeAgentName } from "./agent-names.js";
 import { createScopeRegistry, coerceScopeEvidence, type ScopeRegistry, type CompactScopeEvidence } from "./scope.js";
 
 export interface ServerOptions {
@@ -47,6 +48,7 @@ interface ActiveState {
   observedFromStart?: boolean;
   progress?: ContentProgress;
   model?: string;
+  agent?: string;
   cost?: number;
   fallbackTokens: Partial<TokenCounts>;
   legacy: CandidateStream;
@@ -475,6 +477,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
           const raw = asRecord(response.data) ?? asRecord(response);
           const session = asRecord(raw?.session) ?? raw;
           if (!session || session.id !== sessionID) return;
+          const sessionAgent = normalizeAgentName(session.agent);
           await source.enqueue(async () => {
             if ((source.metadataGeneration.get(sessionID) ?? 0) !== generation) return;
             source.scopes.observeSessionMetadata(sessionID, session);
@@ -488,6 +491,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
               // and runs. Do not forge a newer completion to rewrite history.
             }
             await persistScopeRegistry(source, totals);
+            if (sessionAgent) await totals.setSessionAgent(sessionID, sessionAgent);
           });
         } catch { /* SDK failure/404 is unknown, never negative source proof. */ }
         finally { controller.abort(); source.outstanding.delete(sessionID); }
@@ -1003,6 +1007,18 @@ function activityBoundaries(
   };
 }
 
+/** Session-entity agent only. Assistant message ids are not session ids, and mode/title are ignored. */
+function matchingSessionAgent(sessionID: string, candidates: readonly unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    const entity = asRecord(candidate);
+    if (!entity || entity.id !== sessionID) continue;
+    if (entity.role === "assistant" || entity.role === "user") continue;
+    const name = normalizeAgentName(entity.agent);
+    if (name) return name;
+  }
+  return undefined;
+}
+
 function readSessionIDFromEvent(type: string, properties: AnyRecord, event: AnyRecord): string | undefined {
   const direct = readStringFrom([properties, event], [
     "sessionID",
@@ -1258,6 +1274,11 @@ async function handleEvent(
           if (raw) source.scopes.observeSessionMetadata(sessionID, raw);
         }
         source.metadataGeneration.set(sessionID, (source.metadataGeneration.get(sessionID) ?? 0) + 1);
+        const sessionAgent = matchingSessionAgent(sessionID, [
+          asRecord(properties.session), asRecord(event.session), properties, event,
+          asRecord(properties.info), asRecord(event.info), info,
+        ]);
+        if (sessionAgent) await totals.setSessionAgent(sessionID, sessionAgent);
       }
       if (info?.role === "assistant") {
         messageProof = source.scopes.observeMessageMetadata(sessionID, info);
@@ -1453,6 +1474,8 @@ function recordStepFallback(
   const tokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
   state.fallbackTokens = mergeFallbackTokens(state.fallbackTokens, tokens);
   state.model = state.model ?? modelName(info);
+  const notedAgent = normalizeAgentName(info?.agent);
+  if (notedAgent) state.agent = notedAgent;
   state.cost = numberOrUndefined(info?.cost ?? properties.cost) ?? state.cost;
   active.set(messageID ?? pendingKey(sessionID), state);
 }
@@ -1510,6 +1533,8 @@ async function handleMessageUpdated(
       metadata.progress.set(messageID, state.progress!);
     }
     bindPendingTaint(active, state);
+    const notedAgent = normalizeAgentName(info.agent);
+    if (notedAgent) state.agent = notedAgent;
     responseRuntime(active).current.set(sessionID, messageID);
     responseRuntime(active).closed.delete(sessionID);
     active.set(messageID, state);
@@ -1602,6 +1627,7 @@ async function handleMessageUpdated(
     completedAt: timestamp,
     quality,
   });
+  if (!record.agent && previous?.agent) record.agent = previous.agent;
   if (previous) {
     const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstContent, previous.time.firstToken, record.time.firstToken);
     if (firstToken !== undefined) {
@@ -1708,12 +1734,14 @@ function makeHistoryRecord(input: {
   const firstToken = earliestFirstOutput(start, completed, numberOrUndefined(infoTime.firstToken), numberOrUndefined(infoTime.firstTokenAt), input.state?.firstTokenAt);
   const ttft = firstToken === undefined ? undefined : Math.max(0, firstToken - start);
   const duration = Math.max(0, completed - start);
+  const agent = normalizeAgentName(input.info?.agent) ?? normalizeAgentName(input.state?.agent);
   const record: HistoryRecord = {
     version: HISTORY_VERSION,
     messageID: input.messageID,
     sessionID: input.sessionID,
     ...(input.parentSessionID ? { parentSessionID: input.parentSessionID } : {}),
     ...(input.model ? { model: input.model } : {}),
+    ...(agent ? { agent } : {}),
     tokens: input.tokens,
     cost: Math.max(0, numberOrUndefined(input.cost) ?? 0),
     time: {
@@ -1795,6 +1823,7 @@ function mergeStates(target: ActiveState, source: ActiveState): void {
     target.firstTokenAt = source.firstTokenAt;
   }
   target.model = target.model ?? source.model;
+  if (!target.agent && source.agent) target.agent = source.agent;
   target.cost = target.cost ?? source.cost;
   target.fallbackTokens = mergeFallbackTokens(source.fallbackTokens, target.fallbackTokens);
   target.legacy.hasData ||= source.legacy.hasData;

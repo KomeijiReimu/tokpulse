@@ -9,6 +9,7 @@ import {
   normalizeTokenCounts,
 } from "./core.js";
 import { GENERATION_BASIS_VERSION, type CompletionUpdate, type MeasuredHistoryRecord, type SessionSpeedTotals, type SpeedContribution, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, emptySpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
 import { coerceScopeEvidence, isSessionScopeExcluded, mergeScopeEvidence, type CompactScopeEvidence, type ScopeParents } from "./scope.js";
 
 export const TOTALS_VERSION = 1 as const;
@@ -58,6 +59,8 @@ export interface TotalsLedger {
   /** Proofs for exclusions with no reversible snapshot, anchored to settled:true.
    * Snapshot-backed exclusions keep their proof directly in settled instead. */
   messageScopes?: Record<string, CompactScopeEvidence>;
+  /** Observable agent names by session. Independent of scope and the history window. */
+  sessionAgents?: Record<string, string[]>;
 }
 
 export interface TotalsPathOptions {
@@ -79,6 +82,7 @@ export interface TotalsStorage {
   /** Server-side read: atomically migrates an existing legacy ledger if needed. */
   read(): Promise<TotalsLedger>;
   setSessionScope(sessionID: string, evidence: CompactScopeEvidence): Promise<TotalsLedger>;
+  setSessionAgent(sessionID: string, agent: string): Promise<TotalsLedger>;
   excludeMessage(messageID: string, scopeProof: CompactScopeEvidence): Promise<TotalsLedger>;
   quarantine(): Promise<void>;
 }
@@ -137,6 +141,11 @@ export function createTotalsStorage(pathOrOptions: string | TotalsPathOptions): 
       ledger.sessionScopes[sessionID] = mergeScopeEvidence(ledger.sessionScopes[sessionID], proof);
       return persistLedger(path, ledger);
     }),
+    setSessionAgent: (sessionID, agent) => enqueuePath(path, async () => {
+      const ledger = await loadLedger(path);
+      if (!rememberSessionAgent(ledger, sessionID, agent)) return cloneLedger(ledger);
+      return persistLedger(path, ledger);
+    }),
     excludeMessage: (messageID, scopeProof) => enqueuePath(path, async () => {
       const proof = coerceScopeEvidence(scopeProof);
       if (!messageID || !proof || !["magic-message", "magic-session"].includes(proof.sourceScope)) throw new TypeError("Invalid message exclusion");
@@ -165,7 +174,9 @@ async function seedLedger(path: string, records: readonly HistoryRecord[]): Prom
   if (!Array.isArray(records)) throw new TypeError("Totals seed records must be an array");
   const existing = await readExistingLedger(path);
   if (existing) {
-    if (migrateGenerationBasis(existing)) return persistLedger(path, existing);
+    let changed = migrateGenerationBasis(existing);
+    for (const record of records) if (rememberRecordAgent(existing, record)) changed = true;
+    if (changed) return persistLedger(path, existing);
     return cloneLedger(existing);
   }
 
@@ -242,6 +253,24 @@ function applyRecord(
   freezeRetained(ledger, options.retainedMessageIDs);
 }
 
+function rememberSessionAgent(ledger: TotalsLedger, sessionID: unknown, agent: unknown): boolean {
+  if (typeof sessionID !== "string" || sessionID.length === 0) return false;
+  const name = normalizeAgentName(agent);
+  if (!name) return false;
+  const current = ledger.sessionAgents?.[sessionID];
+  const next = normalizeAgentNames([...(current ?? []), name]);
+  if (current && current.length === next.length && current.every((entry, index) => entry === next[index])) return false;
+  ledger.sessionAgents = { ...ledger.sessionAgents, [sessionID]: next };
+  return true;
+}
+
+/** Names are metadata. Magic exclusions stay on the scope path and are not reclassified here. */
+function rememberRecordAgent(ledger: TotalsLedger, record: HistoryRecord): boolean {
+  const proof = coerceScopeEvidence(record.scope);
+  if (proof?.sourceScope === "magic-message" || proof?.sourceScope === "magic-session") return false;
+  return rememberSessionAgent(ledger, record.sessionID, record.agent);
+}
+
 function applyOpenRecord(ledger: TotalsLedger, record: HistoryRecord): void {
   const messageID = requireMessageID(record);
   const proof = coerceScopeEvidence(record.scope);
@@ -264,14 +293,19 @@ function applyOpenRecord(ledger: TotalsLedger, record: HistoryRecord): void {
     const frozen = ledger.settled[messageID];
     if (frozen === true) return;
     if (frozen) {
-      if (sameContribution(frozen, contribution)) return;
+      if (sameContribution(frozen, contribution)) {
+        rememberRecordAgent(ledger, record);
+        return;
+      }
       replaceContribution(ledger, frozen, contribution);
       delete ledger.settled[messageID];
       ledger.open[messageID] = contribution;
+      rememberRecordAgent(ledger, record);
       return;
     }
     addContribution(ensureSession(ledger, contribution.sessionID), contribution);
     ledger.open[messageID] = contribution;
+    rememberRecordAgent(ledger, record);
     return;
   }
 
@@ -279,6 +313,7 @@ function applyOpenRecord(ledger: TotalsLedger, record: HistoryRecord): void {
     replaceContribution(ledger, previous, contribution);
     ledger.open[messageID] = contribution;
   }
+  rememberRecordAgent(ledger, record);
 }
 
 function excludeContribution(ledger: TotalsLedger, messageID: string, proof: CompactScopeEvidence): void {
@@ -517,6 +552,7 @@ function cloneLedger(ledger: TotalsLedger): TotalsLedger {
   for (const [messageID, contribution] of Object.entries(ledger.open)) {
     open[messageID] = cloneContribution(contribution);
   }
+  const sessionAgents = cloneSessionAgents(ledger.sessionAgents);
   return {
     version: TOTALS_VERSION,
     ...(ledger.generationBasisVersion === GENERATION_BASIS_VERSION ? { generationBasisVersion: GENERATION_BASIS_VERSION } : {}),
@@ -525,6 +561,7 @@ function cloneLedger(ledger: TotalsLedger): TotalsLedger {
     settled: cloneSettled(ledger.settled),
     ...(ledger.sessionScopes ? { sessionScopes: cloneSessionScopes(ledger.sessionScopes) } : {}),
     ...(ledger.messageScopes ? { messageScopes: cloneMessageScopes(ledger.messageScopes, ledger.settled) } : {}),
+    ...(sessionAgents ? { sessionAgents } : {}),
   };
 }
 
@@ -586,7 +623,19 @@ function coerceLedger(value: unknown): TotalsLedger {
     settled,
     ...(value.sessionScopes !== undefined ? { sessionScopes: cloneSessionScopes(value.sessionScopes) } : {}),
     ...(value.messageScopes !== undefined ? { messageScopes: cloneMessageScopes(value.messageScopes, settled) } : {}),
+    ...(cloneSessionAgents(value.sessionAgents) ? { sessionAgents: cloneSessionAgents(value.sessionAgents) } : {}),
   };
+}
+
+function cloneSessionAgents(value: unknown): Record<string, string[]> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const sessionAgents: Record<string, string[]> = {};
+  for (const [sessionID, raw] of Object.entries(value)) {
+    if (sessionID.length === 0) continue;
+    const names = normalizeAgentNames(raw);
+    if (names.length > 0) sessionAgents[sessionID] = names;
+  }
+  return Object.keys(sessionAgents).length > 0 ? sessionAgents : undefined;
 }
 
 function cloneSessionScopes(value: unknown): Record<string, CompactScopeEvidence> {

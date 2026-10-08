@@ -6,6 +6,7 @@ import { cachedContentProgress, coerceCompletionUpdate, createContentMetadataCac
 import { createHistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
+import { normalizeAgentName } from "./agent-names.js";
 import { createScopeRegistry, coerceScopeEvidence } from "./scope.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
@@ -423,6 +424,7 @@ export const server = async (input, pluginOptions) => {
           const raw = asRecord(response.data) ?? asRecord(response);
           const session = asRecord(raw?.session) ?? raw;
           if (!session || session.id !== sessionID) return;
+          const sessionAgent = normalizeAgentName(session.agent);
           await source.enqueue(async () => {
             if ((source.metadataGeneration.get(sessionID) ?? 0) !== generation) return;
             source.scopes.observeSessionMetadata(sessionID, session);
@@ -436,6 +438,7 @@ export const server = async (input, pluginOptions) => {
               // and runs. Do not forge a newer completion to rewrite history.
             }
             await persistScopeRegistry(source, totals);
+            if (sessionAgent) await totals.setSessionAgent(sessionID, sessionAgent);
           });
         } catch {/* SDK failure/404 is unknown, never negative source proof. */} finally {
           controller.abort();
@@ -765,6 +768,18 @@ function activityBoundaries(properties, event) {
     })
   };
 }
+
+/** Session-entity agent only. Assistant message ids are not session ids, and mode/title are ignored. */
+function matchingSessionAgent(sessionID, candidates) {
+  for (const candidate of candidates) {
+    const entity = asRecord(candidate);
+    if (!entity || entity.id !== sessionID) continue;
+    if (entity.role === "assistant" || entity.role === "user") continue;
+    const name = normalizeAgentName(entity.agent);
+    if (name) return name;
+  }
+  return undefined;
+}
 function readSessionIDFromEvent(type, properties, event) {
   const direct = readStringFrom([properties, event], ["sessionID", "sessionId", "session.id"]);
   if (direct) return direct;
@@ -908,6 +923,8 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
           if (raw) source.scopes.observeSessionMetadata(sessionID, raw);
         }
         source.metadataGeneration.set(sessionID, (source.metadataGeneration.get(sessionID) ?? 0) + 1);
+        const sessionAgent = matchingSessionAgent(sessionID, [asRecord(properties.session), asRecord(event.session), properties, event, asRecord(properties.info), asRecord(event.info), info]);
+        if (sessionAgent) await totals.setSessionAgent(sessionID, sessionAgent);
       }
       if (info?.role === "assistant") {
         messageProof = source.scopes.observeMessageMetadata(sessionID, info);
@@ -1069,6 +1086,8 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   const tokens = tokenFields(info?.tokens ?? properties.tokens ?? properties);
   state.fallbackTokens = mergeFallbackTokens(state.fallbackTokens, tokens);
   state.model = state.model ?? modelName(info);
+  const notedAgent = normalizeAgentName(info?.agent);
+  if (notedAgent) state.agent = notedAgent;
   state.cost = numberOrUndefined(info?.cost ?? properties.cost) ?? state.cost;
   active.set(messageID ?? pendingKey(sessionID), state);
 }
@@ -1116,6 +1135,8 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
       metadata.progress.set(messageID, state.progress);
     }
     bindPendingTaint(active, state);
+    const notedAgent = normalizeAgentName(info.agent);
+    if (notedAgent) state.agent = notedAgent;
     responseRuntime(active).current.set(sessionID, messageID);
     responseRuntime(active).closed.delete(sessionID);
     active.set(messageID, state);
@@ -1208,6 +1229,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     completedAt: timestamp,
     quality
   });
+  if (!record.agent && previous?.agent) record.agent = previous.agent;
   if (previous) {
     const firstToken = earliestFirstOutput(record.time.start, record.time.completed ?? timestamp, previous.time.firstContent, previous.time.firstToken, record.time.firstToken);
     if (firstToken !== undefined) {
@@ -1275,6 +1297,7 @@ function makeHistoryRecord(input) {
   const firstToken = earliestFirstOutput(start, completed, numberOrUndefined(infoTime.firstToken), numberOrUndefined(infoTime.firstTokenAt), input.state?.firstTokenAt);
   const ttft = firstToken === undefined ? undefined : Math.max(0, firstToken - start);
   const duration = Math.max(0, completed - start);
+  const agent = normalizeAgentName(input.info?.agent) ?? normalizeAgentName(input.state?.agent);
   const record = {
     version: HISTORY_VERSION,
     messageID: input.messageID,
@@ -1284,6 +1307,9 @@ function makeHistoryRecord(input) {
     } : {}),
     ...(input.model ? {
       model: input.model
+    } : {}),
+    ...(agent ? {
+      agent
     } : {}),
     tokens: input.tokens,
     cost: Math.max(0, numberOrUndefined(input.cost) ?? 0),
@@ -1369,6 +1395,7 @@ function mergeStates(target, source) {
     target.firstTokenAt = source.firstTokenAt;
   }
   target.model = target.model ?? source.model;
+  if (!target.agent && source.agent) target.agent = source.agent;
   target.cost = target.cost ?? source.cost;
   target.fallbackTokens = mergeFallbackTokens(source.fallbackTokens, target.fallbackTokens);
   target.legacy.hasData ||= source.legacy.hasData;

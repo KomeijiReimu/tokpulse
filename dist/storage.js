@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promise
 import { dirname, basename, join } from "node:path";
 import { HISTORY_VERSION } from "./core.js";
 import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, mergeRecordSpeed } from './statistics.js';
+import { normalizeAgentName } from "./agent-names.js";
 import { coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, mergeScopeEvidence } from "./scope.js";
 /** Display-only filtering; never deletes raw historical facts. */
 export function filterHistoryRecords(records, sessionScopes = {}, parents, excludedMessageIDs) {
@@ -207,6 +208,7 @@ export function normalizeHistoryRecord(value) {
   const time = normalizeTime(value.time);
   const samples = Array.isArray(value.samples) ? value.samples.map(normalizeSample).filter(sample => sample !== undefined) : [];
   const quality = value.quality === "provisional" || value.quality === "exact" ? value.quality : undefined;
+  const agent = normalizeAgentName(value.agent);
   return {
     version: HISTORY_VERSION,
     messageID: value.messageID,
@@ -216,6 +218,9 @@ export function normalizeHistoryRecord(value) {
     } : {}),
     ...(typeof value.model === "string" && value.model.length > 0 ? {
       model: value.model
+    } : {}),
+    ...(agent ? {
+      agent
     } : {}),
     tokens,
     cost: nonNegativeNumber(value.cost),
@@ -262,6 +267,7 @@ function mergeHistoryScope(candidate, existing) {
   const oldScope = existing.scope;
   const nextScope = candidate.scope;
   if (oldScope || nextScope) merged.scope = nextScope ? mergeScopeEvidence(oldScope, nextScope) : oldScope;
+  if (!merged.agent && existing.agent) merged.agent = existing.agent;
   return merged;
 }
 function isPreferredRecord(candidate, existing) {

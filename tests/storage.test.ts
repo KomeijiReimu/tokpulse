@@ -17,6 +17,7 @@ import {
 } from "../src/storage.js";
 import { classifyMessageMetadata, createScopeRegistry } from "../src/scope.js";
 
+
 test("late session scope projects old history without destroying raw records or normal users", async (context) => {
   const directory = await makeTestDirectory(context);
   const path = join(directory, "history.jsonl");
@@ -321,3 +322,19 @@ function historyRecord(
     ...overrides,
   };
 }
+
+test("history stores an exact agent and does not infer one from mode, title, or compaction", () => {
+  const [named] = parseHistoryJsonl(serializeHistoryJsonl([historyRecord("m", { agent: " fixer " })]));
+  assert.equal(named.agent, "fixer");
+  assert.equal(parseHistoryJsonl(serializeHistoryJsonl([historyRecord("legacy")]))[0].agent, undefined);
+  const raw = { ...historyRecord("plain"), mode: "designer", title: "fixer" };
+  delete raw.agent;
+  assert.equal(parseHistoryJsonl(`${JSON.stringify(raw)}\n`)[0].agent, undefined);
+  assert.equal(parseHistoryJsonl(serializeHistoryJsonl([historyRecord("bad", { agent: "bad\u001bname" })]))[0].agent, undefined);
+  assert.equal(parseHistoryJsonl(serializeHistoryJsonl([historyRecord("compact", { agent: "compaction" })]))[0].agent, undefined);
+  const [kept] = parseHistoryJsonl(`${JSON.stringify(historyRecord("m", { agent: "oracle" }))}\n${JSON.stringify(historyRecord("m"))}\n`);
+  assert.equal(kept.agent, "oracle");
+  assert.equal(kept.tokens.output, 5);
+  const [replaced] = parseHistoryJsonl(`${JSON.stringify(historyRecord("m", { agent: "fixer" }))}\n${JSON.stringify(historyRecord("m", { agent: " custom-worker " }))}\n`);
+  assert.equal(replaced.agent, "custom-worker");
+});

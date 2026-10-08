@@ -1267,6 +1267,68 @@ test("child agent rows use cumulative direct generation, not bounded response hi
   } finally { store.disposeSignals(); }
 });
 
+test("child names combine only direct scoped records and cumulative ledger names in stable order", () => {
+  const store = createRuntimeStore(1);
+  try {
+    const direct = { tokens: tokens(200), cost: 1, responseCount: 3 };
+    store.totalsLedger.sessions = { root: direct, child: direct, grand: direct, unknown: direct };
+    store.totalsLedger.sessionAgents = {
+      root: ["parent-only"], child: [" oracle ", "fixer", "compaction", "fixer", "bad\u001bname"], grand: ["nested-only"],
+    };
+    store.sessionParents = new Map([["child", "root"], ["grand", "child"], ["unknown", "root"]]);
+    const records = [
+      record("first", "child", 10, 0, { agent: "designer", model: "older-model" }),
+      record("last", "child", 10, 0, { model: "not-an-agent", time: { start: 1200, completed: 2000 } }),
+      record("grand-last", "grand", 10, 0, { agent: "nested-only" }),
+      record("legacy", "unknown", 10, 0, { model: "fixer" }),
+    ];
+    for (const entry of records) store.totalsLedger.settled[entry.messageID] = true;
+    const raw = structuredClone(store.totalsLedger);
+    const rows = childRows(records, "root", store);
+    assert.deepEqual(rows.map((row) => [row.sessionID, row.depth, row.agents]), [
+      ["child", 0, ["designer", "fixer", "oracle"]], ["grand", 1, ["nested-only"]], ["unknown", 0, []],
+    ]);
+    assert.equal(rows[0].model, "not-an-agent", "latest model record need not contain an agent");
+    assert.deepEqual(childRows([], "root", store).map((row) => row.agents), [["fixer", "oracle"], ["nested-only"], []], "ledger names survive a fully trimmed history");
+    assert.deepEqual(childRows(records, "child", store).map((row) => [row.sessionID, row.agents]), [["grand", ["nested-only"]]], "child route must not inherit parent or sibling names");
+    assert.deepEqual(store.totalsLedger, raw, "name display does not mutate ledger metadata");
+    const { sessionAgents: _sessionAgents, ...legacyLedger } = store.totalsLedger;
+    store.totalsLedger = legacyLedger; // Reloads replace the snapshot; projections cache by ledger identity.
+    assert.deepEqual(childRows(records, "root", store).map((row) => row.agents), [["designer"], ["nested-only"], []], "legacy missing map falls back to all direct records");
+  } finally { store.disposeSignals(); }
+});
+
+test("child names cannot restore excluded maintenance sessions, descendants or message names", () => {
+  const store = createRuntimeStore(10);
+  try {
+    const direct = { tokens: tokens(20), cost: 1, responseCount: 1 };
+    store.totalsLedger.sessions = { child: direct, hidden: direct, nested: direct };
+    store.totalsLedger.sessionAgents = { hidden: ["dreamer"], nested: ["hidden-nested"] };
+    store.sessionParents = new Map([["child", "root"], ["hidden", "root"], ["nested", "hidden"]]);
+    store.totalsLedger.sessionScopes = { hidden: { version: 1, sourceScope: "magic-session", reasons: ["session-agent"] } };
+    const records = [
+      record("kept", "child", 10, 0, { agent: "fixer" }),
+      record("message-hidden", "child", 10, 0, { agent: "not-visible", scope: { version: 1, sourceScope: "magic-message", reasons: ["magic-model"] } }),
+      record("tombstoned", "child", 10, 0, { agent: "tombstoned-name" }),
+      record("hidden", "hidden", 10, 0, { agent: "dreamer" }),
+      record("nested", "nested", 10, 0, { agent: "hidden-nested" }),
+    ];
+    store.totalsLedger.settled.tombstoned = true;
+    store.totalsLedger.messageScopes = { tombstoned: { version: 1, sourceScope: "magic-message", reasons: ["magic-model"] } };
+    assert.deepEqual(childRows(records, "root", store).map((row) => [row.sessionID, row.agents]), [["child", ["fixer"]]]);
+  } finally { store.disposeSignals(); }
+});
+
+test("agent metadata participates in equivalence and survives legacy history confirmation without crossing sessions", () => {
+  const named = record("m", "child", 10, 0, { agent: "fixer" });
+  const legacy = record("m", "child", 20, 0);
+  assert.equal(historyRecordsEquivalent(named, { ...named, agent: "oracle" }), false);
+  assert.equal(historyRecordsEquivalent(named, { ...named, agent: " fixer " }), true);
+  assert.equal(mergeHistoryLayers([legacy], new Map([["m", named]]), 1)[0].agent, "fixer");
+  assert.equal(mergeHistoryLayers([named, legacy], new Map(), 1)[0].agent, "fixer");
+  assert.equal(mergeHistoryLayers([record("m", "other", 20, 0)], new Map([["m", named]]), 1)[0].agent, undefined);
+});
+
 test("details tree retains ledger-only child/grandchild and selects their own direct average and last response", () => {
   const store = createRuntimeStore(1);
   const direct = (output: number, reasoning: number, generationMs: number, responseMs: number, cost: number) => ({

@@ -7,6 +7,7 @@ import {
   TokenCounts,
 } from "./core.js";
 import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, mergeRecordSpeed, type MeasuredHistoryRecord } from './statistics.js';
+import { normalizeAgentName } from "./agent-names.js";
 import { coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, mergeScopeEvidence, type CompactScopeEvidence, type ScopeParents, type SessionScopes } from "./scope.js";
 
 export type ScopedHistoryRecord = HistoryRecord & { scope?: CompactScopeEvidence };
@@ -257,6 +258,7 @@ export function normalizeHistoryRecord(value: unknown): ScopedHistoryRecord | un
   const quality = value.quality === "provisional" || value.quality === "exact"
     ? value.quality
     : undefined;
+  const agent = normalizeAgentName(value.agent);
   return {
     version: HISTORY_VERSION,
     messageID: value.messageID,
@@ -265,6 +267,7 @@ export function normalizeHistoryRecord(value: unknown): ScopedHistoryRecord | un
       ? { parentSessionID: value.parentSessionID }
       : {}),
     ...(typeof value.model === "string" && value.model.length > 0 ? { model: value.model } : {}),
+    ...(agent ? { agent } : {}),
     tokens,
     cost: nonNegativeNumber(value.cost),
     time,
@@ -305,6 +308,7 @@ function mergeHistoryScope(candidate: HistoryRecord, existing: HistoryRecord): S
   const oldScope = existing.scope;
   const nextScope = candidate.scope;
   if (oldScope || nextScope) merged.scope = nextScope ? mergeScopeEvidence(oldScope, nextScope) : oldScope;
+  if (!merged.agent && existing.agent) merged.agent = existing.agent;
   return merged;
 }
 

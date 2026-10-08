@@ -351,16 +351,30 @@ test("actual plugin content subscriptions do no session lookup or totals project
     await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
     const store = ui.__testRuntimeStores.at(-1)!;
     const revision = store.revision();
+    const clockRevision = store.clockRevision();
+    const ledger = store.totalsLedger;
     const before = lookups;
+    let agentReads = 0;
+    let metadataReads = 0;
     const types = ["message.part.delta", "message.part.updated", "session.next.text.delta", "session.next.reasoning.delta", "session.next.tool.input.delta"];
     for (let index = 0; index < 40; index++) {
       const type = types[index % types.length];
       handlers.get(type)!({ type, properties: { sessionID: "s", messageID: "m", partID: "p", textID: "p", reasoningID: "p", callID: "p",
-        field: "text", delta: "x".repeat(1000), part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "x".repeat(1000) } } });
+        get agent() { agentReads += 1; return "delta-must-not-be-read"; },
+        get info() { metadataReads += 1; return { get agent() { agentReads += 1; return "delta-must-not-be-read"; } }; },
+        field: "text", delta: "x".repeat(1000),
+        get part() { metadataReads += 1; return { id: "p", messageID: "m", sessionID: "s",
+          get agent() { agentReads += 1; return "delta-must-not-be-read"; }, type: "text", text: "x".repeat(1000) }; } } });
     }
     assert.equal(lookups, before);
     assert.equal(store.revision(), revision);
+    assert.equal(store.clockRevision(), clockRevision);
+    assert.equal(store.totalsLedger, ledger);
+    assert.equal(agentReads, 0, "content events must return before reading agent fields");
+    assert.equal(metadataReads, 0, "content events must return before inspecting info or part metadata");
     assert.equal(store.active.size, 0);
+    assert.equal(store.records.length, 0);
+    assert.equal(Object.keys(store.totalsLedger.sessionAgents ?? {}).length, 0);
   } finally {
     for (const dispose of disposers.reverse()) await dispose();
     await rm(directory, { recursive: true, force: true });
@@ -659,27 +673,29 @@ test("actual narrow sidebar preserves full metric fields and task time without e
   }
 });
 
-test("narrow child rows preserve full IDs, models, counts and TPS across wrapped visible cells", async () => {
+test("narrow child rows preserve full agent names, IDs, models, counts and units across root and child routes", async () => {
   const ui = (await uiPromise)!;
   const sessionID = "ses_eee872613ffeAXfSAWtXsJbYB4";
   const children = [
-    { id: "ses_eee872613ffeAXfSAWtXsJbYB5", parent: sessionID, model: "openai/gpt-5.4-thinking-extended", output: 4_200_000, calls: 1200, speed: v3Generation(200, 0, 2000), expectedRate: "~50 tok/s" },
-    { id: "ses_eee872613ffeAXfSAWtXsJbYB6", parent: "ses_eee872613ffeAXfSAWtXsJbYB5", model: "openrouter/x-ai/grok-4.1-fast-reasoning", output: 3_200_000, calls: 9000, speed: v3Generation(800, 0, 2000), expectedRate: "~200 tok/s" },
-    { id: "ses_fff872613ffeAXfSAWtXsJbYB7", parent: sessionID, model: "openrouter/x-ai/grok-4-without-generation-timing", output: 1_100_000, calls: 100_000, speed: undefined, expectedRate: "--" },
+    { id: "ses_eee872613ffeAXfSAWtXsJbYB5", parent: sessionID, model: "openai/gpt-5.4-thinking-extended", output: 4_200_000, calls: 1200, agents: ["oracle", "fixer"], agent: "fixer", label: "fixer / oracle" },
+    { id: "ses_eee872613ffeAXfSAWtXsJbYB6", parent: "ses_eee872613ffeAXfSAWtXsJbYB5", model: "openrouter/x-ai/grok-4.1-fast-reasoning", output: 3_200_000, calls: 9000, agents: [], agent: "custom-nested-reviewer", label: "custom-nested-reviewer" },
+    { id: "ses_fff872613ffeAXfSAWtXsJbYB7", parent: sessionID, model: "openrouter/x-ai/grok-4-without-generation-timing", output: 1_100_000, calls: 100_000, agents: [], agent: undefined, label: "" },
   ];
-  for (const width of [20, 24, 28, 32]) {
+  const frames = [20, 24, 28, 32].flatMap((width) => [sessionID, children[0].id].map((routeID) => ({ width, routeID })));
+  for (const { width, routeID } of frames) {
     const store = ui.createRuntimeStore(1);
     const tokens = (output: number) => ({ input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 });
     store.totalsLedger.sessions[sessionID] = { tokens: tokens(115_000), cost: 1, responseCount: 1,
       speed: updateSpeedTotals(emptySpeedTotals(), v3Generation(115_000), 1) };
+    store.totalsLedger.sessionAgents = { [sessionID]: ["root-only"] };
     for (const child of children) {
-      store.totalsLedger.sessions[child.id] = { tokens: tokens(child.output), cost: 1, responseCount: child.calls,
-        speed: updateSpeedTotals(emptySpeedTotals(), child.speed, 1) };
+      store.totalsLedger.sessions[child.id] = { tokens: tokens(child.output), cost: 1, responseCount: child.calls };
+      store.totalsLedger.sessionAgents[child.id] = child.agents;
       store.sessionParents.set(child.id, child.parent);
       store.totalsLedger.settled[`${child.id}-last`] = true;
     }
     store.records = children.map((child) => ({ version: 1, messageID: `${child.id}-last`, sessionID: child.id,
-      model: child.model, tokens: tokens(child.output), cost: 1, time: { start: 0, completed: 1 }, samples: [],
+      model: child.model, agent: child.agent, tokens: tokens(child.output), cost: 1, time: { start: 0, completed: 1 }, samples: [],
       speed: { response: { generatedTokens: child.output, durationMs: 1, estimated: false } } }));
     store.pulseExpanded = true;
     const api = host(120, 180);
@@ -688,25 +704,35 @@ test("narrow child rows preserve full IDs, models, counts and TPS across wrapped
       const renderer = useRenderer();
       api.renderer = renderer;
       const panel = new BoxRenderable(renderer, { width, flexDirection: "column", flexShrink: 0 });
-      panel.add(sidebar({ theme: api.theme }, { session_id: sessionID }) as unknown as Renderable);
+      panel.add(sidebar({ theme: api.theme }, { session_id: routeID }) as unknown as Renderable);
       return panel as unknown as JSX.Element;
     }, { width: 120, height: 180 });
     try {
       await rendered.renderOnce();
       await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
+      reportFrame(`child agents ${width} ${routeID === sessionID ? "root" : "child"}`, frame);
       const visible = frame.split("\n").map((line) => line.slice(0, width).replace(/^[\s│┃┆┊┇┋]+/, "")).join("\n");
       const glyphs = visible.replace(/\s+/g, "");
       assert.doesNotMatch(visible, /\.\.\.|…/);
       assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: child rows must stay within the sidebar`);
-      assert.ok(glyphs.includes(`session${sessionID}`));
-      assert.doesNotMatch(visible, /tok\/s|TPS|avg/i);
-      for (const child of children) {
+      assert.ok(glyphs.includes(`session${routeID}`));
+      assert.doesNotMatch(visible, /tok\/s|TPS|TTFT|avg|root-only|Agent unknown/i);
+      const childGlyphs = glyphs.slice(glyphs.indexOf("CHILDAGENTS") + "CHILDAGENTS".length);
+      const expected = routeID === sessionID ? children : [children[1]];
+      for (const child of expected) {
         assert.ok(glyphs.includes(`${child.id}${ui.formatCompactNumber(child.calls)}responses${ui.formatCompactNumber(child.output)}generated`), `${width}: full child ID, counts and units must survive wrapping`);
         assert.ok(glyphs.includes(`model${child.model}`), `${width}: full model must survive wrapping`);
+        assert.ok(childGlyphs.includes(`${child.label.replace(/\s+/g, "")}${child.id}`), `${width}: actual names appear before their own full SID`);
       }
-      assert.ok(glyphs.indexOf(children[0].id) < glyphs.indexOf(children[1].id));
-      assert.ok(glyphs.indexOf(children[1].id) < glyphs.indexOf(children[2].id));
+      if (routeID === sessionID) {
+        assert.ok(childGlyphs.indexOf(children[0].id) < childGlyphs.indexOf(children[1].id));
+        assert.ok(childGlyphs.indexOf(children[1].id) < childGlyphs.indexOf(children[2].id));
+      } else {
+        assert.doesNotMatch(childGlyphs, /fixer|oracle/);
+        assert.ok(!childGlyphs.includes(children[0].id));
+        assert.ok(!childGlyphs.includes(children[2].id));
+      }
     } finally { rendered.renderer.destroy(); store.disposeSignals(); }
   }
 });
