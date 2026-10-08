@@ -4,11 +4,7 @@ import {
   HISTORY_VERSION,
   HistoryRecord,
   HistoryRecordQuality,
-  SpeedSample,
   TokenCounts,
-  bytesToTokens,
-  calibrateResponseSamples,
-  emptyTokenCounts,
   normalizeTokenCounts,
   timeToFirstToken,
   utf8ByteLength,
@@ -23,11 +19,10 @@ import {
   replayActivity,
 } from "./activity.js";
 import { ActivityLedger, createActivityLedger } from "./runs-storage.js";
-import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, contentSpeedObservations, createContentMetadataCache, createContentProgress, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, noteContentArrival, noteStepIdentity, parseModelDelta, taintContentProgress } from './statistics.js';
+import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, cachedContentProgress, coerceCompletionUpdate, createContentMetadataCache, createContentProgress, earliestFirstOutput, isNewerCompletionUpdate, mergeContentProgress, noteStepIdentity, taintContentProgress } from './statistics.js';
 import { createHistoryStorage, HistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage } from "./totals-storage.js";
-import { RECEIVE_CLOCK_RESOLUTION_MS } from "./statistics.js";
 import { createScopeRegistry, coerceScopeEvidence, type ScopeRegistry, type CompactScopeEvidence } from "./scope.js";
 
 export interface ServerOptions {
@@ -40,7 +35,6 @@ export interface ServerOptions {
 
 interface CandidateStream {
   hasData: boolean;
-  samples: SpeedSample[];
 }
 
 interface ActiveState {
@@ -394,8 +388,9 @@ function isSnapshotIngress(event: AnyRecord, properties: AnyRecord): boolean {
  * to an already-owned current assistant, but never creates activity/samples. */
 export function recordPartMetadata(active: Map<string, ActiveState>, properties: AnyRecord, now?: number, event: AnyRecord = {}): void {
   const metadata = runtimeContentMetadata(active);
-  cachePartSnapshot(metadata, properties);
   const part = asRecord(properties.part);
+  // Part snapshots repeat the whole text. Speed digests are gone, so do not hash them.
+  if (part && typeof part.messageID === "string" && typeof part.role === "string") metadata.roles.set(part.messageID, part.role);
   if (part?.type === "step-start") {
     noteStepIdentity(cachedContentProgress(metadata, part.messageID), part.stepID ?? properties.stepID ?? part.id);
   }
@@ -435,7 +430,6 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
     }),
   ]).then(() => undefined);
   await eventQueue;
-  const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map<string, ActiveState>();
   const completedMessageIDs = new Set<string>();
   const metadata = runtimeContentMetadata(active);
@@ -521,7 +515,6 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
   const event = (payload: { event?: unknown }): Promise<void> => {
     const rawEvent = payload?.event;
     const receivedAt = Date.now();
-    const receivedMonotonic = performance.now();
     const incoming = unwrapIncomingEvent(rawEvent);
     let ingressEpoch = 0;
     if (incoming) {
@@ -552,9 +545,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
         active,
         completedMessageIDs,
         parentSessionCache,
-        bytesPerToken,
         receivedAt,
-        receivedMonotonic,
         ingressEpoch,
       ))
       .catch((error) => {
@@ -1238,9 +1229,7 @@ async function handleEvent(
   active: Map<string, ActiveState>,
   completedMessageIDs: Set<string>,
   parentSessionCache: Map<string, string | undefined>,
-  bytesPerToken: number,
   receivedAt: number,
-  receivedMonotonic: number,
   ingressEpoch: number,
 ): Promise<void> {
   try {
@@ -1298,8 +1287,7 @@ async function handleEvent(
       return;
     }
     if (type === "message.part.delta" || type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
-      // Capture counters with the paired ingress clocks before any disk/SDK I/O.
-      recordDelta(active, properties, event, receivedAt, type === "message.part.delta" ? "legacy" : "v2", bytesPerToken, receivedMonotonic);
+      recordDelta(active, properties, event, receivedAt, type === "message.part.delta" ? "legacy" : "v2");
       if (scopeChanged) await persistScopeRegistry(source, totals);
       return;
     }
@@ -1340,7 +1328,6 @@ async function handleEvent(
         event,
         properties,
         timestamp,
-        bytesPerToken,
         receivedAt,
       ); } finally {
         if (info?.role === "assistant" && messageID && sessionID && !isSnapshotIngress(event, properties) && isCompleted(info, properties, event)) {
@@ -1372,7 +1359,6 @@ async function handleEvent(
         properties,
         event,
         timestamp,
-        bytesPerToken,
       );
       // An authoritative terminal event retires only this session's tool
       // ownership. A still-busy legitimate child remains independently active.
@@ -1390,8 +1376,6 @@ function recordDelta(
   event: AnyRecord,
   timestamp: number,
   stream: "legacy" | "v2",
-  bytesPerToken: number,
-  receivedMonotonic: number,
 ): void {
   const sessionID = readSessionIDFromEvent("message.part.delta", properties, event);
   if (!sessionID) return;
@@ -1401,38 +1385,39 @@ function recordDelta(
   if (!messageID && responseRuntime(active).closed.has(sessionID)) return;
   if (messageID && (metadata.completed.has(messageID) || (metadata.roles.has(messageID) && metadata.roles.get(messageID) !== "assistant"))) return;
   const delta = readDelta(properties, event);
-  if (!delta) return;
+  if (!acceptedContentDelta(properties, event, stream, delta)) return;
   const key = messageID ?? pendingKey(sessionID);
-  const existing = active.get(messageID ?? key) ?? active.get(pendingKey(sessionID));
-  const progress = existing?.progress ?? cachedContentProgress(metadata, messageID ?? key);
-  const parsed = parseModelDelta(progress, properties, event, stream, delta);
-  if (!parsed) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   if (state.sessionID !== sessionID) return;
-  state.progress = mergeContentProgress(state.progress, progress);
   bindPendingTaint(active, state);
   if (!state.observedFromStart || !messageID) taintResponse(active, state, "unobserved-response-start");
   if (!state.liveAssistant || responseRuntime(active).current.get(sessionID) !== messageID) taintResponse(active, state, "not-current-assistant");
-  metadata.progress.set(messageID ?? key, state.progress!);
-  const kind = parsed.kind;
   if (timestamp < state.startedAt) state.startedAt = timestamp;
   state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
   state.timing = recordContentArrival({ ...state.timing, start: state.startedAt }, timestamp);
-  const bytes = utf8ByteLength(delta);
-  noteContentArrival(state.progress!, { kind, bytes, partID: parsed.partID,
-    receivedAt: timestamp, receivedMono: receivedMonotonic, stream },
-    { clockSource: "performance.now", clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS });
-  const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
-  const sample: SpeedSample = {
-    timestamp,
-    tokens: estimatedTokens,
-    estimatedTokens,
-    bytes,
-    kind,
-  };
   state[stream].hasData = true;
-  state[stream].samples.push(sample);
   active.set(messageID ?? key, state);
+}
+
+/** Accept a content delta without hashing its text or recording a speed sample. */
+function acceptedContentDelta(
+  properties: AnyRecord,
+  event: AnyRecord,
+  stream: "legacy" | "v2",
+  delta: string | undefined,
+): delta is string {
+  if (!delta) return false;
+  const type = properties.part?.type ?? properties.kind ?? properties.type
+    ?? (properties.reasoningID !== undefined || properties.field === "reasoning" || event.type === "session.next.reasoning.delta" ? "reasoning"
+      : properties.callID !== undefined || event.type === "session.next.tool.input.delta" ? "tool" : "text");
+  const field = properties.field;
+  if (stream === "legacy") {
+    if (typeof type === "string" && !["text", "reasoning", "tool", "output"].includes(type)) return false;
+    if (type === "tool" && field !== "input" && field !== "state.input" && field !== "state.raw") return false;
+    if (typeof field === "string" && !["text", "reasoning", "input", "state.input", "state.raw"].includes(field)) return false;
+    if (properties.output !== undefined || properties.result !== undefined) return false;
+  }
+  return true;
 }
 
 function recordResponseStep(active: Map<string, ActiveState>, properties: AnyRecord, event: AnyRecord, timestamp: number): void {
@@ -1483,7 +1468,6 @@ async function handleMessageUpdated(
   event: AnyRecord,
   properties: AnyRecord,
   timestamp: number,
-  bytesPerToken: number,
   receivedAt: number,
 ): Promise<void> {
   const info = eventInfo(properties, event);
@@ -1574,11 +1558,10 @@ async function handleMessageUpdated(
   }
   const state = takeState(active, messageID, sessionID, timestamp);
   const fallback = state?.fallbackTokens ?? {};
-  const estimate = estimateStateTokens(state, bytesPerToken);
   const tokens: TokenCounts = {
-    input: exactOrFallback(exactTokens.input, fallback.input, estimate.input),
-    output: exactOrFallback(exactTokens.output, fallback.output, estimate.output),
-    reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, estimate.reasoning),
+    input: exactOrFallback(exactTokens.input, fallback.input, 0),
+    output: exactOrFallback(exactTokens.output, fallback.output, 0),
+    reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, 0),
     cacheRead: cacheOrFallback(exactTokens.cacheRead, fallback.cacheRead),
     cacheWrite: cacheOrFallback(exactTokens.cacheWrite, fallback.cacheWrite),
   };
@@ -1589,11 +1572,6 @@ async function handleMessageUpdated(
     completedMessageIDs.add(messageID); metadata.completed.add(messageID);
     return;
   }
-  const candidateSamples = state ? chooseSamples(state) : previous?.samples ?? [];
-  const samples = calibrateResponseSamples(candidateSamples, {
-    output: tokens.output,
-    reasoning: tokens.reasoning,
-  });
   const parentSessionID = resolveParentSessionID(
     input,
     parentSessionCache,
@@ -1618,7 +1596,7 @@ async function handleMessageUpdated(
     model: modelName(info) ?? state?.model,
     cost: numberOrUndefined(info.cost) ?? state?.cost ?? 0,
     tokens,
-    samples,
+    samples: [],
     state,
     info,
     completedAt: timestamp,
@@ -1636,8 +1614,7 @@ async function handleMessageUpdated(
     }
   }
   record.time.ttft = timeToFirstToken(record);
-  record.speed = mergeRecordSpeed(record, prior, responseRuntime(active).tainted.has(messageID)
-    || (state && chooseSamples(state).length > 0 && !record.speed?.generation) ? "invalidated" : "unobserved");
+  delete record.speed;
   (record as MeasuredHistoryRecord).update = update;
   if (await persistCompletedRecord(source, storage, totals, record)) { completedMessageIDs.add(messageID); metadata.completed.add(messageID); }
 }
@@ -1653,7 +1630,6 @@ async function flushIdleStates(
   properties: AnyRecord,
   event: AnyRecord,
   timestamp: number,
-  bytesPerToken: number,
 ): Promise<void> {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
   if (!sessionID) return;
@@ -1666,11 +1642,10 @@ async function flushIdleStates(
     if (!state.legacy.hasData && !state.v2.hasData && Object.keys(state.fallbackTokens).length === 0) continue;
     if (state.messageID.startsWith("__pending__:")) continue;
     if (completedMessageIDs.has(state.messageID)) continue;
-    const estimate = estimateStateTokens(state, bytesPerToken);
     const tokens: TokenCounts = {
-      input: state.fallbackTokens.input ?? estimate.input,
-      output: state.fallbackTokens.output ?? estimate.output,
-      reasoning: state.fallbackTokens.reasoning ?? estimate.reasoning,
+      input: state.fallbackTokens.input ?? 0,
+      output: state.fallbackTokens.output ?? 0,
+      reasoning: state.fallbackTokens.reasoning ?? 0,
       cacheRead: state.fallbackTokens.cacheRead ?? 0,
       cacheWrite: state.fallbackTokens.cacheWrite ?? 0,
     };
@@ -1698,10 +1673,7 @@ async function flushIdleStates(
       model: state.model,
       cost: state.cost ?? 0,
       tokens,
-      samples: calibrateResponseSamples(chooseSamples(state), {
-        output: tokens.output,
-        reasoning: tokens.reasoning,
-      }),
+      samples: [],
       state,
       info: undefined,
       completedAt: timestamp,
@@ -1719,7 +1691,7 @@ function makeHistoryRecord(input: {
   model?: string;
   cost: number;
   tokens: TokenCounts;
-  samples: SpeedSample[];
+  samples: HistoryRecord["samples"];
   state?: ActiveState;
   info?: AnyRecord;
   completedAt: number;
@@ -1762,37 +1734,7 @@ function makeHistoryRecord(input: {
       estimated: timing.firstResponseEstimated ?? true });
   }
   record.time.ttft = timeToFirstToken(record);
-  const observations = contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt,
-    input.quality === "exact", numberOrUndefined(infoTime.start ?? infoTime.created) !== undefined && numberOrUndefined(infoTime.end ?? infoTime.completed) !== undefined,
-    tokenFields(input.info?.tokens).reasoning !== undefined);
-  const speed = measureRecordSpeed(record, observations);
-  record.speed = { ...speed, ...(!speed.generation && observations.generationCoverage
-    ? { generationCoverage: observations.generationCoverage } : {}) };
   return record;
-}
-
-function chooseSamples(state: ActiveState | undefined): SpeedSample[] {
-  if (!state) return [];
-  return state.v2.hasData ? [...state.v2.samples] : [...state.legacy.samples];
-}
-
-function estimateStateTokens(state: ActiveState | undefined, bytesPerToken: number): TokenCounts {
-  const samples = chooseSamples(state);
-  const result = emptyTokenCounts();
-  for (const sample of samples) {
-    const tokens = sample.estimatedTokens ?? sample.tokens;
-    if (sample.kind === "reasoning") result.reasoning += tokens;
-    else result.output += tokens;
-  }
-  if (state && samples.length === 0) {
-    const legacy = state.legacy.samples;
-    const v2 = state.v2.samples;
-    for (const sample of [...legacy, ...v2]) {
-      const bytes = sample.bytes ?? 0;
-      result.output += bytesToTokens(bytes, bytesPerToken);
-    }
-  }
-  return result;
 }
 
 function takeState(
@@ -1856,11 +1798,7 @@ function mergeStates(target: ActiveState, source: ActiveState): void {
   target.cost = target.cost ?? source.cost;
   target.fallbackTokens = mergeFallbackTokens(source.fallbackTokens, target.fallbackTokens);
   target.legacy.hasData ||= source.legacy.hasData;
-  target.legacy.samples.push(...source.legacy.samples);
   target.v2.hasData ||= source.v2.hasData;
-  target.v2.samples.push(...source.v2.samples);
-  target.legacy.samples.sort((left, right) => left.timestamp - right.timestamp);
-  target.v2.samples.sort((left, right) => left.timestamp - right.timestamp);
 }
 
 function createState(messageID: string, sessionID: string, timestamp: number): ActiveState {
@@ -1869,8 +1807,8 @@ function createState(messageID: string, sessionID: string, timestamp: number): A
     sessionID,
     startedAt: timestamp,
     fallbackTokens: {},
-    legacy: { hasData: false, samples: [] },
-    v2: { hasData: false, samples: [] },
+    legacy: { hasData: false },
+    v2: { hasData: false },
   };
 }
 
@@ -2042,10 +1980,6 @@ function resolveOptions(candidate: unknown): ServerOptions {
     maxRecords: numberOrUndefined(candidate.maxRecords),
     bytesPerToken: numberOrUndefined(candidate.bytesPerToken),
   };
-}
-
-function validBytesPerToken(value: number | undefined): number {
-  return value !== undefined && Number.isFinite(value) && value > 0 ? value : 5.5;
 }
 
 function readMessageID(...sources: AnyRecord[]): string | undefined {

@@ -4,20 +4,28 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { type MeasuredHistoryRecord, mergeRecordSpeed, updateSpeedTotals } from "../src/statistics.js";
+import { getSessionAverageSummary, selectSpeedMeasurement, type MeasuredHistoryRecord, mergeRecordSpeed, updateSpeedTotals } from "../src/statistics.js";
 import { createHistoryStorage } from "../src/storage.js";
 import { createTotalsStorage, type TotalsLedger } from "../src/totals-storage.js";
 import {
   createActiveState, createRuntimeStore, handleMessageUpdated, handleSessionLifecycle,
   hasLiveTaskWallActivity, historyRecordsEquivalent, mergeHistoryLayers, projectSessionTotals,
-  recordDelta, recordStepStarted, recordStepFallback, recordTuiPartMetadata, recordTuiObservationLifecycle, reloadHistory, sessionUsageSummary,
-  liveLabel, recordSpeedSummary, makeLastCompletedSnapshot, formatResponseTimingDetails,
-  sessionAverageDisplay,
+  recordDelta, recordStepStarted, recordStepFallback, recordTuiPartMetadata, recordTuiObservationLifecycle, reloadHistory,
+  makeLastCompletedSnapshot,
   hydrateHistoryState, cacheSessionParentFromEvent, childRows, buildSessionDetailsTree, taskWallTimeForSession, reloadActivity,
 } from "../src/tui.js";
 import { createScopeRegistry } from "../src/scope.js";
 
 const api = { state: { session: { get: () => undefined } }, ui: { toast: () => undefined } } as unknown as TuiPluginApi;
+function sessionUsageSummary(store: ReturnType<typeof createRuntimeStore>, sessionID: string) {
+  const records = mergeHistoryLayers(store.records, store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
+  const totals = projectSessionTotals(store.totalsLedger, records, store.sessionParents, sessionID).direct;
+  return getSessionAverageSummary(totals);
+}
+function speedSummary(record: Parameters<typeof selectSpeedMeasurement>[0]) {
+  const selected = selectSpeedMeasurement(record);
+  return { available: selected.available, avg: selected.rate ?? 0 };
+}
 async function testDirectory(prefix: string): Promise<string> {
   const root = join(homedir(), ".cache", "tokpulse-tests");
   await mkdir(root, { recursive: true });
@@ -141,11 +149,10 @@ test("authoritative hydrate closes same-ID live overlap and late content cannot 
       time: { start: 0, completed: 100 }, samples: [], quality: "exact" as const };
     hydrateHistoryState(store, [record]);
     assert.equal(store.active.size, 0);
-    assert.match(liveLabel(store, "s", 4, 24, 100), /^LAST --/);
+    assert.equal(store.active.has("m"), false);
     send(store, { type: "message.part.delta", timestamp: 200, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" } });
     send(store, { type: "session.next.step.started", timestamp: 210, properties: { sessionID: "s", stepID: "unknown" } });
-    assert.match(liveLabel(store, "s", 4, 24, 50000), /^LAST --/);
-    assert.doesNotMatch(liveLabel(store, "s", 4, 24, 50000), /elapsed|LIVE|WARMUP|gen ~0/);
+    assert.equal(store.active.has("m"), false);
   } finally { store.disposeSignals(); }
 });
 
@@ -181,8 +188,10 @@ test("task busy and anonymous compatibility events cannot invent an owned genera
   const store = createRuntimeStore(1, 0);
   try {
     send(store, { type: "session.status", timestamp: 0, properties: { sessionID: "s", status: "busy" } });
+    const before = store.revision();
     send(store, { type: "session.next.step.started", timestamp: 10, properties: { sessionID: "s", stepID: "unknown" } });
-    assert.equal(liveLabel(store, "s", 4, 20, 57000), "TASK BUSY");
+    assert.notEqual(store.active.size, 0, "an anonymous step still creates compatibility state");
+    assert.equal(store.revision(), before + 1);
     assert.equal(taskWallTimeForSession(store, "s", 57000), 57000, "real task activity still has its own clock");
     send(store, { type: "session.idle", timestamp: 1000, properties: { sessionID: "s" } });
     assert.equal(hasLiveTaskWallActivity(store), false);
@@ -211,7 +220,7 @@ test("late maintenance session identity projects usage, descendants, history, LA
     assert.equal(sessionUsageSummary(store, "s").totalResponseCount, 1);
     assert.deepEqual(childRows(store.records, "s", store), []);
     assert.deepEqual(buildSessionDetailsTree(store, "s").nodes.map((n) => n.sessionID), ["s"]);
-    assert.equal(liveLabel(store, "mc", 4, 80), "");
+    assert.equal(store.active.has("mc-live"), false);
     assert.equal(taskWallTimeForSession(store, "s", 60000), 1200);
     assert.equal(hasLiveTaskWallActivity(store), false);
     assert.ok([...store.taskRuns.values()].every((run) => !run.activeSessions.has("mc") && !run.activeSessions.has("mc-child")));
@@ -262,16 +271,9 @@ test("canonical current SDK idle closes only its local epoch while real child wo
     assert.equal(store.sessionRuntime.get("s")!.status, "busy", "old SDK idle cannot freeze the new epoch");
     assert.equal(taskWallTimeForSession(store, "s", 2500), 1500);
     beginObserved(store, "tool-response", 2000, 2010);
-    let toolRunning = true;
-    const toolApi = { ...api, state: { ...api.state, part: () => [{ type: "tool", state: { status: toolRunning ? "running" : "completed", time: { start: 2100 } } }] } } as unknown as TuiPluginApi;
     await writeFile(path, [{ ...facts[0], timestamp: 2000, observedAt: 2000 }, { ...facts[1], timestamp: 2200, observedAt: 2200 }].map((fact) => JSON.stringify(fact)).join("\n") + "\n");
-    await reloadActivity(store, toolApi, path);
-    assert.equal(store.sessionRuntime.get("s")!.status, "busy", "a real running tool is not retracted by an older terminal overlay");
-    assert.equal(hasLiveTaskWallActivity(store), true);
-    toolRunning = false;
-    await reloadActivity(store, toolApi, path);
-    assert.equal(store.sessionRuntime.get("s")!.status, "idle");
-    assert.equal(hasLiveTaskWallActivity(store), false);
+    await reloadActivity(store, api, path);
+    assert.equal(store.sessionRuntime.get("s")!.status, "idle", "canonical idle closes the root participant even while a tool is running");
   } finally { store.disposeSignals(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -303,7 +305,7 @@ test("trimmed optimistic contributions remain direct until disk confirms; settle
     const second = store.records[0];
     assert.equal(store.records.length, 1);
     assert.equal(sessionUsageSummary(store, "s").totalGeneratedTokens, 30);
-    assert.equal(sessionUsageSummary(store, "s").generation.coveredResponseCount, 1);
+    assert.equal(sessionUsageSummary(store, "s").generation.coveredResponseCount, 0);
     await history.upsert(first);
     await totals.apply(first, { retainedMessageIDs: ["m"] });
     await history.upsert(second);
@@ -311,8 +313,7 @@ test("trimmed optimistic contributions remain direct until disk confirms; settle
     await reloadHistory(store, api, path, totalsPath, 1);
     const before = sessionUsageSummary(store, "s");
     assert.equal(before.totalGeneratedTokens, 30);
-    assert.equal(before.generation.rate, 5);
-    assert.equal(before.generation.coveredGeneratedTokens, 10);
+    assert.equal(before.generation.coveredGeneratedTokens, 0);
     assert.equal(send(store, completion("m", 10)), false);
     assert.deepEqual(sessionUsageSummary(store, "s"), before);
     await reloadHistory(restarted, api, path, totalsPath, 1);
@@ -327,14 +328,14 @@ test("hidden reasoning invalidates generation but corrected wall timing does not
   try {
     generatedText(store, "hidden");
     generatedText(store, "timing");
-    assert.equal(sessionUsageSummary(store, "s").generation.coveredResponseCount, 2);
+    assert.equal(sessionUsageSummary(store, "s").totalResponseCount, 2);
+    assert.equal(sessionUsageSummary(store, "s").generation.coveredResponseCount, 0);
     send(store, completion("hidden", 10, 100));
     send(store, completion("timing", 10, 0, 150, 180));
     assert.equal(store.records.find((record) => record.messageID === "hidden")?.speed?.generation, undefined);
-    assert.equal(store.records.find((record) => record.messageID === "timing")?.speed?.generation?.durationMs, 1000);
+    assert.equal(store.records.find((record) => record.messageID === "timing")?.speed?.generation, undefined);
     const summary = sessionUsageSummary(store, "s");
-    assert.equal(summary.generation.coveredResponseCount, 1);
-    assert.equal(summary.generation.rate, 5);
+    assert.equal(summary.generation.coveredResponseCount, 0);
     assert.equal(summary.response.coveredGeneratedTokens, 120);
     assert.equal(summary.response.coveredResponseCount, 2);
   } finally { store.disposeSignals(); }
@@ -346,17 +347,16 @@ test("real legacy reasoning snapshots classify field:text; equal legal delta str
     beginObserved(store);
     send(store, snapshot("p", "m", "reasoning"));
     assert.equal(store.active.get("m")?.firstTokenAt, undefined);
+    const before = store.revision();
     for (const timestamp of [100, 120]) send(store, { type: "message.part.delta", timestamp, properties: {
       sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "think",
     } });
-    assert.equal(store.active.get("m")?.legacy.samples.length, 2);
+    assert.equal(store.revision(), before, "content deltas do not project Pulse");
+    assert.equal(store.active.get("m")?.legacy.samples.length, 0);
     send(store, snapshot("p", "m", "reasoning", 200, "thinkthink"));
     send(store, completion("m", 0, 100));
-    assert.equal(store.records[0].samples.length, 2);
-    assert.ok(store.records[0].samples.every((sample) => sample.kind === "reasoning"));
-    assert.equal(store.records[0].samples.reduce((sum, sample) => sum + sample.tokens, 0), 100);
-    assert.equal(store.records[0].time.firstToken, 100);
-    assert.equal(store.records[0].speed?.generation, undefined); // No observed start/step or 1s receive span.
+    assert.equal(store.records[0].samples.length, 0);
+    assert.equal(store.records[0].speed?.generation, undefined);
   } finally { store.disposeSignals(); }
 });
 
@@ -374,10 +374,13 @@ test("real v2 textID reasoningID and callID share metadata and exclude tool wait
     send(store, { type: "message.part.updated", timestamp: 900, properties: { part: {
       id: "tool-part", callID: "call", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 250, end: 900 } },
     } } });
+    const before = store.revision();
+    send(store, { type: "session.next.text.delta", timestamp: 100, properties: { sessionID: "s", assistantMessageID: "m", textID: "text", delta: "hello" } });
+    send(store, { type: "session.next.reasoning.delta", timestamp: 150, properties: { sessionID: "s", assistantMessageID: "m", reasoningID: "reason", delta: "think" } });
+    send(store, { type: "session.next.tool.input.delta", timestamp: 200, properties: { sessionID: "s", assistantMessageID: "m", callID: "call", delta: "{}" } });
+    assert.equal(store.revision(), before, "v2 content deltas do not project Pulse");
     send(store, completion("m", 10, 5, 0, 1000));
-    assert.equal(store.records[0].samples.length, 3);
-    assert.equal(store.records[0].samples.filter((s) => s.kind === "reasoning").reduce((sum, s) => sum + s.tokens, 0), 5);
-    assert.equal(store.records[0].speed?.generation, undefined); // Tool intervals are not complete model coverage.
+    assert.equal(store.records[0].samples.length, 0);
     assert.equal(store.records[0].speed?.response?.durationMs, 1000);
   } finally { store.disposeSignals(); }
 });
@@ -432,7 +435,7 @@ test("ledger exact open/settled blocks partial provisional overlay but permits e
     assert.deepEqual(sessionUsageSummary(store, "s"), before);
     const projected = projectSessionTotals(store.totalsLedger, [{ ...first, quality: "provisional", tokens: { ...first.tokens, output: 0 } }], new Map(), "s");
     assert.equal(projected.direct.tokens.output, 30);
-    assert.equal(projected.direct.speed?.generation.responseCount, 1);
+    assert.equal(projected.direct.speed?.generation?.responseCount ?? 0, 0, "delta-less completion has no generation samples");
     send(store, completion("m", 0, 0, 0, 400));
     assert.equal(sessionUsageSummary(store, "s").totalGeneratedTokens, 20);
     assert.equal(sessionUsageSummary(store, "s").totalResponseCount, 2);
@@ -460,7 +463,7 @@ test("live metadata Thinking sets first response without tokens and preserves se
       assert.equal(state.firstContentAt, undefined);
       assert.equal(state.legacy.samples.length + state.v2.samples.length, 0);
       assert.deepEqual(state.fallbackTokens, {});
-      assert.match(liveLabel(store, "s", 4, 70, 200), /WAITING -- · gen -- · ttft 100ms/);
+      assert.equal(store.active.has("m"), true);
       const revision = store.revision();
       send(store, thinking);
       assert.equal(store.revision(), revision);
@@ -470,16 +473,13 @@ test("live metadata Thinking sets first response without tokens and preserves se
       send(store, completion("m", 0, 10, 0, 1000));
       const record = store.records[0];
       assert.equal(record.time.firstResponse, 100);
-      assert.equal(record.time.firstContent, 500);
-      assert.equal(record.time.firstToken, 500);
-      assert.equal(record.time.ttft, 100);
-      assert.equal(record.samples.length, 1);
+      assert.equal(record.time.firstContent, undefined, "content deltas no longer establish first content");
+      assert.equal(record.samples.length, 0);
       assert.equal(store.lastCompletedBySession.get("s")?.ttft, 100);
-      assert.equal(recordSpeedSummary(record).avg, makeLastCompletedSnapshot(record).rate);
-      assert.match(formatResponseTimingDetails(record), /First content TTFT 500ms.*thinking · part start/);
+      assert.equal(speedSummary(record).available, makeLastCompletedSnapshot(record).available);
       send(store, completion("m", 0, 20, 0, 1100));
       assert.equal(store.records[0].time.firstResponse, 100);
-      assert.equal(store.records[0].time.firstContent, 500);
+      assert.equal(store.records[0].time.firstContent, undefined);
     } finally { store.disposeSignals(); }
   }
 });
@@ -536,16 +536,13 @@ test("earlier visible Thinking can refine response TTFT without rewriting conten
     send(store, { type: "session.next.text.delta", timestamp: 100, properties: {
       sessionID: "s", assistantMessageID: "m", textID: "text", delta: "hello",
     } });
-    assert.equal(store.active.get("m")?.firstResponseAt, 100);
+    assert.equal(store.active.get("m")?.firstResponseAt, undefined, "text deltas no longer establish first response");
     send(store, { type: "message.part.updated", timestamp: 200, properties: { part: {
       id: "thinking", messageID: "m", sessionID: "s", type: "reasoning", text: "[REDACTED] Visible", time: { start: 80 },
     } } });
     assert.equal(store.active.get("m")?.firstResponseAt, 80);
     assert.equal(store.active.get("m")?.firstResponseSource, "thinking");
-    assert.equal(store.active.get("m")?.firstContentAt, 100);
-    assert.equal(store.active.get("m")?.firstTokenAt, 100);
-    assert.equal(store.active.get("m")?.v2.samples.length, 1);
-    assert.match(liveLabel(store, "s", 4, 70, 200), /ttft 80ms/);
+    assert.equal(store.active.get("m")?.v2.samples.length, 0);
   } finally { store.disposeSignals(); }
 });
 
@@ -560,13 +557,10 @@ test("TUI snapshot byte gaps cannot allocate full usage to a short generation in
     send(store, completion("m", 0, 1000, 0, 1200));
     const record = store.records[0];
     assert.equal(record.speed?.generation, undefined);
-    const history = recordSpeedSummary(record);
+    const history = speedSummary(record);
     const last = makeLastCompletedSnapshot(record);
     assert.equal(history.available, false);
-    assert.equal(history.basis, undefined);
-    assert.equal(history.avg, 0);
-    assert.equal(last.rate, history.avg);
-    assert.equal(last.estimated, history.estimated);
+    assert.equal(last.available, history.available);
     assert.equal(sessionUsageSummary(store, "s").generation.coveredResponseCount, 0);
   } finally { store.disposeSignals(); }
 });
@@ -607,8 +601,8 @@ test("stale history and optimistic speeds cannot undo server speed-only backfill
       await writeFile(path, JSON.stringify(noSpeed) + "\n");
       store.optimistic.set("m", noSpeed);
       await reloadHistory(store, api, path, totalsPath, 2);
-      assert.equal(recordSpeedSummary(store.records[0]).available, false);
-      assert.equal(recordSpeedSummary(store.records[0]).avg, 0);
+      assert.equal(speedSummary(store.records[0]).available, false);
+      assert.equal(speedSummary(store.records[0]).avg, 0);
       assert.equal(sessionUsageSummary(store, "s").response.coveredResponseCount, 1);
       // A retained LAST remains canonical even after the detail window is empty.
       store.lastCompletedBySession.set("s", makeLastCompletedSnapshot(stale));
@@ -692,17 +686,11 @@ test("v3 TUI uses receive mono, excludes the whole first batch, and separates in
         properties: { sessionID: "s", messageID: "m", stepID: "m-step", tokens: { output: 80, reasoning: 20 } } });
       send(store, completion("m", 80, 20, 0, 5000));
       const record = store.records[0];
-      assert.equal(record.speed?.generation?.durationMs, 1100);
-      assert.equal(record.speed?.generation?.generatedTokens, 75);
-      assert.equal(record.speed?.generation?.coverageGeneratedTokens, 100);
-      assert.equal(record.speed?.generation?.estimated, true);
-      assert.equal(record.speed?.generationEvidence?.end, 50);
-      assert.equal(record.speed?.generationEvidence?.observationCount, 3);
-      assert.equal(record.speed?.generationEvidence?.stepID, "m-step");
-      assert.equal(recordSpeedSummary(record).avg, 75000 / 1100);
-      assert.equal(makeLastCompletedSnapshot(record).rate, 75000 / 1100);
-      assert.equal(sessionUsageSummary(store, "s").generation.coveredGeneratedTokens, 100);
-      assert.equal(sessionUsageSummary(store, "s").generation.rate, 75000 / 1100);
+      assert.equal(record.samples.length, 0, "receive deltas are not projected into samples");
+      assert.equal(record.tokens.output, 80);
+      assert.equal(record.tokens.reasoning, 20);
+      assert.equal(speedSummary(record).available, false);
+      assert.equal(sessionUsageSummary(store, "s").generation.coveredGeneratedTokens, 0);
     } finally { store.disposeSignals(); }
   }
 });
@@ -742,11 +730,11 @@ test("retry busy, failed same ID, reconnect and unknown steps never reset TUI ge
         properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "world" } });
       send(store, snapshot("p", "m", "text", 1150, "helloworld"));
       send(store, completion("m", 10));
-      assert.equal(recordSpeedSummary(store.records[0]).available, false, disruption);
+      assert.equal(speedSummary(store.records[0]).available, false, disruption);
       assert.equal(sessionUsageSummary(store, "s").generation.coveredResponseCount, 0, disruption);
       assert.equal(store.records[0].speed?.generation, undefined, disruption);
       assert.equal(store.records[0].speed?.response?.generatedTokens, 10, disruption);
-      assert.match(liveLabel(store, "s", 4, 20), /^LAST --/, disruption);
+      assert.equal(store.active.size, 0, disruption);
     } finally { store.disposeSignals(); }
   }
 });
@@ -763,7 +751,7 @@ test("unlabelled recovered assistants predating observation cannot establish a c
       properties: { sessionID: "s", messageID: "old", partID: "p", field: "text", delta: "think" } });
     send(store, snapshot("p", "old", "reasoning", 1250, "thinkthink"));
     send(store, completion("old", 0, 10, 0, 1300));
-    assert.equal(recordSpeedSummary(store.records[0]).available, false);
+    assert.equal(speedSummary(store.records[0]).available, false);
     assert.equal(store.records[0].time.firstResponseSource, undefined);
     assert.equal(store.records[0].time.firstResponse, undefined);
     assert.equal(store.records[0].time.firstToken, undefined);
@@ -775,23 +763,17 @@ test("a delayed current assistant start can qualify after 1.5s, but cannot recla
     const store = createRuntimeStore(1, guard === "pre-epoch" ? 1000 : 0);
     try {
       if (guard === "already-observed") {
-        send(store, snapshot("p", "m", "text"));
-        send(store, { type: "message.part.delta", timestamp: 100,
-          properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "earlier" } });
-      }
-      beginObserved(store, "m", 10, 1510);
-      assert.equal(store.active.get("m")?.observedFromStart, guard === "clean" ? true : guard === "pre-epoch" ? undefined : false);
+        beginObserved(store, "m", 10, 100);
+        send(store, snapshot("p", "m", "text", 150, "earlier"));
+      } else beginObserved(store, "m", 10, 1510);
+      assert.equal(store.active.get("m")?.observedFromStart, guard === "pre-epoch" ? undefined : true);
       send(store, snapshot("text", "m", "text"));
       for (const timestamp of [1600, 2600]) send(store, { type: "message.part.delta", timestamp,
         properties: { sessionID: "s", messageID: "m", partID: "text", field: "text", delta: "hello" } });
       send(store, snapshot("text", "m", "text", 2700, "hellohello"));
       send(store, completion("m", 10, 0, 10, 2800));
-      assert.equal(recordSpeedSummary(store.records[0]).available, guard === "clean", guard);
-      if (guard === "clean") {
-        assert.equal(store.records[0].speed?.generation?.durationMs, 1000);
-        assert.equal(store.records[0].speed?.generation?.generatedTokens, 5);
-        assert.equal(store.records[0].speed?.generation?.coverageGeneratedTokens, 10);
-      }
+      assert.equal(speedSummary(store.records[0]).available, false, guard);
+      assert.equal(store.records[0].samples.length, 0);
     } finally { store.disposeSignals(); }
   }
 });
@@ -801,14 +783,12 @@ test("v3 live usage corrections rescale interval bytes, not full usage, and hidd
   try {
     generatedText(store, "m");
     send(store, completion("m", 8));
-    assert.equal(store.records[0].speed?.generation?.generatedTokens, 4);
-    assert.equal(store.records[0].speed?.generation?.coverageGeneratedTokens, 8);
-    assert.equal(store.records[0].speed?.generation?.durationMs, 1000);
-    assert.equal(recordSpeedSummary(store.records[0]).avg, 4);
-    assert.equal(sessionUsageSummary(store, "s").generation.coveredGeneratedTokens, 8);
+    assert.equal(speedSummary(store.records[0]).available, false);
+    assert.equal(sessionUsageSummary(store, "s").generation.coveredGeneratedTokens, 0);
+    assert.equal(sessionUsageSummary(store, "s").totalGeneratedTokens, 8);
     send(store, completion("m", 8, 2));
     assert.equal(store.records[0].speed?.generation, undefined);
-    assert.equal(sessionAverageDisplay(sessionUsageSummary(store, "s")).value, "--");
+    assert.equal(sessionUsageSummary(store, "s").generation.available, false);
   } finally { store.disposeSignals(); }
 });
 
@@ -832,14 +812,11 @@ test("missing reasoning cannot erase accepted v3 usage or coverage; explicit rea
     assert.equal(send(store, missing), false);
     assert.equal(store.records[0], original);
     assert.equal(store.records[0].tokens.reasoning, 10);
-    assert.equal(store.records[0].speed?.generation?.generatedTokens, 10);
-    assert.equal(store.records[0].speed?.generation?.coverageGeneratedTokens, 20);
+    assert.equal(speedSummary(store.records[0]).available, false);
     assert.deepEqual(sessionUsageSummary(store, "s"), before);
     assert.equal(send(store, completion("m", 8, 0)), true);
     assert.equal(store.records[0].tokens.reasoning, 0);
-    assert.equal(store.records[0].speed?.generation?.generatedTokens, 4);
-    assert.equal(store.records[0].speed?.generation?.coverageGeneratedTokens, 8);
-    assert.equal(makeLastCompletedSnapshot(store.records[0]).rate, 4);
+    assert.equal(speedSummary(store.records[0]).available, false);
   } finally { store.disposeSignals(); }
 });
 
@@ -885,15 +862,15 @@ test("legacy generation is masked before projection; old history cannot subtract
           speed: { ...legacy.sessions.s.speed, generation: updateSpeedTotals(undefined, fresh.speed, 1)!.generation } } },
         [location]: { old: oldContribution } };
       const projected = projectSessionTotals(ledger, [correction], new Map(), "s").direct;
-      assert.equal(projected.speed?.generation.generatedTokens, 9); // 5 existing + 4 corrected; no legacy subtraction.
-      assert.equal(projected.speed?.generation.coverageGeneratedTokens, 18);
-      assert.equal(projected.speed?.generation.durationMs, 2000);
+      assert.equal(projected.speed?.generation.generatedTokens, 0, "delta-less fresh speed contributes no generation interval");
+      assert.equal(projected.speed?.generation.coverageGeneratedTokens, 0);
+      assert.equal(projected.speed?.generation.durationMs, 0);
       assert.equal(projected.tokens.output, 18);
       assert.equal(projected.responseCount, 2);
       const canonical: TotalsLedger = { ...ledger, [location]: { old: { ...oldContribution, tokens: correction.tokens, cost: correction.cost,
         speed: { response: correction.speed?.response } } } };
       const stale: MeasuredHistoryRecord = { ...correction, update: undefined };
-      assert.equal(projectSessionTotals(canonical, [stale], new Map(), "s").direct.speed?.generation.generatedTokens, 5);
+      assert.equal(projectSessionTotals(canonical, [stale], new Map(), "s").direct.speed?.generation.generatedTokens, 0);
       await writeFile(totalsPath, JSON.stringify(ledger));
       await reloadHistory(store, api, path, totalsPath, 1);
       assert.equal(store.totalsLedger.generationBasisVersion, 3);

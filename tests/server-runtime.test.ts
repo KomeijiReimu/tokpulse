@@ -681,19 +681,14 @@ for (const failure of ["history", "totals"] as const) {
       assert.equal(record.time.completed, 1500);
       assert.equal(record.cost, 10);
       assert.equal(record.tokens.output, 10);
-      assert.equal(record.samples.length, 2);
-      assert.equal(record.speed.generation.durationMs, 1100);
-      assert.equal(record.speed.generation.generatedTokens, 5);
-      assert.equal(record.speed.generationEvidence.clockSource, "performance.now");
-      assert.equal(record.speed.generationEvidence.clockResolutionMs, 1);
-      assert.equal(record.speed.generationEvidence.firstReceiveMono, 100);
-      assert.equal(record.speed.generationEvidence.lastReceiveMono, 1200);
+      assert.equal(record.samples.length, 0);
+      assert.equal(record.speed, undefined);
       if (written) assert.deepEqual(record, written);
       const before = await readTotals(path);
       assert.equal(before.sessions.s.responseCount, 1);
       assert.equal(before.sessions.s.cost, 10);
       assert.equal(before.sessions.s.tokens.output, 10);
-      assert.equal(before.sessions.s.speed.generation.responseCount, 1);
+      assert.equal(before.sessions.s.speed, undefined);
       await send({ type: "session.idle", timestamp: 6000, properties: { sessionID: "s" } });
       assert.deepEqual(await readTotals(path), before);
       assert.equal((await readRecords(path)).length, 1);
@@ -730,8 +725,10 @@ test("permanent history failure parks exact evidence after three bounded lifecyc
       await send(completionFact("parked", 10, 0, 0, 1500)); // explicit repair opportunity
       const [record] = await readRecords(path);
       assert.equal(record.quality, "exact");
-      assert.equal(record.speed.generation.durationMs, 1100);
+      assert.equal(record.tokens.output, 10);
+      assert.equal(record.speed, undefined);
       assert.equal((await readTotals(path)).sessions.s.responseCount, 1);
+      assert.equal((await readTotals(path)).sessions.s.speed, undefined);
     });
   } finally { console.warn = oldWarn; }
 });
@@ -765,7 +762,9 @@ test("rejected incomplete completion retires live ownership and late unowned del
     await send({ type: "message.updated", timestamp: 400, properties: { info: { id: "new", sessionID: "s", role: "assistant", time: { created: 400 } } } });
     await send({ type: "message.part.delta", timestamp: 420, properties: { sessionID: "s", messageID: "new", field: "text", delta: "new" } });
     await send(completionFact("new", 2, 0, 400, 500));
-    assert.equal((await readRecords(path)).find((r) => r.messageID === "new").samples.length, 1);
+    assert.equal((await readRecords(path)).find((r) => r.messageID === "new").samples.length, 0);
+    assert.equal((await readRecords(path)).find((r) => r.messageID === "new").tokens.output, 2);
+    assert.equal((await readRecords(path)).find((r) => r.messageID === "new").speed, undefined);
   });
 });
 
@@ -846,8 +845,9 @@ test("authoritative corrections accept zero, smaller usage and shorter duration;
     const [record] = await readRecords(path);
     const totals = await readTotals(path);
     assert.equal(record.tokens.output, 2);
+    assert.equal(record.speed, undefined);
     assert.equal(totals.sessions.s.tokens.output, 2);
-    assert.equal(totals.sessions.s.speed.response.durationMs, 50);
+    assert.equal(totals.sessions.s.speed, undefined);
     assert.equal(totals.sessions.s.responseCount, 1);
   });
 });
@@ -856,9 +856,9 @@ test("trimmed completion replay and restart preserve settled generation evidence
     await textGeneration(send, "m");
     await send(completionFact("new", 0, 0, 300, 400));
     const before = await readTotals(path);
-    assert.equal(before.settled.m.speed.generation.durationMs, 1100);
-    assert.equal(before.settled.m.speed.generation.generatedTokens, 5);
-    assert.equal(before.settled.m.speed.generationEvidence.start, 100);
+    assert.equal(before.sessions.s.tokens.output, 10);
+    assert.equal(before.sessions.s.speed, undefined);
+    assert.equal((before.settled.m as any).speed, undefined);
     await send(completionFact("m", 10, 0, 0, 1500));
     await (await restart())(completionFact("m", 10, 0, 0, 1500));
     assert.deepEqual(await readTotals(path), before);
@@ -877,8 +877,9 @@ for (const trimmed of [false, true]) {
       const expectedCount = trimmed ? 2 : 1;
       assert.equal(before.sessions.s.tokens.output, trimmed ? 30 : 10);
       assert.equal(before.sessions.s.responseCount, expectedCount);
-      assert.equal(coverageBefore.generation.coveredResponseCount, 1);
-      assert.equal(coverageBefore.response.coveredResponseCount, expectedCount);
+      assert.equal(before.sessions.s.speed, undefined);
+      assert.equal(coverageBefore.generation.available, false);
+      assert.equal(coverageBefore.response.available, false);
       assert.equal((trimmed ? before.settled.m : before.open.m).quality, "exact");
 
       await send(assistantCompleted("m", { input: 1 }, 1600, 0, "s"));
@@ -900,12 +901,7 @@ for (const trimmed of [false, true]) {
       assert.equal(corrected.sessions.s.tokens.output, trimmed ? 20 : 0);
       assert.equal(corrected.sessions.s.tokens.reasoning, 0);
       assert.equal(corrected.sessions.s.responseCount, expectedCount);
-      assert.equal(corrected.sessions.s.speed.generation.generatedTokens, 0);
-      assert.equal(corrected.sessions.s.speed.generation.durationMs, 1100);
-      assert.equal(corrected.sessions.s.speed.generation.responseCount, 1);
-      assert.equal(corrected.sessions.s.speed.response.generatedTokens, trimmed ? 20 : 0);
-      assert.equal(corrected.sessions.s.speed.response.durationMs, trimmed ? 2100 : 2000);
-      assert.equal(corrected.sessions.s.speed.response.responseCount, expectedCount);
+      assert.equal(corrected.sessions.s.speed, undefined);
       const records = await readRecords(path);
       assert.equal(records.length, 1);
       assert.equal(records[0].messageID, "m");
@@ -919,16 +915,19 @@ test("hidden reasoning invalidates generation, while provider-time corrections p
   await backendCase(async ({ path, send }) => {
     await textGeneration(send, "hidden");
     await textGeneration(send, "timing");
-    assert.equal((await readTotals(path)).sessions.s.speed.generation.responseCount, 2);
+    assert.equal((await readTotals(path)).sessions.s.tokens.output, 20);
+    assert.equal((await readTotals(path)).sessions.s.speed, undefined);
     await send(completionFact("hidden", 10, 100, 0, 300));
     await send(completionFact("timing", 10, 0, 150, 180));
     const records = await readRecords(path);
-    assert.equal(records.find((r) => r.messageID === "hidden").speed.generation, undefined);
-    assert.equal(records.find((r) => r.messageID === "timing").speed.generation.durationMs, 1100);
+    assert.equal(records.find((r) => r.messageID === "hidden").tokens.reasoning, 100);
+    assert.equal(records.find((r) => r.messageID === "hidden").speed, undefined);
+    assert.equal(records.find((r) => r.messageID === "timing").tokens.output, 10);
+    assert.equal(records.find((r) => r.messageID === "timing").speed, undefined);
     const totals = await readTotals(path);
-    assert.equal(totals.sessions.s.speed.generation.responseCount, 1);
-    assert.equal(totals.sessions.s.speed.generation.generatedTokens, 5);
-    assert.equal(totals.sessions.s.speed.response.generatedTokens, 120);
+    assert.equal(totals.sessions.s.tokens.output, 20);
+    assert.equal(totals.sessions.s.tokens.reasoning, 100);
+    assert.equal(totals.sessions.s.speed, undefined);
     assert.equal(totals.sessions.s.responseCount, 2);
   });
 });
@@ -942,12 +941,10 @@ test("real legacy reasoning metadata classifies field:text without kind and cali
     await send(snapshotFact("p", "m", "reasoning", 1300, "thinkagain", 100));
     await send(completionFact("m", 0, 100, 0, 1500));
     const [record] = await readRecords(path);
-    assert.equal(record.samples[0].kind, "reasoning");
-    assert.equal(record.samples.reduce((sum: number, sample: any) => sum + sample.tokens, 0), 100);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.tokens.reasoning, 100);
     assert.equal(record.time.firstToken, 100);
-    assert.equal(record.speed.generation.durationMs, 1100);
-    assert.equal(record.speed.generation.generatedTokens, 50);
-    assert.equal(record.speed.generation.coverageGeneratedTokens, 100);
+    assert.equal(record.speed, undefined);
   });
 });
 test("snapshot-only entry point never rebuilds active and known user deltas cannot generate", async () => {
@@ -979,12 +976,12 @@ test("real v2 IDs associate complete content metadata, but tool-input coverage s
     await send({ type: "message.part.updated", timestamp: 250, properties: { part: { id: "tool-part", callID: "call", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 250 } } } } });
     await send(completionFact("m", 10, 5, 0, 1000));
     const [record] = await readRecords(path);
-    assert.equal(record.samples.length, 3);
-    assert.equal(record.samples.filter((s: any) => s.kind === "reasoning").reduce((sum: number, s: any) => sum + s.tokens, 0), 5);
-    assert.equal(record.speed.generation, undefined);
-    assert.equal(record.speed.generationEvidence, undefined);
-    assert.equal(record.speed.response.durationMs, 1000);
-    assert.equal((await readTotals(path)).sessions.s.speed.generation.responseCount, 0);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.tokens.reasoning, 5);
+    assert.equal(record.speed, undefined);
+    assert.equal((await readTotals(path)).sessions.s.tokens.output, 10);
+    assert.equal((await readTotals(path)).sessions.s.speed, undefined);
   });
 });
 test("explicit envelope revisions reject stale updates and permit a genuinely newer return to old facts", async () => {
@@ -1056,18 +1053,19 @@ test("known snapshot gap and uncertain tool input downgrade generation without s
     let records = await readRecords(historyPath);
     assert.equal(records[0].time.firstToken, 100);
     assert.equal(records[0].time.ttft, 100);
-    assert.equal(records[0].samples.length, 2); // v2 final priority, no snapshot/result duplication
-    assert.equal(records[0].speed.generation, undefined);
-    assert.equal(records[0].speed.generationEvidence, undefined);
-    assert.equal(records[0].speed.response.durationMs, 1000);
+    assert.equal(records[0].tokens.output, 20);
+    assert.equal(records[0].tokens.reasoning, 5);
+    assert.equal(records[0].samples.length, 0);
+    assert.equal(records[0].speed, undefined);
     await send("message.updated", 1200, { info: { ...info, time: { created: 0, firstToken: 300, completed: 1200 } } });
     records = await readRecords(historyPath);
     assert.equal(records[0].time.firstToken, 100);
-    assert.equal(records[0].speed.response.durationMs, 1200);
+    assert.equal(records[0].tokens.output, 20);
+    assert.equal(records[0].speed, undefined);
     const totals = await readTotals(historyPath);
     assert.equal(totals.sessions.s.responseCount, 1);
-    assert.equal(totals.sessions.s.speed.response.durationMs, 1200);
-    assert.equal(totals.sessions.s.speed.generation.responseCount, 0);
+    assert.equal(totals.sessions.s.tokens.output, 20);
+    assert.equal(totals.sessions.s.speed, undefined);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -1082,8 +1080,7 @@ test("unknown multistep usage is not summed and missing final usage is provision
     const [record] = await readRecords(historyPath);
     assert.equal(record.tokens.output, 20);
     assert.equal(record.quality, "provisional");
-    assert.equal(record.speed.response.estimated, true);
-    assert.equal(record.speed.generation, undefined);
+    assert.equal(record.speed, undefined);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -1096,10 +1093,11 @@ test("cumulative direct speed outlives the retained history window", async () =>
     await hooks.event!({ event: assistantCompleted("new", { input: 1, output: 30, reasoning: 0 }, 200) as never });
     assert.equal((await readRecords(historyPath)).length, 1);
     const totals = await readTotals(historyPath);
-    assert.equal(totals.sessions.session.speed.response.generatedTokens, 40);
-    assert.equal(totals.sessions.session.speed.response.durationMs, 100);
-    assert.equal(totals.sessions.session.speed.response.responseCount, 2);
-    assert.equal(totals.settled.old.speed.response.generatedTokens, 10);
+    assert.equal(totals.sessions.session.tokens.output, 40);
+    assert.equal(totals.sessions.session.responseCount, 2);
+    assert.equal(totals.sessions.session.speed, undefined);
+    assert.equal(totals.settled.old.tokens.output, 10);
+    assert.equal(totals.settled.old.speed, undefined);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -1115,9 +1113,9 @@ test("tool-only snapshots have no invented first output or generation interval",
     await hooks.event!({ event: assistantCompleted("m", { input: 1, output: 10, reasoning: 0 }, 1000, 0, "s") as never });
     const [record] = await readRecords(historyPath);
     assert.equal(record.time.firstToken, undefined);
+    assert.equal(record.tokens.output, 10);
     assert.equal(record.samples.length, 0);
-    assert.equal(record.speed.generation, undefined);
-    assert.equal(record.speed.response.durationMs, 50);
+    assert.equal(record.speed, undefined);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -1765,9 +1763,11 @@ test("an idle provisional replaced by a smaller exact is not added twice", async
 
     const provisionalHistory = await readRecords(historyPath);
     assert.equal(provisionalHistory[0]?.quality, "provisional");
+    assert.equal(provisionalHistory[0]?.speed, undefined);
     const provisional = await readTotals(historyPath);
     assert.equal(provisional.sessions.session.responseCount, 1);
-    assert.ok(provisional.sessions.session.tokens.output > 3);
+    assert.equal(provisional.sessions.session.tokens.output, 0);
+    assert.equal(provisional.sessions.session.speed, undefined);
 
     await hooks.event({ event: {
       type: "message.updated",
@@ -1862,7 +1862,8 @@ test("an idle totals write failure keeps the active state for a later retry", as
 
     const totals = await readTotals(historyPath);
     assert.equal(totals.sessions.session.responseCount, 1);
-    assert.ok(totals.sessions.session.tokens.output > 0);
+    assert.equal(totals.sessions.session.tokens.output, 0);
+    assert.equal(totals.sessions.session.speed, undefined);
     assert.equal((await readRecords(historyPath)).length, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });

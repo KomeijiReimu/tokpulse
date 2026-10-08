@@ -13,15 +13,12 @@ import { readFile } from "node:fs/promises";
 import { watch, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { createEffect, createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
-import { BoxRenderable, TextareaRenderable, TextRenderable, LayoutEvents, RenderableEvents, Yoga } from "@opentui/core";
+import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import { createBindingLookup } from "@opencode-ai/plugin/tui";
-import { DEFAULT_BYTES_PER_TOKEN, DEFAULT_ROLLING_WINDOW_MS, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calculateSpeedStats, calibrateResponseSamples, bytesToTokens, durationOf, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, measureRollingTokenRate, timeToFirstToken, utf8ByteLength } from "./core.js";
+import { DEFAULT_BYTES_PER_TOKEN, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calibrateResponseSamples, bytesToTokens, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, timeToFirstToken } from "./core.js";
 import { replayActivity, resolveRootSessionID } from "./activity.js";
-import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, parseModelDelta, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
-import { getSessionAverageSummary } from "./statistics.js";
-import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteContentArrival, noteStepIdentity, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
-import { RECEIVE_CLOCK_RESOLUTION_MS } from "./statistics.js";
+import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
+import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteStepIdentity, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
 import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, isSessionScopeExcluded, mergeScopeEvidence } from "./scope.js";
 import { DEFAULT_MAX_RECORDS, readHistoryFile, filterHistoryRecords } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
@@ -32,11 +29,6 @@ const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
 const COMMAND_NAME = "oc-tps.history";
 export const DETAILS_COMMAND_NAME = "oc-tps.details";
-const SPARK_CHARS = ".:-=+#";
-const RECEIVE_CLOCK = Object.freeze({
-  clockSource: "performance.now",
-  clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS
-});
 const recordQualityByObject = new WeakMap();
 const observationRuntimes = new WeakMap();
 function observationRuntime(store) {
@@ -384,14 +376,6 @@ function readSessionID(properties, event) {
   const direct = readStringFrom([properties, event], ["sessionID", "sessionId", "session.id"]);
   if (direct) return direct;
   return readStringFrom([asRecord(properties.info), asRecord(properties.session), asRecord(event.info), asRecord(event.session)], ["id", "sessionID", "sessionId", "session.id"]);
-}
-function readDelta(properties, event) {
-  const values = [properties.delta, properties.text, properties.content, getPath(properties, "part.delta"), getPath(properties, "part.text"), event.delta, event.text];
-  return values.find(value => typeof value === "string" && value.length > 0);
-}
-function inferKind(properties, event) {
-  const values = [properties.kind, properties.type, properties.field, getPath(properties, "part.type"), event.kind, event.type];
-  return values.some(value => typeof value === "string" && value.toLowerCase().includes("reason")) ? "reasoning" : "output";
 }
 function modelName(value) {
   if (!value) return undefined;
@@ -1610,69 +1594,9 @@ export function noteTaskRecord(store, api, record) {
   const summary = noteTaskRunRecord(run, record.sessionID, record.time.start, record.time.completed);
   if (summary) store.bump();
 }
-export function recordDelta(store, properties, event, stream, _explicitKind, bytesPerToken, receivedAt = Date.now(), receivedMono = performance.now(), clock) {
-  const sessionID = readSessionID(properties, event);
-  if (!sessionID) return;
-  if (isReplayEvent(event, properties)) {
-    const state = store.active.get(readMessageID(properties) ?? pendingKey(sessionID));
-    if (state) taintTuiState(store, state, "recovered-content");
-    return;
-  }
-  const parentID = sessionParentFromEvent("message.part.delta", properties, event);
-  if (parentID) rememberSessionParent(store, sessionID, parentID);
-  const messageID = readMessageID(properties) ?? ownedMessageID(store, sessionID);
-  if (!scopeEligible(store, sessionID, messageID)) return;
-  if (messageID && (knownCompletedMessage(store, messageID) || knownNonAssistant(store, messageID))) return;
-  const delta = readDelta(properties, event);
-  if (!delta) return;
-  const timestamp = receivedAt;
-  const pending = store.active.get(pendingKey(sessionID));
-  const existingState = messageID ? store.active.get(messageID) ?? (pending?.ownerMessageID === messageID ? pending : undefined) : pending;
-  if (existingState && existingState.sessionID !== sessionID) return;
-  const progress = existingState?.progress ?? cachedContentProgress(observationRuntime(store).metadata, messageID ?? pendingKey(sessionID));
-  // Losing compatibility streams must not mutate hashes, timing or sticky taints.
-  const selected = existingState?.selectedSource ?? progress.selectedStream;
-  if (selected !== undefined && selected !== stream) return;
-  const parsed = parseModelDelta(progress, properties, event, stream, delta);
-  if (!parsed) return;
-  const runtime = messageID && observationRuntime(store).liveAssistantMessages.has(messageID) ? ensureSessionRun(store, sessionID, timestamp) : getSessionRuntime(store, sessionID);
-  const state = existingState ?? getOrCreateActiveState(store.active, messageID, sessionID, timestamp);
-  state.progress = progress;
-  bindTuiPendingTaints(store, state);
-  if (!state.observedFromStart || !messageID) taintTuiState(store, state, "unobserved-response-start");
-  observationRuntime(store).metadata.progress.set(messageID ?? pendingKey(sessionID), progress);
-  if (messageID && observationRuntime(store).liveAssistantMessages.has(messageID)) {
-    applyActiveTiming(state, recordContentArrival(activeTiming(state), timestamp));
-  }
-  runtime.runFirstTokenAt = Math.min(runtime.runFirstTokenAt ?? timestamp, timestamp);
-  const bytes = utf8ByteLength(delta);
-  noteContentArrival(progress, {
-    kind: parsed.kind,
-    partID: parsed.partID,
-    bytes,
-    receivedAt,
-    receivedMono,
-    stream
-  }, clock);
-  const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
-  const sample = {
-    timestamp,
-    tokens: estimatedTokens,
-    estimatedTokens,
-    bytes,
-    kind: parsed.kind
-  };
-  if (state.sessionID !== sessionID) return;
-  state.selectedSource = lockStreamSource(state.selectedSource, stream);
-  runtime.runFirstTokenAt = runtime.runFirstTokenAt === undefined ? timestamp : Math.min(runtime.runFirstTokenAt, timestamp);
-  if (messageID) runtime.activeMessageID = messageID;
-  state[stream].hasData = true;
-  state[stream].samples.push(sample);
-  state[stream].samples.sort((left, right) => left.timestamp - right.timestamp);
-  state.responseEpoch ??= runtime.runEpoch;
-  state.ownerMessageID ??= messageID;
-  store.active.set(state.messageID, state);
-  store.bump();
+export function recordDelta(_store, _properties, _event, _stream, _explicitKind, _bytesPerToken, _receivedAt = Date.now(), _receivedMono = performance.now(), _clock) {
+  // Content streaming is intentionally not projected. Completion, history, and
+  // activity events remain the only paths that refresh usage or task time.
 }
 export function recordStepStarted(store, properties, event) {
   if (isReplayEvent(event, properties)) return;
@@ -2272,9 +2196,9 @@ export async function reloadActivity(store, api, path, generation = store.activi
         const terminal = instance.events.at(-1);
         if (!terminal || instance.open || terminal.state === "busy" || terminal.state === "retry" || terminal.timestamp < lastActive || terminal.observedAt < observationRuntime(store).observedSince) continue;
         if (!instance.events.some(fact => (fact.state === "busy" || fact.state === "retry") && fact.timestamp >= observationRuntime(store).observedSince && fact.timestamp <= lastActive)) continue;
-        const current = latestActive(store, participant.sessionID);
-        if (current && current.startedAt > terminal.timestamp) continue;
-        if (knownToolWaiting(api, store, participant.sessionID)) continue;
+        const currentID = ownedMessageID(store, participant.sessionID);
+        const current = currentID ? store.active.get(currentID) : undefined;
+        if (current?.sessionID === participant.sessionID && observationRuntime(store).liveAssistantMessages.has(current.messageID) && current.startedAt > terminal.timestamp) continue;
         handleSessionLifecycle(store, api, "session.idle", {
           sessionID: participant.sessionID
         }, {
@@ -2441,17 +2365,13 @@ function formatScaledUnit(absolute, divisor, decimals, trimTrailingZero) {
   if (trimTrailingZero) rendered = rendered.replace(/\.0$/, "");
   return rendered;
 }
-export function formatCompactRate(value) {
-  return `${formatCompactNumber(value)} tok/s`;
-}
 export function formatCacheHitRate(rate) {
   if (rate === undefined || !Number.isFinite(rate)) return "--";
   return `${Math.round(Math.max(0, Math.min(1, rate)) * 100)}%`;
 }
-export function formatPulseMetrics(tokens, speed, width = Number.POSITIVE_INFINITY, taskTimeMs) {
-  const speedLabel = speed !== undefined && Number.isFinite(speed) && speed >= 0 ? `~${formatCompactRate(speed)}` : "-- tok/s";
+export function formatPulseMetrics(tokens, width = Number.POSITIVE_INFINITY, taskTimeMs) {
   const timeLabel = taskTimeMs !== undefined && Number.isFinite(taskTimeMs) && taskTimeMs >= 0 ? formatDuration(taskTimeMs).replace(/\s+/g, "") : "--";
-  const fields = [`${formatCompactNumber(totalTokens(tokens))} total`, speedLabel, `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`];
+  const fields = [`${formatCompactNumber(totalTokens(tokens))} total`, `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`];
   return wrapMetricFields(fields, width);
 }
 function wrapMetricFields(fields, width) {
@@ -2464,8 +2384,8 @@ function wrapMetricFields(fields, width) {
   }
   return lines.join("\n");
 }
-export function formatPulseSummary(tokens, speed) {
-  return `+ Token Pulse  ${formatPulseMetrics(tokens, speed)}`;
+export function formatPulseSummary(tokens) {
+  return `+ Token Pulse  ${formatPulseMetrics(tokens)}`;
 }
 function formatCost(value) {
   return `$${formatNumber(value, 4)}`;
@@ -2476,79 +2396,6 @@ function formatTime(timestamp) {
   if (Number.isNaN(date.getTime())) return "--:--:--";
   return date.toISOString().slice(11, 19);
 }
-function formatOptionalDuration(value) {
-  return value === undefined ? "--" : formatDuration(value);
-}
-export function generationElapsed(record) {
-  return selectSpeedMeasurement(record).measurement?.durationMs;
-}
-export function recordSpeedSummary(record) {
-  const generated = generatedTokens(record.tokens);
-  const sampleStats = calculateSpeedStats(record.samples.map(sample => ({
-    ...sample,
-    tokens: sample.estimatedTokens ?? (sample.bytes !== undefined ? bytesToTokens(sample.bytes, DEFAULT_BYTES_PER_TOKEN) : sample.tokens)
-  })));
-  const selected = selectSpeedMeasurement(record);
-  return {
-    avg: selected.rate ?? 0,
-    max: sampleStats.extremaAvailable ? sampleStats.max : 0,
-    min: sampleStats.extremaAvailable ? sampleStats.min : 0,
-    extremaAvailable: sampleStats.extremaAvailable === true,
-    available: selected.available,
-    generated,
-    estimated: selected.estimated,
-    basis: selected.basis,
-    observationQuality: selected.measurement?.observationQuality
-  };
-}
-export function formatResponseTimingDetails(record) {
-  const time = record.time;
-  const firstContent = earliestFirstOutput(time.start, time.completed ?? time.start, time.firstContent, time.firstToken);
-  const contentTTFT = firstContent === undefined ? undefined : firstContent - time.start;
-  const signal = time.firstResponse !== undefined ? `${time.firstResponseSource ?? "content"} · ${time.firstResponseTimeSource === "part-start" ? "part start" : "event arrival"}${time.firstResponseEstimated ? " (estimated)" : ""}` : "legacy content timing";
-  return `First content TTFT ${formatOptionalDuration(contentTTFT)} · first response: ${signal}. Start is assistant message creation, not an exact provider request time.`;
-}
-export function formatArrivalPeaks(record) {
-  const summary = recordSpeedSummary(record);
-  return summary.extremaAvailable ? `Arrival peaks (estimated window): max ~${formatCompactRate(summary.max)} · min ~${formatCompactRate(summary.min)}` : "Arrival peaks: -- (insufficient window observations)";
-}
-export function formatResponseThroughput(record) {
-  const selected = selectResponseMeasurement(record);
-  return `Response throughput ${selected.available ? `${selected.estimated ? "~" : ""}${formatCompactRate(selected.rate)}` : "--"}`;
-}
-export function aggregateSpeed(records) {
-  let generated = 0;
-  let elapsed = 0;
-  for (const record of records) {
-    // Window aggregate uses a single response basis; never mix generation
-    // and response durations when only a subset has generation coverage.
-    const response = coerceSpeedContribution(record.speed)?.response;
-    if (!response) continue;
-    generated += response.generatedTokens;
-    elapsed += response.durationMs;
-  }
-  return elapsed > 0 ? generated * 1000 / elapsed : 0;
-}
-function sparkline(samples, width = 8) {
-  if (width <= 0) return "";
-  if (samples.length === 0) return ".".repeat(width);
-  const ordered = [...samples].sort((left, right) => left.timestamp - right.timestamp);
-  const values = Array.from({
-    length: width
-  }, (_, index) => {
-    const start = Math.floor(index * ordered.length / width);
-    const end = Math.max(start + 1, Math.floor((index + 1) * ordered.length / width));
-    const bucket = ordered.slice(start, Math.min(end, ordered.length));
-    return bucket.reduce((sum, sample) => sum + Math.max(0, sample.tokens), 0);
-  });
-  const max = Math.max(...values);
-  const min = Math.min(...values);
-  return values.map(value => {
-    if (max === min) return SPARK_CHARS[3];
-    const index = Math.round((value - min) / (max - min) * (SPARK_CHARS.length - 1));
-    return SPARK_CHARS[Math.max(0, Math.min(SPARK_CHARS.length - 1, index))];
-  }).join("");
-}
 function padRight(value, width) {
   return value.length >= width ? value.slice(0, width) : value.padEnd(width, " ");
 }
@@ -2556,10 +2403,7 @@ function padLeft(value, width) {
   return value.length >= width ? value.slice(-width) : value.padStart(width, " ");
 }
 export function formatHistoryRow(record) {
-  const speed = recordSpeedSummary(record);
-  const ttft = timeToFirstToken(record);
-  const duration = durationOf(record);
-  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(speed.available ? `${speed.estimated ? "~" : ""}${formatCompactNumber(speed.avg)}` : "--", 7), padRight(speed.observationQuality === "short" ? "generation short" : speed.basis ?? "--", 10), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.max)}` : "--", 7), padLeft(speed.extremaAvailable ? `~${formatCompactNumber(speed.min)}` : "--", 7), padLeft(formatOptionalDuration(ttft), 7), padLeft(formatOptionalDuration(duration), 7), padLeft(formatCost(record.cost), 9), sparkline(record.samples)].join(" ");
+  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(formatCost(record.cost), 9)].join(" ");
 }
 function summaryLines(label, tokens, cost, responseCount) {
   return [label, `  Total tokens (input + generated + cache) ${formatCompactNumber(totalTokens(tokens))}`, `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`, `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`, `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`, `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`, `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
@@ -2693,7 +2537,7 @@ function ChildAgentRows(props) {
       _$insert(_el$10, () => `${"  ".repeat(row.depth)}${row.sessionID}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`);
       _$setProp(_el$11, "wrapMode", "word");
       _$setProp(_el$11, "flexShrink", 0);
-      _$insert(_el$11, () => `model ${row.model}  ${row.speedAvailable ? `~${formatCompactRate(row.speed)}` : "--"}`);
+      _$insert(_el$11, () => `model ${row.model}`);
       _$effect(_p$ => {
         var _v$3 = props.theme.current.borderSubtle,
           _v$4 = props.theme.current.info,
@@ -2772,27 +2616,6 @@ function totalsForSession(store, sessionID) {
   const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
   return projectSessionTotals(scopedLedger(store), scopedRecords(store, contributions), store.sessionParents, sessionID);
 }
-export function sessionUsageSummary(store, sessionID) {
-  return getSessionAverageSummary(totalsForSession(store, sessionID)?.direct ?? zeroDirectTotals());
-}
-export function formatAverageRate(summary) {
-  if (!summary.available || summary.rate === undefined) return "--";
-  return `${summary.estimated ? "~" : ""}${formatCompactRate(summary.rate)}`;
-}
-export function sessionAverageDisplay(summary, isChild = false) {
-  const measured = summary.generation;
-  return {
-    label: isChild ? "Session avg TPS" : "Main avg TPS",
-    value: measured.available && measured.rate !== undefined ? `~${formatCompactRate(measured.rate)}` : "--",
-    coverage: `Observed ${formatCompactNumber(measured.coveredResponseCount)}/${formatCompactNumber(summary.totalResponseCount)} calls${measured.shortResponseCount ? ` · ${formatCompactNumber(measured.shortResponseCount)} short (low confidence)` : ""}`,
-    ...(!measured.available && measured.coveredResponseCount === 0 && summary.totalResponseCount > 0 ? {
-      diagnostic: "No qualified generation timing."
-    } : {})
-  };
-}
-function averageCoverage(summary, total) {
-  return `Observed usage ${formatCompactNumber(summary.coveredGeneratedTokens)}/${formatCompactNumber(total.totalGeneratedTokens)} generated tokens · ${formatCompactNumber(summary.coveredResponseCount)}/${formatCompactNumber(total.totalResponseCount)} calls · ${formatOptionalDuration(summary.available ? summary.durationMs : undefined)} measured${summary.shortResponseCount ? ` · ${formatCompactNumber(summary.shortResponseCount)} short (low confidence)` : ""}`;
-}
 export function TokenPulseDetails(props) {
   if (!scopeEligible(props.store, props.sessionID)) return (() => {
     var _el$12 = _$createElement("text");
@@ -2866,22 +2689,11 @@ export function TokenPulseDetails(props) {
       _el$20 = _$createElement("text"),
       _el$22 = _$createElement("text"),
       _el$23 = _$createElement("text"),
-      _el$25 = _$createElement("text"),
-      _el$26 = _$createElement("text"),
-      _el$27 = _$createElement("text"),
-      _el$28 = _$createElement("text"),
-      _el$29 = _$createElement("text"),
-      _el$31 = _$createElement("text"),
-      _el$33 = _$createElement("text"),
-      _el$35 = _$createElement("text"),
-      _el$36 = _$createElement("text"),
-      _el$38 = _$createElement("text"),
-      _el$40 = _$createElement("text"),
-      _el$42 = _$createElement("text");
+      _el$25 = _$createElement("text");
     _$insertNode(_el$14, _el$15);
     _$insertNode(_el$14, _el$17);
     _$insertNode(_el$14, _el$18);
-    _$insertNode(_el$14, _el$42);
+    _$insertNode(_el$14, _el$25);
     _$setProp(_el$14, "flexDirection", "column");
     _$setProp(_el$14, "width", "100%");
     _$setProp(_el$14, "flexShrink", 0);
@@ -2894,87 +2706,87 @@ export function TokenPulseDetails(props) {
     _$insert(_el$14, (() => {
       var _c$ = _$memo(() => tree().nodes.length > 1);
       return () => _c$() && (() => {
-        var _el$44 = _$createElement("box"),
-          _el$45 = _$createElement("text"),
-          _el$46 = _$createElement("select"),
-          _el$47 = _$createElement("box"),
-          _el$48 = _$createElement("text"),
-          _el$50 = _$createElement("text"),
-          _el$52 = _$createElement("text"),
-          _el$54 = _$createElement("text");
-        _$insertNode(_el$44, _el$45);
-        _$insertNode(_el$44, _el$46);
-        _$insertNode(_el$44, _el$47);
-        _$setProp(_el$44, "flexDirection", "column");
-        _$setProp(_el$44, "flexShrink", 0);
-        _$insert(_el$45, () => `SESSION TREE · ${tree().nodes.length} sessions`);
+        var _el$27 = _$createElement("box"),
+          _el$28 = _$createElement("text"),
+          _el$29 = _$createElement("select"),
+          _el$30 = _$createElement("box"),
+          _el$31 = _$createElement("text"),
+          _el$33 = _$createElement("text"),
+          _el$35 = _$createElement("text"),
+          _el$37 = _$createElement("text");
+        _$insertNode(_el$27, _el$28);
+        _$insertNode(_el$27, _el$29);
+        _$insertNode(_el$27, _el$30);
+        _$setProp(_el$27, "flexDirection", "column");
+        _$setProp(_el$27, "flexShrink", 0);
+        _$insert(_el$28, () => `SESSION TREE · ${tree().nodes.length} sessions`);
         _$use(node => {
           selector = node;
           onMount(() => node.focus());
-        }, _el$46);
-        _$setProp(_el$46, "flexShrink", 0);
-        _$setProp(_el$46, "showDescription", false);
-        _$setProp(_el$46, "showScrollIndicator", true);
-        _$setProp(_el$46, "wrapSelection", false);
-        _$setProp(_el$46, "itemSpacing", 0);
-        _$setProp(_el$46, "onChange", (_index, option) => choose(option?.value));
-        _$setProp(_el$46, "onSelect", (_index, option) => {
+        }, _el$29);
+        _$setProp(_el$29, "flexShrink", 0);
+        _$setProp(_el$29, "showDescription", false);
+        _$setProp(_el$29, "showScrollIndicator", true);
+        _$setProp(_el$29, "wrapSelection", false);
+        _$setProp(_el$29, "itemSpacing", 0);
+        _$setProp(_el$29, "onChange", (_index, option) => choose(option?.value));
+        _$setProp(_el$29, "onSelect", (_index, option) => {
           choose(option?.value);
           body?.focus();
         });
-        _$setProp(_el$46, "onKeyDown", key => {
+        _$setProp(_el$29, "onKeyDown", key => {
           if (key.name === "tab") {
             key.preventDefault();
             key.stopPropagation();
             body?.focus();
           }
         });
-        _$insertNode(_el$47, _el$48);
-        _$insertNode(_el$47, _el$50);
-        _$insertNode(_el$47, _el$52);
-        _$insertNode(_el$47, _el$54);
-        _$setProp(_el$47, "flexDirection", "row");
-        _$setProp(_el$47, "height", 1);
-        _$setProp(_el$47, "flexShrink", 0);
-        _$insertNode(_el$48, _$createTextNode(`[prev]`));
-        _$setProp(_el$48, "onMouseDown", () => {
+        _$insertNode(_el$30, _el$31);
+        _$insertNode(_el$30, _el$33);
+        _$insertNode(_el$30, _el$35);
+        _$insertNode(_el$30, _el$37);
+        _$setProp(_el$30, "flexDirection", "row");
+        _$setProp(_el$30, "height", 1);
+        _$setProp(_el$30, "flexShrink", 0);
+        _$insertNode(_el$31, _$createTextNode(`[prev]`));
+        _$setProp(_el$31, "onMouseDown", () => {
           selector?.focus();
           selector?.moveUp();
         });
-        _$insertNode(_el$50, _$createTextNode(` `));
-        _$insertNode(_el$52, _$createTextNode(`[next]`));
-        _$setProp(_el$52, "onMouseDown", () => {
+        _$insertNode(_el$33, _$createTextNode(` `));
+        _$insertNode(_el$35, _$createTextNode(`[next]`));
+        _$setProp(_el$35, "onMouseDown", () => {
           selector?.focus();
           selector?.moveDown();
         });
-        _$insertNode(_el$54, _$createTextNode(` · ↑/↓ · Enter/Tab`));
+        _$insertNode(_el$37, _$createTextNode(` · ↑/↓ · Enter/Tab`));
         _$effect(_p$ => {
-          var _v$26 = theme.accent,
-            _v$27 = Math.min(tree().nodes.length, compact() ? 2 : 3),
-            _v$28 = options(),
-            _v$29 = Math.max(0, tree().nodes.findIndex(node => node.sessionID === details().sessionID)),
-            _v$30 = theme.text,
-            _v$31 = theme.backgroundPanel,
-            _v$32 = theme.backgroundPanel,
-            _v$33 = theme.backgroundElement,
-            _v$34 = theme.accent,
-            _v$35 = theme.accent,
-            _v$36 = theme.textMuted,
-            _v$37 = theme.accent,
-            _v$38 = theme.textMuted;
-          _v$26 !== _p$.e && (_p$.e = _$setProp(_el$45, "fg", _v$26, _p$.e));
-          _v$27 !== _p$.t && (_p$.t = _$setProp(_el$46, "height", _v$27, _p$.t));
-          _v$28 !== _p$.a && (_p$.a = _$setProp(_el$46, "options", _v$28, _p$.a));
-          _v$29 !== _p$.o && (_p$.o = _$setProp(_el$46, "selectedIndex", _v$29, _p$.o));
-          _v$30 !== _p$.i && (_p$.i = _$setProp(_el$46, "textColor", _v$30, _p$.i));
-          _v$31 !== _p$.n && (_p$.n = _$setProp(_el$46, "backgroundColor", _v$31, _p$.n));
-          _v$32 !== _p$.s && (_p$.s = _$setProp(_el$46, "focusedBackgroundColor", _v$32, _p$.s));
-          _v$33 !== _p$.h && (_p$.h = _$setProp(_el$46, "selectedBackgroundColor", _v$33, _p$.h));
-          _v$34 !== _p$.r && (_p$.r = _$setProp(_el$46, "selectedTextColor", _v$34, _p$.r));
-          _v$35 !== _p$.d && (_p$.d = _$setProp(_el$48, "fg", _v$35, _p$.d));
-          _v$36 !== _p$.l && (_p$.l = _$setProp(_el$50, "fg", _v$36, _p$.l));
-          _v$37 !== _p$.u && (_p$.u = _$setProp(_el$52, "fg", _v$37, _p$.u));
-          _v$38 !== _p$.c && (_p$.c = _$setProp(_el$54, "fg", _v$38, _p$.c));
+          var _v$15 = theme.accent,
+            _v$16 = Math.min(tree().nodes.length, compact() ? 2 : 3),
+            _v$17 = options(),
+            _v$18 = Math.max(0, tree().nodes.findIndex(node => node.sessionID === details().sessionID)),
+            _v$19 = theme.text,
+            _v$20 = theme.backgroundPanel,
+            _v$21 = theme.backgroundPanel,
+            _v$22 = theme.backgroundElement,
+            _v$23 = theme.accent,
+            _v$24 = theme.accent,
+            _v$25 = theme.textMuted,
+            _v$26 = theme.accent,
+            _v$27 = theme.textMuted;
+          _v$15 !== _p$.e && (_p$.e = _$setProp(_el$28, "fg", _v$15, _p$.e));
+          _v$16 !== _p$.t && (_p$.t = _$setProp(_el$29, "height", _v$16, _p$.t));
+          _v$17 !== _p$.a && (_p$.a = _$setProp(_el$29, "options", _v$17, _p$.a));
+          _v$18 !== _p$.o && (_p$.o = _$setProp(_el$29, "selectedIndex", _v$18, _p$.o));
+          _v$19 !== _p$.i && (_p$.i = _$setProp(_el$29, "textColor", _v$19, _p$.i));
+          _v$20 !== _p$.n && (_p$.n = _$setProp(_el$29, "backgroundColor", _v$20, _p$.n));
+          _v$21 !== _p$.s && (_p$.s = _$setProp(_el$29, "focusedBackgroundColor", _v$21, _p$.s));
+          _v$22 !== _p$.h && (_p$.h = _$setProp(_el$29, "selectedBackgroundColor", _v$22, _p$.h));
+          _v$23 !== _p$.r && (_p$.r = _$setProp(_el$29, "selectedTextColor", _v$23, _p$.r));
+          _v$24 !== _p$.d && (_p$.d = _$setProp(_el$31, "fg", _v$24, _p$.d));
+          _v$25 !== _p$.l && (_p$.l = _$setProp(_el$33, "fg", _v$25, _p$.l));
+          _v$26 !== _p$.u && (_p$.u = _$setProp(_el$35, "fg", _v$26, _p$.u));
+          _v$27 !== _p$.c && (_p$.c = _$setProp(_el$37, "fg", _v$27, _p$.c));
           return _p$;
         }, {
           e: undefined,
@@ -2991,7 +2803,7 @@ export function TokenPulseDetails(props) {
           u: undefined,
           c: undefined
         });
-        return _el$44;
+        return _el$27;
       })();
     })(), _el$18);
     _$insertNode(_el$18, _el$19);
@@ -3025,17 +2837,6 @@ export function TokenPulseDetails(props) {
     _$insertNode(_el$19, _el$20);
     _$insertNode(_el$19, _el$22);
     _$insertNode(_el$19, _el$23);
-    _$insertNode(_el$19, _el$25);
-    _$insertNode(_el$19, _el$26);
-    _$insertNode(_el$19, _el$27);
-    _$insertNode(_el$19, _el$28);
-    _$insertNode(_el$19, _el$29);
-    _$insertNode(_el$19, _el$31);
-    _$insertNode(_el$19, _el$33);
-    _$insertNode(_el$19, _el$35);
-    _$insertNode(_el$19, _el$36);
-    _$insertNode(_el$19, _el$38);
-    _$insertNode(_el$19, _el$40);
     _$setProp(_el$19, "flexDirection", "column");
     _$setProp(_el$19, "flexShrink", 0);
     _$setProp(_el$19, "width", "100%");
@@ -3045,26 +2846,14 @@ export function TokenPulseDetails(props) {
     _$insert(_el$19, (() => {
       var _c$2 = _$memo(() => details().direct.responseCount === 0);
       return () => _c$2() && (() => {
-        var _el$56 = _$createElement("text");
-        _$insertNode(_el$56, _$createTextNode(`No recorded usage for this session`));
-        _$setProp(_el$56, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$56, "fg", theme.textMuted, _$p));
-        return _el$56;
+        var _el$39 = _$createElement("text");
+        _$insertNode(_el$39, _$createTextNode(`No recorded usage for this session`));
+        _$setProp(_el$39, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$39, "fg", theme.textMuted, _$p));
+        return _el$39;
       })();
     })(), _el$23);
-    _$insertNode(_el$23, _$createTextNode(`SESSION AVERAGES`));
-    _$setProp(_el$25, "wrapMode", "word");
-    _$insert(_el$25, () => `Generation avg TPS  ${formatAverageRate(details().average.generation)}`);
-    _$setProp(_el$26, "wrapMode", "word");
-    _$insert(_el$26, () => averageCoverage(details().average.generation, details().average));
-    _$setProp(_el$27, "wrapMode", "word");
-    _$insert(_el$27, () => `Response throughput  ${formatAverageRate(details().average.response)}`);
-    _$setProp(_el$28, "wrapMode", "word");
-    _$insert(_el$28, () => averageCoverage(details().average.response, details().average));
-    _$insertNode(_el$29, _$createTextNode(`Response time includes TTFT and may include tool waits. Completed TPS needs complete content and at least 100ms of verified arrival timing. Under 1s is short, low confidence. LIVE and peaks still need 1s.`));
-    _$setProp(_el$29, "wrapMode", "word");
-    _$insertNode(_el$31, _$createTextNode(`SESSION USAGE`));
-    _$setProp(_el$31, "paddingTop", 1);
+    _$insertNode(_el$23, _$createTextNode(`SESSION USAGE`));
     _$insert(_el$19, _$createComponent(PulseMetricGrid, {
       get theme() {
         return props.api.theme;
@@ -3072,90 +2861,31 @@ export function TokenPulseDetails(props) {
       get rows() {
         return pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map(metric => [metric]);
       }
-    }), _el$33);
-    _$insertNode(_el$33, _$createTextNode(`LAST RESPONSE`));
-    _$setProp(_el$33, "paddingTop", 1);
-    _$setProp(_el$35, "wrapMode", "word");
-    _$insert(_el$35, (() => {
-      var _c$3 = _$memo(() => !!details().last);
-      return () => _c$3() ? `${details().lastSpeed.available ? `~${formatCompactRate(details().lastSpeed.avg)} (generation)${details().lastSpeed.observationQuality === "short" ? " · short, low confidence" : ""}` : "Generation TPS --"} · TTFT ${formatOptionalDuration(details().last.ttft)} · response time ${formatOptionalDuration(durationOf(details().last.record))}` : "No completed response in the loaded history";
-    })());
+    }), null);
     _$insert(_el$19, (() => {
-      var _c$4 = _$memo(() => !!details().last);
-      return () => _c$4() && [(() => {
-        var _el$58 = _$createElement("text");
-        _$setProp(_el$58, "wrapMode", "word");
-        _$insert(_el$58, () => formatResponseThroughput(details().last.record));
-        _$effect(_$p => _$setProp(_el$58, "fg", theme.textMuted, _$p));
-        return _el$58;
-      })(), (() => {
-        var _el$59 = _$createElement("text");
-        _$setProp(_el$59, "wrapMode", "word");
-        _$insert(_el$59, () => formatResponseTimingDetails(details().last.record));
-        _$effect(_$p => _$setProp(_el$59, "fg", theme.textMuted, _$p));
-        return _el$59;
-      })(), (() => {
-        var _el$60 = _$createElement("text");
-        _$setProp(_el$60, "wrapMode", "word");
-        _$insert(_el$60, () => formatArrivalPeaks(details().last.record));
-        _$effect(_$p => _$setProp(_el$60, "fg", theme.textMuted, _$p));
-        return _el$60;
-      })(), _$memo(() => _$memo(() => !!!details().lastSpeed?.available)() && (() => {
-        var _el$61 = _$createElement("text");
-        _$setProp(_el$61, "wrapMode", "word");
-        _$insert(_el$61, () => responseMeasurementStatus(details().last.record));
-        _$effect(_$p => _$setProp(_el$61, "fg", theme.textMuted, _$p));
-        return _el$61;
-      })())];
-    })(), _el$36);
-    _$insert(_el$19, (() => {
-      var _c$5 = _$memo(() => !!details().last?.record.model);
-      return () => _c$5() && (() => {
-        var _el$62 = _$createElement("text");
-        _$setProp(_el$62, "wrapMode", "word");
-        _$insert(_el$62, () => `Last model: ${details().last.record.model}`);
-        _$effect(_$p => _$setProp(_el$62, "fg", theme.textMuted, _$p));
-        return _el$62;
+      var _c$3 = _$memo(() => !!details().last?.record.model);
+      return () => _c$3() && (() => {
+        var _el$41 = _$createElement("text");
+        _$setProp(_el$41, "wrapMode", "word");
+        _$insert(_el$41, () => `Last model: ${details().last.record.model}`);
+        _$effect(_$p => _$setProp(_el$41, "fg", theme.textMuted, _$p));
+        return _el$41;
       })();
-    })(), _el$36);
+    })(), null);
     _$insert(_el$19, (() => {
-      var _c$6 = _$memo(() => tree().nodes.length > 1);
-      return () => _c$6() ? [(() => {
-        var _el$63 = _$createElement("text");
-        _$insertNode(_el$63, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
-        _$setProp(_el$63, "paddingTop", 1);
-        _$effect(_$p => _$setProp(_el$63, "fg", theme.accent, _$p));
-        return _el$63;
+      var _c$4 = _$memo(() => tree().nodes.length > 1);
+      return () => _c$4() ? [(() => {
+        var _el$42 = _$createElement("text");
+        _$insertNode(_el$42, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
+        _$setProp(_el$42, "paddingTop", 1);
+        _$effect(_$p => _$setProp(_el$42, "fg", theme.accent, _$p));
+        return _el$42;
       })(), (() => {
-        var _el$65 = _$createElement("text");
-        _$insertNode(_el$65, _$createTextNode(`Measured token/time sums, not wall-clock throughput. Includes every descendant once.`));
-        _$setProp(_el$65, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$65, "fg", theme.textMuted, _$p));
-        return _el$65;
-      })(), (() => {
-        var _el$67 = _$createElement("text");
-        _$setProp(_el$67, "wrapMode", "word");
-        _$insert(_el$67, () => `Generation avg TPS  ${formatAverageRate(tree().average.generation)}`);
-        _$effect(_$p => _$setProp(_el$67, "fg", theme.text, _$p));
-        return _el$67;
-      })(), (() => {
-        var _el$68 = _$createElement("text");
-        _$setProp(_el$68, "wrapMode", "word");
-        _$insert(_el$68, () => averageCoverage(tree().average.generation, tree().average));
-        _$effect(_$p => _$setProp(_el$68, "fg", theme.textMuted, _$p));
-        return _el$68;
-      })(), (() => {
-        var _el$69 = _$createElement("text");
-        _$setProp(_el$69, "wrapMode", "word");
-        _$insert(_el$69, () => `Response throughput  ${formatAverageRate(tree().average.response)}`);
-        _$effect(_$p => _$setProp(_el$69, "fg", theme.text, _$p));
-        return _el$69;
-      })(), (() => {
-        var _el$70 = _$createElement("text");
-        _$setProp(_el$70, "wrapMode", "word");
-        _$insert(_el$70, () => averageCoverage(tree().average.response, tree().average));
-        _$effect(_$p => _$setProp(_el$70, "fg", theme.textMuted, _$p));
-        return _el$70;
+        var _el$44 = _$createElement("text");
+        _$insertNode(_el$44, _$createTextNode(`Includes every descendant once.`));
+        _$setProp(_el$44, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$44, "fg", theme.textMuted, _$p));
+        return _el$44;
       })(), _$createComponent(PulseMetricGrid, {
         get theme() {
           return props.api.theme;
@@ -3164,23 +2894,16 @@ export function TokenPulseDetails(props) {
           return pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map(metric => [metric]);
         }
       })] : (() => {
-        var _el$71 = _$createElement("text");
-        _$insertNode(_el$71, _$createTextNode(`No known subagents in this scope`));
-        _$setProp(_el$71, "paddingTop", 1);
-        _$setProp(_el$71, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$71, "fg", theme.textMuted, _$p));
-        return _el$71;
+        var _el$46 = _$createElement("text");
+        _$insertNode(_el$46, _$createTextNode(`No known subagents in this scope`));
+        _$setProp(_el$46, "paddingTop", 1);
+        _$setProp(_el$46, "wrapMode", "word");
+        _$effect(_$p => _$setProp(_el$46, "fg", theme.textMuted, _$p));
+        return _el$46;
       })();
-    })(), _el$36);
-    _$insertNode(_el$36, _$createTextNode(`Average = estimated interval tokens / observed time, not an average of call speeds. The first arrival batch is excluded. Coverage counts accepted calls' full output + reasoning usage, not interval tokens.`));
-    _$setProp(_el$36, "paddingTop", 1);
-    _$setProp(_el$36, "wrapMode", "word");
-    _$insertNode(_el$38, _$createTextNode(`incl TPS includes this session + subagents. Older or incomplete observations do not count toward generation speed.`));
-    _$setProp(_el$38, "wrapMode", "word");
-    _$insertNode(_el$40, _$createTextNode(`~ means a host-observed estimate, not provider-internal speed. LIVE and peaks use byte-based windowed event arrivals, not token generation inside the model.`));
-    _$setProp(_el$40, "wrapMode", "word");
-    _$insertNode(_el$42, _$createTextNode(`esc / ctrl+c to close`));
-    _$setProp(_el$42, "flexShrink", 0);
+    })(), null);
+    _$insertNode(_el$25, _$createTextNode(`esc / ctrl+c to close`));
+    _$setProp(_el$25, "flexShrink", 0);
     _$effect(_p$ => {
       var _v$6 = dimensions().width < 50 ? 1 : 2,
         _v$7 = compact() ? 0 : 1,
@@ -3191,19 +2914,8 @@ export function TokenPulseDetails(props) {
         _v$10 = theme.accent,
         _v$11 = theme.textMuted,
         _v$12 = theme.accent,
-        _v$13 = theme.text,
-        _v$14 = theme.textMuted,
-        _v$15 = theme.text,
-        _v$16 = theme.textMuted,
-        _v$17 = theme.textMuted,
-        _v$18 = theme.accent,
-        _v$19 = theme.accent,
-        _v$20 = theme.text,
-        _v$21 = theme.textMuted,
-        _v$22 = theme.textMuted,
-        _v$23 = theme.textMuted,
-        _v$24 = theme.textMuted,
-        _v$25 = compact() ? 0 : 1;
+        _v$13 = theme.textMuted,
+        _v$14 = compact() ? 0 : 1;
       _v$6 !== _p$.e && (_p$.e = _$setProp(_el$14, "paddingX", _v$6, _p$.e));
       _v$7 !== _p$.t && (_p$.t = _$setProp(_el$14, "paddingY", _v$7, _p$.t));
       _v$8 !== _p$.a && (_p$.a = _$setProp(_el$14, "height", _v$8, _p$.a));
@@ -3214,18 +2926,7 @@ export function TokenPulseDetails(props) {
       _v$11 !== _p$.h && (_p$.h = _$setProp(_el$22, "fg", _v$11, _p$.h));
       _v$12 !== _p$.r && (_p$.r = _$setProp(_el$23, "fg", _v$12, _p$.r));
       _v$13 !== _p$.d && (_p$.d = _$setProp(_el$25, "fg", _v$13, _p$.d));
-      _v$14 !== _p$.l && (_p$.l = _$setProp(_el$26, "fg", _v$14, _p$.l));
-      _v$15 !== _p$.u && (_p$.u = _$setProp(_el$27, "fg", _v$15, _p$.u));
-      _v$16 !== _p$.c && (_p$.c = _$setProp(_el$28, "fg", _v$16, _p$.c));
-      _v$17 !== _p$.w && (_p$.w = _$setProp(_el$29, "fg", _v$17, _p$.w));
-      _v$18 !== _p$.m && (_p$.m = _$setProp(_el$31, "fg", _v$18, _p$.m));
-      _v$19 !== _p$.f && (_p$.f = _$setProp(_el$33, "fg", _v$19, _p$.f));
-      _v$20 !== _p$.y && (_p$.y = _$setProp(_el$35, "fg", _v$20, _p$.y));
-      _v$21 !== _p$.g && (_p$.g = _$setProp(_el$36, "fg", _v$21, _p$.g));
-      _v$22 !== _p$.p && (_p$.p = _$setProp(_el$38, "fg", _v$22, _p$.p));
-      _v$23 !== _p$.b && (_p$.b = _$setProp(_el$40, "fg", _v$23, _p$.b));
-      _v$24 !== _p$.T && (_p$.T = _$setProp(_el$42, "fg", _v$24, _p$.T));
-      _v$25 !== _p$.A && (_p$.A = _$setProp(_el$42, "paddingTop", _v$25, _p$.A));
+      _v$14 !== _p$.l && (_p$.l = _$setProp(_el$25, "paddingTop", _v$14, _p$.l));
       return _p$;
     }, {
       e: undefined,
@@ -3238,18 +2939,7 @@ export function TokenPulseDetails(props) {
       h: undefined,
       r: undefined,
       d: undefined,
-      l: undefined,
-      u: undefined,
-      c: undefined,
-      w: undefined,
-      m: undefined,
-      f: undefined,
-      y: undefined,
-      g: undefined,
-      p: undefined,
-      b: undefined,
-      T: undefined,
-      A: undefined
+      l: undefined
     });
     return _el$14;
   })();
@@ -3278,8 +2968,7 @@ export function buildSessionDetailsTree(store, rootID, parents = store.sessionPa
     const direct = Object.prototype.hasOwnProperty.call(projected.sessions, node.sessionID) ? projected.sessions[node.sessionID] : zeroDirectTotals();
     nodes.push({
       ...node,
-      direct,
-      average: getSessionAverageSummary(direct)
+      direct
     });
     const descendants = (children.get(node.sessionID) ?? []).slice().sort().reverse();
     for (const sessionID of descendants) pending.push({
@@ -3291,8 +2980,7 @@ export function buildSessionDetailsTree(store, rootID, parents = store.sessionPa
   return {
     rootID,
     nodes,
-    including,
-    average: getSessionAverageSummary(including)
+    including
   };
 }
 export function selectSessionDetails(tree, sessionID, lastBySession) {
@@ -3300,8 +2988,7 @@ export function selectSessionDetails(tree, sessionID, lastBySession) {
   const last = lastBySession.get(node.sessionID);
   return {
     ...node,
-    last,
-    lastSpeed: last ? recordSpeedSummary(last.record) : undefined
+    last
   };
 }
 export function createDetailsController(api, store) {
@@ -3349,7 +3036,7 @@ export function registerTokenPulseCommands(api, store, options, openHistory) {
     commands: [{
       name: COMMAND_NAME,
       title: "Open token history",
-      desc: "Open recent token speed history for the current session",
+      desc: "Open recent usage history for the current session",
       category: "Plugin",
       namespace: "palette",
       slashName: "tps",
@@ -3357,7 +3044,7 @@ export function registerTokenPulseCommands(api, store, options, openHistory) {
     }, {
       name: DETAILS_COMMAND_NAME,
       title: "Token Pulse details",
-      desc: "Session averages, usage and timing coverage",
+      desc: "Session usage, cache and task time",
       category: "Plugin",
       namespace: "palette",
       slashName: "tps-details",
@@ -3727,14 +3414,11 @@ export function childRows(records, sessionID, store) {
     const show = directRecords.length > 0 || totalsHaveUsage(rollup.including);
     if (show) {
       const modelRecord = directRecords.slice().sort((left, right) => (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start))[0];
-      const generation = getSessionAverageSummary(rollup.direct).generation;
       rows.push({
         depth,
         sessionID: childID,
         responseCount: rollup.direct.responseCount,
         generated: generatedTokens(rollup.direct.tokens),
-        speed: generation.rate ?? 0,
-        speedAvailable: generation.available,
         model: modelRecord?.model ?? "-"
       });
     }
@@ -3742,63 +3426,6 @@ export function childRows(records, sessionID, store) {
   };
   for (const child of root.children) append(child.sessionID, 0);
   return rows;
-}
-function activeStats(state, now, bytesPerToken) {
-  if (!state) return {
-    rate: 0,
-    status: "inactive",
-    generated: 0,
-    elapsed: 0
-  };
-  const tokens = estimateActiveTokens(state, bytesPerToken);
-  const measured = measureRollingTokenRate(selectedSamples(state), now, DEFAULT_ROLLING_WINDOW_MS);
-  return {
-    rate: measured.rate,
-    status: measured.status,
-    generated: generatedTokens(tokens),
-    ...((state.firstResponseAt ?? state.firstTokenAt) !== undefined ? {
-      ttft: Math.max(0, (state.firstResponseAt ?? state.firstTokenAt) - state.startedAt)
-    } : {}),
-    elapsed: Math.max(0, now - state.startedAt)
-  };
-}
-function latestActive(store, sessionID, preferredMessageID) {
-  const id = preferredMessageID ?? ownedMessageID(store, sessionID);
-  const state = id ? store.active.get(id) : undefined;
-  return state?.sessionID === sessionID && observationRuntime(store).liveAssistantMessages.has(state.messageID) && !knownCompletedMessage(store, state.messageID) && scopeEligible(store, sessionID, state.messageID) ? state : undefined;
-}
-export function responseMeasurementStatus(record) {
-  if (selectSpeedMeasurement(record).available) return "";
-  if (record.samples.length === 1) return "Single batch; TPS unavailable.";
-  const reasons = record.speed?.generationCoverage?.reasons ?? [];
-  if (reasons.includes("insufficient-receive-span")) return "Insufficient arrival timing.";
-  if (reasons.includes("unknown-receive-clock")) return "Receive clock not verified.";
-  if (reasons.includes("hidden-reasoning") || reasons.includes("unobserved-output")) return "Incomplete content observation.";
-  if (reasons.includes("tool-usage-uncertain")) return "Tool usage timing not verified.";
-  return "No qualified generation timing.";
-}
-export function liveLabel(store, sessionID, bytesPerToken, width, now = Date.now(), toolWaiting = false) {
-  return wrapMetricFields(promptMetricFields(store, sessionID, bytesPerToken, now, toolWaiting), width);
-}
-function promptMetricFields(store, sessionID, bytesPerToken, now, toolWaiting) {
-  if (!scopeEligible(store, sessionID)) return [];
-  const runtime = store.sessionRuntime.get(sessionID);
-  const state = latestActive(store, sessionID, runtime?.activeMessageID);
-  const stats = activeStats(state, now, bytesPerToken);
-  const runGenerated = runtime ? generatedTokens(runtime.runTotals) : 0;
-  if (state) {
-    const hasContent = selectedSamples(state).length > 0;
-    const rate = toolWaiting ? "WAIT TOOL --" : !hasContent ? "WAITING --" : stats.status === "inactive" ? "WAIT --" : stats.status === "warming" ? "WARMUP --" : `LIVE ~${formatCompactRate(stats.rate)}`;
-    return [rate, `gen ${hasContent ? `~${formatCompactNumber(stats.generated)}` : "--"}`, `ttft ${formatOptionalDuration(stats.ttft)}`, `elapsed ${formatDuration(stats.elapsed)}`, `total ${formatCompactNumber(runGenerated)}`];
-  }
-  const last = store.lastCompletedBySession.get(sessionID);
-  if (last && scopeEligible(store, sessionID, last.record.messageID)) {
-    const prefix = last.estimated ? "LAST ~" : "LAST ";
-    const rate = last.available === false ? "LAST --" : `${prefix}${formatCompactRate(last.rate)} ${last.basis ?? ""}`.trimEnd();
-    const totalGenerated = runtime && runtime.runResponseCount > 0 ? runGenerated : last.generated;
-    return [rate, ...(last.observationQuality === "short" ? ["short, low confidence"] : []), `gen ${formatCompactNumber(last.generated)}`, `ttft ${formatOptionalDuration(last.ttft)}`, `measured ${formatOptionalDuration(last.available === false ? undefined : last.elapsed)}`, `total ${formatCompactNumber(totalGenerated)}`, ...(last.available === false ? [responseMeasurementStatus(last.record)] : [])];
-  }
-  return [runtime?.status === "busy" || runtime?.status === "retry" ? "TASK BUSY" : "IDLE"];
 }
 function currentSessionID(api) {
   const route = api.route.current;
@@ -3830,34 +3457,34 @@ function warnWithToast(api, message, error) {
 }
 function Header(props) {
   return (() => {
-    var _el$73 = _$createElement("box"),
-      _el$74 = _$createElement("text"),
-      _el$76 = _$createElement("text"),
-      _el$77 = _$createTextNode(`session `);
-    _$insertNode(_el$73, _el$74);
-    _$insertNode(_el$73, _el$76);
-    _$setProp(_el$73, "height", 2);
-    _$setProp(_el$73, "paddingX", 1);
-    _$setProp(_el$73, "flexDirection", "column");
-    _$insertNode(_el$74, _$createTextNode(`OC TPS / history`));
-    _$insertNode(_el$76, _el$77);
-    _$setProp(_el$76, "truncate", true);
-    _$setProp(_el$76, "wrapMode", "none");
-    _$insert(_el$76, () => shortTail(props.sessionID, 18), null);
+    var _el$48 = _$createElement("box"),
+      _el$49 = _$createElement("text"),
+      _el$51 = _$createElement("text"),
+      _el$52 = _$createTextNode(`session `);
+    _$insertNode(_el$48, _el$49);
+    _$insertNode(_el$48, _el$51);
+    _$setProp(_el$48, "height", 2);
+    _$setProp(_el$48, "paddingX", 1);
+    _$setProp(_el$48, "flexDirection", "column");
+    _$insertNode(_el$49, _$createTextNode(`Token history`));
+    _$insertNode(_el$51, _el$52);
+    _$setProp(_el$51, "truncate", true);
+    _$setProp(_el$51, "wrapMode", "none");
+    _$insert(_el$51, () => shortTail(props.sessionID, 18), null);
     _$effect(_p$ => {
-      var _v$39 = props.theme.current.backgroundPanel,
-        _v$40 = props.theme.current.primary,
-        _v$41 = props.theme.current.textMuted;
-      _v$39 !== _p$.e && (_p$.e = _$setProp(_el$73, "backgroundColor", _v$39, _p$.e));
-      _v$40 !== _p$.t && (_p$.t = _$setProp(_el$74, "fg", _v$40, _p$.t));
-      _v$41 !== _p$.a && (_p$.a = _$setProp(_el$76, "fg", _v$41, _p$.a));
+      var _v$28 = props.theme.current.backgroundPanel,
+        _v$29 = props.theme.current.primary,
+        _v$30 = props.theme.current.textMuted;
+      _v$28 !== _p$.e && (_p$.e = _$setProp(_el$48, "backgroundColor", _v$28, _p$.e));
+      _v$29 !== _p$.t && (_p$.t = _$setProp(_el$49, "fg", _v$29, _p$.t));
+      _v$30 !== _p$.a && (_p$.a = _$setProp(_el$51, "fg", _v$30, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined
     });
-    return _el$73;
+    return _el$48;
   })();
 }
 function SummaryBlock(props) {
@@ -3869,30 +3496,30 @@ function SummaryBlock(props) {
     return [...summaryLines("Session only", rollup.direct.tokens, rollup.direct.cost, rollup.direct.responseCount), ...summaryLines("Including subagents", rollup.including.tokens, rollup.including.cost, rollup.including.responseCount)];
   });
   return (() => {
-    var _el$78 = _$createElement("box"),
-      _el$79 = _$createElement("text");
-    _$insertNode(_el$78, _el$79);
-    _$setProp(_el$78, "paddingX", 1);
-    _$setProp(_el$78, "flexDirection", "column");
-    _$insertNode(_el$79, _$createTextNode(`totals`));
-    _$insert(_el$78, () => lines().map(line => (() => {
-      var _el$81 = _$createElement("text");
-      _$setProp(_el$81, "wrapMode", "word");
-      _$insert(_el$81, line);
-      _$effect(_$p => _$setProp(_el$81, "fg", props.theme.current.text, _$p));
-      return _el$81;
+    var _el$53 = _$createElement("box"),
+      _el$54 = _$createElement("text");
+    _$insertNode(_el$53, _el$54);
+    _$setProp(_el$53, "paddingX", 1);
+    _$setProp(_el$53, "flexDirection", "column");
+    _$insertNode(_el$54, _$createTextNode(`totals`));
+    _$insert(_el$53, () => lines().map(line => (() => {
+      var _el$56 = _$createElement("text");
+      _$setProp(_el$56, "wrapMode", "word");
+      _$insert(_el$56, line);
+      _$effect(_$p => _$setProp(_el$56, "fg", props.theme.current.text, _$p));
+      return _el$56;
     })()), null);
     _$effect(_p$ => {
-      var _v$42 = props.theme.current.background,
-        _v$43 = props.theme.current.secondary;
-      _v$42 !== _p$.e && (_p$.e = _$setProp(_el$78, "backgroundColor", _v$42, _p$.e));
-      _v$43 !== _p$.t && (_p$.t = _$setProp(_el$79, "fg", _v$43, _p$.t));
+      var _v$31 = props.theme.current.background,
+        _v$32 = props.theme.current.secondary;
+      _v$31 !== _p$.e && (_p$.e = _$setProp(_el$53, "backgroundColor", _v$31, _p$.e));
+      _v$32 !== _p$.t && (_p$.t = _$setProp(_el$54, "fg", _v$32, _p$.t));
       return _p$;
     }, {
       e: undefined,
       t: undefined
     });
-    return _el$78;
+    return _el$53;
   })();
 }
 function HistoryView(props) {
@@ -3901,25 +3528,23 @@ function HistoryView(props) {
     return recentRecords(props.store.records, props.sessionID, props.store);
   });
   return (() => {
-    var _el$82 = _$createElement("box"),
-      _el$83 = _$createElement("box"),
-      _el$84 = _$createElement("text"),
-      _el$86 = _$createElement("text"),
-      _el$88 = _$createElement("scrollbox");
-    _$insertNode(_el$82, _el$83);
-    _$insertNode(_el$82, _el$86);
-    _$insertNode(_el$82, _el$88);
-    _$setProp(_el$82, "flexDirection", "column");
-    _$setProp(_el$82, "flexGrow", 1);
-    _$insert(_el$82, _$createComponent(Header, {
+    var _el$57 = _$createElement("box"),
+      _el$58 = _$createElement("box"),
+      _el$59 = _$createElement("text"),
+      _el$61 = _$createElement("scrollbox");
+    _$insertNode(_el$57, _el$58);
+    _$insertNode(_el$57, _el$61);
+    _$setProp(_el$57, "flexDirection", "column");
+    _$setProp(_el$57, "flexGrow", 1);
+    _$insert(_el$57, _$createComponent(Header, {
       get theme() {
         return props.api.theme;
       },
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$83);
-    _$insert(_el$82, _$createComponent(SummaryBlock, {
+    }), _el$58);
+    _$insert(_el$57, _$createComponent(SummaryBlock, {
       get theme() {
         return props.api.theme;
       },
@@ -3929,356 +3554,52 @@ function HistoryView(props) {
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$83);
-    _$insertNode(_el$83, _el$84);
-    _$setProp(_el$83, "height", 1);
-    _$setProp(_el$83, "paddingX", 1);
-    _$insertNode(_el$84, _$createTextNode(`TIME SESSION MODEL OUT/REAS GEN~ BASIS MAX~ MIN~ TTFT DUR COST SPARK`));
-    _$setProp(_el$84, "truncate", true);
-    _$setProp(_el$84, "wrapMode", "none");
-    _$insertNode(_el$86, _$createTextNode(`GEN is host-observed generation TPS; ~ is estimated, not provider-internal speed. MAX/MIN use byte-based arrival windows; -- means insufficient observations.`));
-    _$setProp(_el$86, "paddingX", 1);
-    _$setProp(_el$86, "wrapMode", "word");
-    _$setProp(_el$88, "flexGrow", 1);
-    _$setProp(_el$88, "flexDirection", "column");
-    _$setProp(_el$88, "paddingX", 1);
-    _$setProp(_el$88, "stickyScroll", true);
-    _$setProp(_el$88, "stickyStart", "top");
-    _$insert(_el$88, (() => {
-      var _c$7 = _$memo(() => rows().length === 0);
-      return () => _c$7() ? (() => {
-        var _el$89 = _$createElement("text");
-        _$insertNode(_el$89, _$createTextNode(`No completed responses yet`));
-        _$effect(_$p => _$setProp(_el$89, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$89;
+    }), _el$58);
+    _$insertNode(_el$58, _el$59);
+    _$setProp(_el$58, "height", 1);
+    _$setProp(_el$58, "paddingX", 1);
+    _$insertNode(_el$59, _$createTextNode(`TIME SESSION MODEL OUT/REAS COST`));
+    _$setProp(_el$59, "truncate", true);
+    _$setProp(_el$59, "wrapMode", "none");
+    _$setProp(_el$61, "flexGrow", 1);
+    _$setProp(_el$61, "flexDirection", "column");
+    _$setProp(_el$61, "paddingX", 1);
+    _$setProp(_el$61, "stickyScroll", true);
+    _$setProp(_el$61, "stickyStart", "top");
+    _$insert(_el$61, (() => {
+      var _c$5 = _$memo(() => rows().length === 0);
+      return () => _c$5() ? (() => {
+        var _el$62 = _$createElement("text");
+        _$insertNode(_el$62, _$createTextNode(`No completed responses yet`));
+        _$effect(_$p => _$setProp(_el$62, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$62;
       })() : rows().map(record => (() => {
-        var _el$91 = _$createElement("text");
-        _$setProp(_el$91, "truncate", true);
-        _$setProp(_el$91, "wrapMode", "none");
-        _$insert(_el$91, () => formatHistoryRow(record));
-        _$effect(_$p => _$setProp(_el$91, "fg", props.api.theme.current.text, _$p));
-        return _el$91;
+        var _el$64 = _$createElement("text");
+        _$setProp(_el$64, "truncate", true);
+        _$setProp(_el$64, "wrapMode", "none");
+        _$insert(_el$64, () => formatHistoryRow(record));
+        _$effect(_$p => _$setProp(_el$64, "fg", props.api.theme.current.text, _$p));
+        return _el$64;
       })());
     })());
     _$effect(_p$ => {
-      var _v$44 = props.api.theme.current.background,
-        _v$45 = props.api.theme.current.backgroundElement,
-        _v$46 = props.api.theme.current.textMuted,
-        _v$47 = props.api.theme.current.textMuted,
-        _v$48 = props.api.theme.current.background;
-      _v$44 !== _p$.e && (_p$.e = _$setProp(_el$82, "backgroundColor", _v$44, _p$.e));
-      _v$45 !== _p$.t && (_p$.t = _$setProp(_el$83, "backgroundColor", _v$45, _p$.t));
-      _v$46 !== _p$.a && (_p$.a = _$setProp(_el$84, "fg", _v$46, _p$.a));
-      _v$47 !== _p$.o && (_p$.o = _$setProp(_el$86, "fg", _v$47, _p$.o));
-      _v$48 !== _p$.i && (_p$.i = _$setProp(_el$88, "backgroundColor", _v$48, _p$.i));
+      var _v$33 = props.api.theme.current.background,
+        _v$34 = props.api.theme.current.backgroundElement,
+        _v$35 = props.api.theme.current.textMuted,
+        _v$36 = props.api.theme.current.background;
+      _v$33 !== _p$.e && (_p$.e = _$setProp(_el$57, "backgroundColor", _v$33, _p$.e));
+      _v$34 !== _p$.t && (_p$.t = _$setProp(_el$58, "backgroundColor", _v$34, _p$.t));
+      _v$35 !== _p$.a && (_p$.a = _$setProp(_el$59, "fg", _v$35, _p$.a));
+      _v$36 !== _p$.o && (_p$.o = _$setProp(_el$61, "backgroundColor", _v$36, _p$.o));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined,
-      o: undefined,
-      i: undefined
+      o: undefined
     });
-    return _el$82;
+    return _el$57;
   })();
-}
-
-// These leases belong only to the official prompt's metadata/right wrappers,
-// never the textarea, model row, sidebar, or an arbitrary custom slot parent.
-
-const promptLayoutLeases = new WeakMap();
-function samePromptValue(a, b) {
-  return a.unit === b.unit && Object.is(a.value, b.value);
-}
-function ownPromptStyle(node, read, write, equal = Object.is) {
-  const original = read();
-  let last = original;
-  let lost = false;
-  return {
-    baseline() {
-      const current = read();
-      return !lost && equal(current, last) ? original : current;
-    },
-    borrow() {
-      if (node.isDestroyed || lost) return () => {};
-      const current = read();
-      if (!equal(current, last)) return () => {};
-      write(original);
-      return () => {
-        if (!node.isDestroyed && equal(read(), original)) write(current);else lost = true;
-      };
-    },
-    set(value) {
-      if (node.isDestroyed || lost) return;
-      if (!equal(read(), last)) {
-        lost = true;
-        return;
-      }
-      if (equal(last, value)) return;
-      write(value);
-      last = read();
-      node.requestRender();
-    },
-    restore() {
-      if (!node.isDestroyed && !lost && equal(read(), last)) {
-        write(original);
-        node.requestRender();
-      }
-    }
-  };
-}
-function officialPromptWrappers(node) {
-  const right = node.parent,
-    row = right?.parent,
-    body = row?.parent;
-  if (!(right instanceof BoxRenderable) || !(row instanceof BoxRenderable) || !(body instanceof BoxRenderable)) return;
-  const r = right.getLayoutNode(),
-    m = row.getLayoutNode(),
-    b = body.getLayoutNode();
-  const point = (value, expected) => value.unit === Yoga.Unit.Point && value.value === expected;
-  const gap = layout => {
-    const column = layout.getGap(Yoga.Gutter.Column);
-    return column.unit === Yoga.Unit.Undefined ? layout.getGap(Yoga.Gutter.All) : column;
-  };
-  if (r.getFlexDirection() !== Yoga.FlexDirection.Row || r.getAlignItems() !== Yoga.Align.Center || !point(gap(r), 1) || m.getFlexDirection() !== Yoga.FlexDirection.Row || m.getJustifyContent() !== Yoga.Justify.SpaceBetween || !point(m.getPadding(Yoga.Edge.Top), 1) || !point(gap(m), 1) || b.getFlexDirection() !== Yoga.FlexDirection.Column || !point(b.getPadding(Yoga.Edge.Left), 2) || !point(b.getPadding(Yoga.Edge.Right), 2) || !point(b.getPadding(Yoga.Edge.Top), 1)) return;
-  const [textarea, metadata] = body.getChildren(),
-    [left, trailing] = row.getChildren();
-  if (!(textarea instanceof TextareaRenderable) || metadata !== row || body.getChildrenCount() !== 2 || !(left instanceof BoxRenderable) || trailing !== right || row.getChildrenCount() !== 2 || left.getLayoutNode().getFlexDirection() !== Yoga.FlexDirection.Row) return;
-  const [agent, ...prefix] = left.getChildren();
-  if (!(agent instanceof TextRenderable)) return;
-  if (prefix[0] instanceof TextRenderable && prefix[0].plainText === "auto") prefix.shift();
-  const models = prefix[0];
-  if (prefix.length === 0 ? agent.plainText !== "Shell" : prefix.length !== 1 || !(models instanceof BoxRenderable) || models.getLayoutNode().getFlexDirection() !== Yoga.FlexDirection.Row || !(models.getChildren()[0] instanceof TextRenderable) || models.getChildren()[0].plainText !== "·" || !(models.getChildren()[1] instanceof TextRenderable) || models.getChildren()[1].getLayoutNode().getFlexShrink() !== 0) return;
-  const border = body.parent,
-    anchor = border?.parent;
-  const fullWidth = item => {
-    const width = item.getLayoutNode().getWidth();
-    return width.unit === Yoga.Unit.Percent && width.value === 100;
-  };
-  if (!(border instanceof BoxRenderable) || !(anchor instanceof BoxRenderable) || !Array.isArray(border.border) || border.border.length !== 1 || border.border[0] !== "left" || anchor.getLayoutNode().getFlexDirection() !== Yoga.FlexDirection.Column || !fullWidth(textarea) || !fullWidth(body) || !fullWidth(border) || !fullWidth(anchor)) return;
-  return {
-    right,
-    row
-  };
-}
-function leasePromptLayout(node, minimum) {
-  const wrappers = officialPromptWrappers(node);
-  if (!wrappers) return;
-  const {
-    right,
-    row
-  } = wrappers;
-  let lease = promptLayoutLeases.get(right);
-  if (!lease) {
-    const r = right.getLayoutNode(),
-      m = row.getLayoutNode();
-    const left = row.getChildren()[0];
-    const leftNode = left.getLayoutNode();
-    const leftMax = ownPromptStyle(left, () => leftNode.getMaxWidth(), value => leftNode.setMaxWidth(value), samePromptValue);
-    const wrap = ownPromptStyle(row, () => m.getFlexWrap(), value => m.setFlexWrap(value));
-    const grow = ownPromptStyle(right, () => r.getFlexGrow(), value => r.setFlexGrow(value));
-    const basis = ownPromptStyle(right, () => r.getFlexBasis(), value => r.setFlexBasis(value), samePromptValue);
-    const min = ownPromptStyle(right, () => r.getMinWidth(), value => r.setMinWidth(value), samePromptValue);
-    const members = new Map();
-    const observed = new Set();
-    let updating = false;
-    let baselineKey = "",
-      baselineLeft = 0;
-    const update = () => {
-      if (updating || row.isDestroyed || right.isDestroyed) return;
-      updating = true;
-      try {
-        const children = right.getChildren().filter(item => !item.isDestroyed && item.visible);
-        const leftTree = item => item instanceof TextRenderable ? [item] : [item, ...item.getChildren().flatMap(leftTree)];
-        const needed = new Set([row, right, ...children, ...leftTree(left)]);
-        for (const item of observed) if (!needed.has(item)) {
-          item.off(LayoutEvents.RESIZED, update);
-          item.off(LayoutEvents.LAYOUT_CHANGED, update);
-          observed.delete(item);
-        }
-        for (const item of needed) if (!observed.has(item)) {
-          item.on(LayoutEvents.RESIZED, update);
-          item.on(LayoutEvents.LAYOUT_CHANGED, update);
-          observed.add(item);
-        }
-        const budget = Math.max(1, row.width);
-        const gaps = Math.max(0, children.length - 1); // matched official right gap = 1
-        const others = children.filter(item => !members.has(item));
-        const otherWidth = others.reduce((sum, item) => {
-          const width = item.getLayoutNode().getWidth();
-          return sum + (width.unit === Yoga.Unit.Point ? width.value : item.width);
-        }, 0);
-        const activeMembers = children.filter(item => members.has(item));
-        // Ask Yoga for the existing absent layout, not an approximation of its
-        // shrink rules. Only this metadata subtree is measured, synchronously;
-        // no paint, input/visibility property, timer or history work is involved.
-        const texts = item => item instanceof TextRenderable ? item.chunks.map(chunk => chunk.text).join("") : item.getChildren().map(texts).join("\0");
-        const key = JSON.stringify([budget, texts(left), others.map(item => [item.num, item.width, item.getLayoutNode().getWidth()]), wrap.baseline(), grow.baseline(), basis.baseline(), min.baseline(), leftMax.baseline()]);
-        if (key !== baselineKey) {
-          const restore = [leftMax, wrap, grow, basis, min].map(style => style.borrow());
-          const displays = activeMembers.map(item => [item.getLayoutNode(), item.getLayoutNode().getDisplay()]);
-          // Prompt's hasRightContent() removes this wrapper entirely when the
-          // slot is absent and no other right content exists.
-          if (others.length === 0) displays.push([r, r.getDisplay()]);
-          try {
-            for (const [layout] of displays) layout.setDisplay(Yoga.Display.None);
-            m.calculateLayout(budget, undefined, Yoga.Direction.LTR);
-            baselineLeft = leftNode.getComputedWidth();
-            baselineKey = key;
-          } finally {
-            for (const [layout, display] of displays) layout.setDisplay(display);
-            for (const undo of restore.reverse()) undo();
-          }
-        }
-        leftMax.set({
-          unit: Yoga.Unit.Point,
-          value: Math.max(0, baselineLeft)
-        });
-        const share = Math.max(1, (budget - otherWidth - gaps) / Math.max(1, activeMembers.length));
-        let total = otherWidth + gaps;
-        for (const item of activeMembers) {
-          const member = members.get(item);
-          const width = Math.min(member.minimum, share);
-          member.minimumStyle.set({
-            unit: Yoga.Unit.Point,
-            value: width
-          });
-          total += width;
-        }
-        wrap.set(Yoga.Wrap.Wrap);
-        grow.set(1);
-        basis.set({
-          unit: Yoga.Unit.Point,
-          value: 0
-        });
-        min.set({
-          unit: Yoga.Unit.Point,
-          value: Math.min(budget, total)
-        });
-      } finally {
-        updating = false;
-      }
-    };
-    lease = {
-      members,
-      update,
-      release() {
-        for (const item of observed) {
-          item.off(LayoutEvents.RESIZED, update);
-          item.off(LayoutEvents.LAYOUT_CHANGED, update);
-        }
-        observed.clear();
-        min.restore();
-        basis.restore();
-        grow.restore();
-        wrap.restore();
-        leftMax.restore();
-        promptLayoutLeases.delete(right);
-      }
-    };
-    promptLayoutLeases.set(right, lease);
-  }
-  const n = node.getLayoutNode();
-  const width = ownPromptStyle(node, () => n.getWidth(), value => {
-    node.width = value.unit === Yoga.Unit.Point ? value.value : value.unit === Yoga.Unit.Percent ? `${value.value}%` : "auto";
-  }, samePromptValue);
-  const grow = ownPromptStyle(node, () => n.getFlexGrow(), value => n.setFlexGrow(value));
-  const basis = ownPromptStyle(node, () => n.getFlexBasis(), value => n.setFlexBasis(value), samePromptValue);
-  const min = ownPromptStyle(node, () => n.getMinWidth(), value => n.setMinWidth(value), samePromptValue);
-  width.set({
-    unit: Yoga.Unit.Auto,
-    value: Number.NaN
-  });
-  grow.set(1);
-  basis.set({
-    unit: Yoga.Unit.Point,
-    value: 0
-  });
-  const member = {
-    minimum,
-    minimumStyle: min,
-    restore: [min.restore, basis.restore, grow.restore, width.restore]
-  };
-  lease.members.set(node, member);
-  lease.update();
-  let released = false;
-  return {
-    update(value) {
-      if (!released) {
-        member.minimum = value;
-        lease.update();
-      }
-    },
-    release() {
-      if (released) return;
-      released = true;
-      lease.members.delete(node);
-      for (const restore of member.restore) restore();
-      if (lease.members.size === 0) lease.release();else lease.update();
-    }
-  };
-}
-function PromptRight(props) {
-  rememberVisibleSession(props.store, props.sessionID);
-  const [width, setWidth] = createSignal(0);
-  let node;
-  let layout;
-  const fields = createMemo(() => {
-    props.store.revision();
-    props.store.clockRevision();
-    return promptMetricFields(props.store, props.sessionID, props.options.bytesPerToken, Date.now(), knownToolWaiting(props.api, props.store, props.sessionID));
-  });
-  const minimum = () => Math.max(1, ...fields().map(field => field.length));
-  const label = createMemo(() => wrapMetricFields(fields(), width()));
-  const attach = () => {
-    if (!node || node.isDestroyed) return;
-    layout ??= leasePromptLayout(node, minimum());
-    layout?.update(minimum());
-  };
-  const release = () => {
-    layout?.release();
-    layout = undefined;
-  };
-  onMount(attach);
-  createEffect(() => {
-    fields();
-    attach();
-  });
-  onCleanup(() => {
-    node?.off(RenderableEvents.DESTROYED, release);
-    release();
-  });
-  return (() => {
-    var _el$92 = _$createElement("box"),
-      _el$93 = _$createElement("text");
-    _$insertNode(_el$92, _el$93);
-    _$use(value => {
-      node = value;
-      node.once(RenderableEvents.DESTROYED, release);
-    }, _el$92);
-    _$setProp(_el$92, "flexDirection", "column");
-    _$setProp(_el$92, "width", "100%");
-    _$setProp(_el$92, "flexShrink", 0);
-    _$setProp(_el$92, "onSizeChange", function () {
-      setWidth(Math.max(1, this.width));
-      attach();
-    });
-    _$setProp(_el$93, "wrapMode", "word");
-    _$setProp(_el$93, "flexShrink", 0);
-    _$insert(_el$93, label);
-    _$effect(_$p => _$setProp(_el$93, "fg", props.api.theme.current.accent, _$p));
-    return _el$92;
-  })();
-}
-function knownToolWaiting(api, store, sessionID) {
-  const state = latestActive(store, sessionID, store.sessionRuntime.get(sessionID)?.activeMessageID);
-  if (!state) return false;
-  const latest = selectedSamples(state).at(-1)?.timestamp ?? state.startedAt;
-  try {
-    return api.state.part(state.messageID).some(part => part.type === "tool" && part.state.status === "running" && part.state.time.start >= latest);
-  } catch {
-    return false;
-  }
 }
 export function rememberVisibleSession(store, sessionID) {
   if (!sessionID || store.focusSessionID === sessionID) return;
@@ -4319,10 +3640,6 @@ function BottomContent(props) {
     return taskWallTimeForSession(props.store, sessionID());
   });
   const rows = createMemo(() => childRows(view().records, sessionID(), props.store));
-  const average = createMemo(() => {
-    props.store.revision();
-    return sessionAverageDisplay(sessionUsageSummary(props.store, sessionID()), Boolean(parentSessionID(props.api, sessionID(), undefined, props.store)));
-  });
   const sections = createMemo(() => {
     const totals = view().totals;
     return [{
@@ -4337,17 +3654,9 @@ function BottomContent(props) {
       responseCount: totals?.including.responseCount ?? 0
     }];
   });
-  const pulseSummary = createMemo(() => {
-    const currentView = view();
-    const average = getSessionAverageSummary(currentView.totals?.including ?? zeroDirectTotals()).generation;
-    return {
-      tokens: currentView.totals?.including.tokens ?? emptyTokenCounts(),
-      speed: average.available ? average.rate : undefined
-    };
-  });
   const metricLabel = createMemo(() => {
-    const summary = pulseSummary();
-    return formatPulseMetrics(summary.tokens, summary.speed, metricWidth(), taskWallTime());
+    const tokens = view().totals?.including.tokens ?? emptyTokenCounts();
+    return formatPulseMetrics(tokens, metricWidth(), taskWallTime());
   });
   const taskWallTimeLabel = createMemo(() => {
     const wallTime = taskWallTime();
@@ -4362,154 +3671,97 @@ function BottomContent(props) {
     togglePulse(props.store);
   };
   return (() => {
-    var _el$94 = _$createElement("box");
-    _$setProp(_el$94, "flexDirection", "column");
-    _$setProp(_el$94, "width", "100%");
-    _$setProp(_el$94, "paddingTop", 1);
-    _$setProp(_el$94, "paddingX", 1);
-    _$setProp(_el$94, "overflow", "hidden");
-    _$setProp(_el$94, "flexShrink", 0);
-    _$insert(_el$94, (() => {
-      var _c$8 = _$memo(() => !!visible());
-      return () => _c$8() && [(() => {
-        var _el$95 = _$createElement("box"),
-          _el$96 = _$createElement("text");
-        _$insertNode(_el$95, _el$96);
-        _$setProp(_el$95, "focusable", true);
-        _$setProp(_el$95, "width", "100%");
-        _$setProp(_el$95, "height", 1);
-        _$setProp(_el$95, "paddingX", 1);
-        _$setProp(_el$95, "onMouseDown", onPulseMouseDown);
-        _$setProp(_el$96, "truncate", true);
-        _$setProp(_el$96, "wrapMode", "none");
-        _$insert(_el$96, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
+    var _el$65 = _$createElement("box");
+    _$setProp(_el$65, "flexDirection", "column");
+    _$setProp(_el$65, "width", "100%");
+    _$setProp(_el$65, "paddingTop", 1);
+    _$setProp(_el$65, "paddingX", 1);
+    _$setProp(_el$65, "overflow", "hidden");
+    _$setProp(_el$65, "flexShrink", 0);
+    _$insert(_el$65, (() => {
+      var _c$6 = _$memo(() => !!visible());
+      return () => _c$6() && [(() => {
+        var _el$66 = _$createElement("box"),
+          _el$67 = _$createElement("text");
+        _$insertNode(_el$66, _el$67);
+        _$setProp(_el$66, "focusable", true);
+        _$setProp(_el$66, "width", "100%");
+        _$setProp(_el$66, "height", 1);
+        _$setProp(_el$66, "paddingX", 1);
+        _$setProp(_el$66, "onMouseDown", onPulseMouseDown);
+        _$setProp(_el$67, "truncate", true);
+        _$setProp(_el$67, "wrapMode", "none");
+        _$insert(_el$67, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
         _$effect(_p$ => {
-          var _v$49 = props.api.theme.current.backgroundElement,
-            _v$50 = props.api.theme.current.primary;
-          _v$49 !== _p$.e && (_p$.e = _$setProp(_el$95, "backgroundColor", _v$49, _p$.e));
-          _v$50 !== _p$.t && (_p$.t = _$setProp(_el$96, "fg", _v$50, _p$.t));
+          var _v$37 = props.api.theme.current.backgroundElement,
+            _v$38 = props.api.theme.current.primary;
+          _v$37 !== _p$.e && (_p$.e = _$setProp(_el$66, "backgroundColor", _v$37, _p$.e));
+          _v$38 !== _p$.t && (_p$.t = _$setProp(_el$67, "fg", _v$38, _p$.t));
           return _p$;
         }, {
           e: undefined,
           t: undefined
         });
-        return _el$95;
+        return _el$66;
       })(), (() => {
-        var _el$97 = _$createElement("box"),
-          _el$98 = _$createElement("text");
-        _$insertNode(_el$97, _el$98);
-        _$setProp(_el$97, "flexDirection", "column");
-        _$setProp(_el$97, "width", "100%");
-        _$setProp(_el$97, "paddingX", 1);
-        _$setProp(_el$97, "flexShrink", 0);
-        _$setProp(_el$97, "onSizeChange", function () {
+        var _el$68 = _$createElement("box"),
+          _el$69 = _$createElement("text");
+        _$insertNode(_el$68, _el$69);
+        _$setProp(_el$68, "flexDirection", "column");
+        _$setProp(_el$68, "width", "100%");
+        _$setProp(_el$68, "paddingX", 1);
+        _$setProp(_el$68, "flexShrink", 0);
+        _$setProp(_el$68, "onSizeChange", function () {
           setMetricWidth(Math.max(1, this.width - 2));
         });
-        _$setProp(_el$98, "width", "100%");
-        _$setProp(_el$98, "wrapMode", "word");
-        _$setProp(_el$98, "flexShrink", 0);
-        _$insert(_el$98, metricLabel);
-        _$effect(_$p => _$setProp(_el$98, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$97;
+        _$setProp(_el$69, "width", "100%");
+        _$setProp(_el$69, "wrapMode", "word");
+        _$setProp(_el$69, "flexShrink", 0);
+        _$insert(_el$69, metricLabel);
+        _$effect(_$p => _$setProp(_el$69, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$68;
       })(), _$memo(() => _$memo(() => !!expanded())() && (!sessionID() ? (() => {
-        var _el$99 = _$createElement("text");
-        _$insertNode(_el$99, _$createTextNode(`No active session`));
-        _$setProp(_el$99, "paddingTop", 1);
-        _$setProp(_el$99, "truncate", true);
-        _$setProp(_el$99, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$99, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$99;
+        var _el$70 = _$createElement("text");
+        _$insertNode(_el$70, _$createTextNode(`No active session`));
+        _$setProp(_el$70, "paddingTop", 1);
+        _$setProp(_el$70, "truncate", true);
+        _$setProp(_el$70, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$70, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$70;
       })() : [(() => {
-        var _el$101 = _$createElement("text"),
-          _el$102 = _$createTextNode(`session `);
-        _$insertNode(_el$101, _el$102);
-        _$setProp(_el$101, "paddingTop", 1);
-        _$setProp(_el$101, "wrapMode", "word");
-        _$setProp(_el$101, "flexShrink", 0);
-        _$insert(_el$101, sessionID, null);
-        _$effect(_$p => _$setProp(_el$101, "fg", props.api.theme.current.secondary, _$p));
-        return _el$101;
-      })(), _$memo(() => sections().map((section, index) => [_$createComponent(PulseSection, {
+        var _el$72 = _$createElement("text"),
+          _el$73 = _$createTextNode(`session `);
+        _$insertNode(_el$72, _el$73);
+        _$setProp(_el$72, "paddingTop", 1);
+        _$setProp(_el$72, "wrapMode", "word");
+        _$setProp(_el$72, "flexShrink", 0);
+        _$insert(_el$72, sessionID, null);
+        _$effect(_$p => _$setProp(_el$72, "fg", props.api.theme.current.secondary, _$p));
+        return _el$72;
+      })(), _$memo(() => sections().map((section, index) => _$createComponent(PulseSection, {
         get theme() {
           return props.api.theme;
         },
         section: section
-      }), index === 0 && (() => {
-        var _el$106 = _$createElement("box"),
-          _el$107 = _$createElement("text"),
-          _el$108 = _$createElement("text"),
-          _el$109 = _$createElement("text");
-        _$insertNode(_el$106, _el$107);
-        _$insertNode(_el$106, _el$108);
-        _$insertNode(_el$106, _el$109);
-        _$setProp(_el$106, "flexDirection", "column");
-        _$setProp(_el$106, "width", "100%");
-        _$setProp(_el$106, "paddingX", 1);
-        _$setProp(_el$106, "flexShrink", 0);
-        _$setProp(_el$107, "wrapMode", "word");
-        _$setProp(_el$107, "flexShrink", 0);
-        _$insert(_el$107, () => average().label);
-        _$setProp(_el$108, "wrapMode", "word");
-        _$setProp(_el$108, "flexShrink", 0);
-        _$insert(_el$108, () => average().value);
-        _$insert(_el$106, (() => {
-          var _c$9 = _$memo(() => !!average().coverage);
-          return () => _c$9() && (() => {
-            var _el$111 = _$createElement("text");
-            _$setProp(_el$111, "wrapMode", "word");
-            _$setProp(_el$111, "flexShrink", 0);
-            _$insert(_el$111, () => average().coverage);
-            _$effect(_$p => _$setProp(_el$111, "fg", props.api.theme.current.textMuted, _$p));
-            return _el$111;
-          })();
-        })(), _el$109);
-        _$insert(_el$106, (() => {
-          var _c$0 = _$memo(() => !!average().diagnostic);
-          return () => _c$0() && (() => {
-            var _el$112 = _$createElement("text");
-            _$setProp(_el$112, "wrapMode", "word");
-            _$setProp(_el$112, "flexShrink", 0);
-            _$insert(_el$112, () => average().diagnostic);
-            _$effect(_$p => _$setProp(_el$112, "fg", props.api.theme.current.textMuted, _$p));
-            return _el$112;
-          })();
-        })(), _el$109);
-        _$insertNode(_el$109, _$createTextNode(`Compact usage and TPS include subagents. Time is recorded task activity.`));
-        _$setProp(_el$109, "wrapMode", "word");
-        _$setProp(_el$109, "flexShrink", 0);
-        _$effect(_p$ => {
-          var _v$51 = props.api.theme.current.textMuted,
-            _v$52 = props.api.theme.current.accent,
-            _v$53 = props.api.theme.current.textMuted;
-          _v$51 !== _p$.e && (_p$.e = _$setProp(_el$107, "fg", _v$51, _p$.e));
-          _v$52 !== _p$.t && (_p$.t = _$setProp(_el$108, "fg", _v$52, _p$.t));
-          _v$53 !== _p$.a && (_p$.a = _$setProp(_el$109, "fg", _v$53, _p$.a));
-          return _p$;
-        }, {
-          e: undefined,
-          t: undefined,
-          a: undefined
-        });
-        return _el$106;
-      })()])), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
-        var _el$113 = _$createElement("text");
-        _$insertNode(_el$113, _$createTextNode(`No completed responses yet`));
-        _$setProp(_el$113, "paddingTop", 1);
-        _$setProp(_el$113, "truncate", true);
-        _$setProp(_el$113, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$113, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$113;
+      }))), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
+        var _el$77 = _$createElement("text");
+        _$insertNode(_el$77, _$createTextNode(`No completed responses yet`));
+        _$setProp(_el$77, "paddingTop", 1);
+        _$setProp(_el$77, "truncate", true);
+        _$setProp(_el$77, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$77, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$77;
       })()), (() => {
-        var _el$103 = _$createElement("box"),
-          _el$104 = _$createElement("text");
-        _$insertNode(_el$103, _el$104);
-        _$setProp(_el$103, "flexDirection", "column");
-        _$setProp(_el$103, "width", "100%");
-        _$setProp(_el$103, "paddingTop", 1);
-        _$insertNode(_el$104, _$createTextNode(`SESSION RUN`));
-        _$setProp(_el$104, "truncate", true);
-        _$setProp(_el$104, "wrapMode", "none");
-        _$insert(_el$103, _$createComponent(PulseMetricGrid, {
+        var _el$74 = _$createElement("box"),
+          _el$75 = _$createElement("text");
+        _$insertNode(_el$74, _el$75);
+        _$setProp(_el$74, "flexDirection", "column");
+        _$setProp(_el$74, "width", "100%");
+        _$setProp(_el$74, "paddingTop", 1);
+        _$insertNode(_el$75, _$createTextNode(`SESSION RUN`));
+        _$setProp(_el$75, "truncate", true);
+        _$setProp(_el$75, "wrapMode", "none");
+        _$insert(_el$74, _$createComponent(PulseMetricGrid, {
           get theme() {
             return props.api.theme;
           },
@@ -4520,8 +3772,8 @@ function BottomContent(props) {
             }]];
           }
         }), null);
-        _$effect(_$p => _$setProp(_el$104, "fg", props.api.theme.current.accent, _$p));
-        return _el$103;
+        _$effect(_$p => _$setProp(_el$75, "fg", props.api.theme.current.accent, _$p));
+        return _el$74;
       })(), _$memo(() => _$memo(() => rows().length > 0)() && _$createComponent(ChildAgentRows, {
         get theme() {
           return props.api.theme;
@@ -4531,7 +3783,7 @@ function BottomContent(props) {
         }
       }))]))];
     })());
-    return _el$94;
+    return _el$65;
   })();
 }
 export function createTuiSlotPlugin(api, store, options) {
@@ -4544,14 +3796,6 @@ export function createTuiSlotPlugin(api, store, options) {
         get sessionID() {
           return props.session_id;
         }
-      }),
-      session_prompt_right: (_context, props) => _$createComponent(PromptRight, {
-        api: api,
-        store: store,
-        get sessionID() {
-          return props.session_id;
-        },
-        options: options
       })
     }
   };
@@ -4562,7 +3806,7 @@ function registerLegacyCommand(api, openHistory, openDetails, options) {
     const dispose = once(api.command.register(() => [{
       title: "Open token history",
       value: COMMAND_NAME,
-      description: "Open recent token speed history for the current session",
+      description: "Open recent usage history for the current session",
       category: "Plugin",
       keybind: legacyBinding(options, COMMAND_NAME, "ctrl+shift+t"),
       slash: {
@@ -4572,7 +3816,7 @@ function registerLegacyCommand(api, openHistory, openDetails, options) {
     }, {
       title: "Token Pulse details",
       value: DETAILS_COMMAND_NAME,
-      description: "Session averages, usage and timing coverage",
+      description: "Session usage, cache and task time",
       category: "Plugin",
       keybind: legacyBinding(options, DETAILS_COMMAND_NAME, "ctrl+shift+y"),
       slash: {
@@ -4873,12 +4117,14 @@ const tui = async (api, rawOptions) => {
   };
   const handleEvent = (input, _metadata) => {
     if (disposed) return;
+    const event = normalizeEvent(input);
+    if (!event) return;
+    const type = eventType(event);
+    // Content streaming does no Pulse work: no clocks, session lookup, task
+    // migration, part snapshot, hash, sample, or totals revision.
+    if (type === "message.part.delta" || type === "message.part.updated" || type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") return;
     const receivedAt = Date.now();
-    const receivedMono = performance.now();
     try {
-      const event = normalizeEvent(input);
-      if (!event) return;
-      const type = eventType(event);
       const properties = eventProperties(event);
       if (type === "server.connected" || type === "server.instance.disposed" || type.startsWith("workspace.")) {
         recordTuiObservationLifecycle(store, type, properties, event, receivedAt);
@@ -4894,18 +4140,6 @@ const tui = async (api, rawOptions) => {
         return;
       }
       if (eventSessionID) rootSessionIDFor(store, api, eventSessionID);
-      if (type === "message.part.updated") {
-        recordTuiPartMetadata(store, properties, event, receivedAt);
-        return;
-      }
-      if (type === "message.part.delta") {
-        recordDelta(store, properties, event, "legacy", undefined, options.bytesPerToken, receivedAt, receivedMono, RECEIVE_CLOCK);
-        return;
-      }
-      if (type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
-        recordDelta(store, properties, event, "v2", type.endsWith("reasoning.delta") ? "reasoning" : "output", options.bytesPerToken, receivedAt, receivedMono, RECEIVE_CLOCK);
-        return;
-      }
       if (type === "session.next.step.started") {
         recordStepStarted(store, properties, event);
         return;

@@ -2,31 +2,20 @@
 
 [简体中文](README.zh-CN.md)
 
-Token Pulse is an OpenCode plugin for live token speed, session totals, and
-response history. It ships two independent entry points: the server records
-responses and activity, and the TUI renders live speed plus session aggregates.
+Token Pulse is an OpenCode plugin for session totals, cache, and task time.
+It ships two independent entry points: the server records completed usage and
+activity, and the TUI shows those totals.
 
 It requires **OpenCode 1.18 or later**.
 
 ## Features
 
-- Live `tok/s` in the prompt while a response streams, with generated tokens,
-  TTFT, and elapsed time.
-- Session totals in the sidebar Token Pulse block, including recursive
-  child-agent sessions.
-- Additional weighted average TPS for the current session's own agent,
-  excluding child agents.
-- Completion records with TTFT, duration, avg/max/min speed, input, output,
-  reasoning, cache read/write, and cost.
-- Persistent session run time across turns and OpenCode restarts.
+- Session totals in the sidebar Token Pulse block, including input, output,
+  reasoning, cache read/write, and cost, with recursive child-agent sessions.
+- Persistent task time across turns and OpenCode restarts.
 - History view via `/tps` or `Ctrl+Shift+T`.
-- Session speed details via `/tps-details`, **Token Pulse details** in the
-  command palette, or `Ctrl+Shift+Y`.
-
-Streaming token counts are estimated from UTF-8 bytes at **5.5 bytes/token**
-by default (`bytesPerToken`). When OpenCode provides usage at completion, those
-values replace the corresponding usage estimates. Live and peak/minimum speeds
-remain byte-based arrival estimates.
+- Session details via `/tps-details`, **Token Pulse details** in the command
+  palette, or `Ctrl+Shift+Y`.
 
 ## Install
 
@@ -52,8 +41,7 @@ absolute path with your checkout.
       "file:///absolute/path/to/tokpulse/dist/server.js",
       {
         "historyPath": ".opencode/oc-tps/history.jsonl",
-        "maxRecords": 1000,
-        "bytesPerToken": 5.5
+        "maxRecords": 1000
       }
     ]
   ]
@@ -69,8 +57,7 @@ absolute path with your checkout.
       "file:///absolute/path/to/tokpulse/dist/tui.js",
       {
         "historyPath": ".opencode/oc-tps/history.jsonl",
-        "maxRecords": 1000,
-        "bytesPerToken": 5.5
+        "maxRecords": 1000
       }
     ]
   ]
@@ -78,47 +65,20 @@ absolute path with your checkout.
 ```
 
 The server keeps recording even if the TUI is not running. The TUI reads the
-same JSONL files for live and completed data.
+same JSONL files for completed usage and activity.
 
 For the published npm package, use `@komeijireimu/tokpulse/server` in
 `opencode.json` and `@komeijireimu/tokpulse/tui` in `tui.json` in place of the
 file URLs above.
 
-## Speed and session details
+## Session totals and task time
 
-The primary speed is **generation TPS**, including output and observable reasoning.
-`~` marks a host-observed estimate: event arrival timing cannot reveal the
-provider's exact internal generation speed. A completed measurement needs **two
-distinct arrival batches**, with complete content observations matching the final
-response. Short observations of **100–999ms** can qualify when every arrival has
-verified monotonic clock provenance; they are marked as low-confidence estimates.
-A single batch or an extremely short burst cannot establish generation TPS.
-Tokens in the first batch are excluded using each category's share of observed
-bytes and its final usage; this interval token count is always an estimate.
-Retry-contaminated, interrupted, or incomplete observations have no generation TPS.
-
-- **Main average** uses the current session's own cumulative generation measurements,
-  excluding child agents. Expand Token Pulse to see this average and its coverage.
-- **Compact speed** uses cumulative generation measurements including user-task descendant
-  agents, matching the inclusive usage totals.
-- **Response throughput** is separate: it uses the full response duration,
-  including TTFT and possibly tool wait time. It never substitutes for generation
-  TPS; missing generation measurements display `--`.
-
-Cumulative generation TPS is **total estimated interval tokens / total measured
-seconds**, persisted in `totals.json` beside history and retained after history
-trimming. Coverage reports qualified responses and their **full generated usage**,
-not just the interval token estimates. Stored qualified measurements survive
-restarts and history trimming. Older history cannot supply missing generation
-observations.
-
-Live speed and historical peaks need at least **1 second** and **two distinct
-observation timestamps**. Waiting for content is separate from warming up an
-observed stream; after completion, the last result or its unavailability reason
-replaces the live state.
+Totals include input, output, reasoning, cache read, cache write, and cost.
+The sidebar total includes eligible child-agent sessions. Expand Token Pulse
+to see the current session's own usage separately from its descendants.
 
 Magic Context maintenance runs, including historian, dreamer and their descendants,
-are excluded from token, cost, call, speed and task-time statistics and from agent
+are excluded from token, cost, call, and task-time statistics and from agent
 views. Maintenance summaries inside a user session are excluded per message;
 the rest of that session remains counted. Historical data without verifiable
 source information or the original contribution needed for safe reversal is
@@ -130,8 +90,8 @@ eligible work has ended; maintenance work cannot extend it.
 
 Open details with `/tps-details`, **Token Pulse details** in the command palette,
 or the default `Ctrl+Shift+Y`. The view covers the session where it was opened and
-its known descendant agents. Select an agent to inspect its own usage and averages;
-a separate summary covers the entire tree. Press `Esc` or `Ctrl+C` to close.
+its known descendant agents. Select an agent to inspect its own usage, cache, and
+task time; a separate summary covers the entire tree. Press `Esc` or `Ctrl+C` to close.
 `/tps` and `Ctrl+Shift+T` open history.
 
 Customize the details shortcut in the TUI plugin's tuple options:
@@ -174,7 +134,6 @@ per completed response, kept to the most recent **1,000 records** by default.
 | `historyPath` | `.opencode/oc-tps/history.jsonl` | Relative path under the worktree, or an absolute path. |
 | `runsPath` | same directory as `historyPath`, file `runs.jsonl` | Activity ledger path. |
 | `maxRecords` | `1000` | Number of response records to keep. |
-| `bytesPerToken` | `5.5` | UTF-8 bytes per estimated token while streaming. |
 
 ## Development
 

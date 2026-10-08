@@ -77,9 +77,9 @@ test("metadata-only Thinking precedes content, keeps earliest provenance and add
     assert.equal(record.time.firstResponse, 100);
     assert.equal(record.time.firstContent, 500);
     assert.equal(record.time.firstToken, 500);
-    assert.equal(record.samples.length, 1);
-    assert.equal(record.samples[0].tokens, 10);
-    assert.equal(record.speed?.generation, undefined);
+    assert.equal(record.tokens.reasoning, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -154,9 +154,9 @@ test("ambiguous tool tails cannot manufacture generation coverage from delta or 
     await send({ type: "message.part.updated", timestamp: 4500, properties: { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 200, end: 4500 } } } } });
     await send(completed("m", 10, 0, 5000));
     const [record] = await records(path);
-    assert.equal(record.speed?.generation, undefined);
-    assert.equal(record.speed?.generationEvidence, undefined);
-    assert.equal(record.speed?.response?.durationMs, 5000);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -228,19 +228,18 @@ test("every real paired ingress declares receive-clock precision for a short com
     await textSnapshot(send, "short", "helloworld", 360, true);
     await officialTextComplete(send, "short", 10, 0, 10_000);
     const [record] = await records(path);
-    assert.equal(record.speed?.generation?.durationMs, 256);
-    assert.equal(record.speed?.generation?.generatedTokens, 5);
-    assert.equal(record.speed?.generation?.observationQuality, "short");
-    assert.equal(record.speed?.generationEvidence?.clockSource, "performance.now");
-    assert.equal(record.speed?.generationEvidence?.clockResolutionMs, 1);
-    assert.equal(record.speed?.generationEvidence?.observationQuality, "short");
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
     const totals = await createTotalsStorage({ historyPath: path }).read();
     assert.equal(totals.generationBasisVersion, 3);
-    assert.equal(totals.sessions.s.speed?.generation.shortResponseCount, 1);
+    assert.equal(totals.sessions.s.tokens.output, 10);
+    assert.equal(totals.sessions.s.responseCount, 1);
+    assert.equal(totals.sessions.s.speed, undefined);
   });
 });
 
-test("CLI 1.18.35-shaped early byte and 256ms final part preserve the whole ten-second receive span", async () => {
+test("a long delta stream persists tokens and does not record speed", async () => {
   await backend(async ({ path, send }) => {
     await officialTextStart(send, "hello");
     await send(delta("hello", 10, "hello-text", "."));
@@ -253,13 +252,12 @@ test("CLI 1.18.35-shaped early byte and 256ms final part preserve the whole ten-
       id: "hello-final", messageID: "hello", sessionID: "s", type: "text", text: "Hello!", time: { start: 9714, end: 9970 } } } });
     await officialTextComplete(send, "hello", 12, 0, 10_000);
     const [record] = await records(path);
-    assert.equal(record.samples[0].bytes, 1);
-    assert.equal(record.speed?.generation?.durationMs, 9960);
-    assert.ok(Math.abs(record.speed!.generation!.generatedTokens - 72 / 7) < 1e-12);
-    const mean = record.speed!.generation!.generatedTokens / (record.speed!.generation!.durationMs / 1000);
-    assert.ok(mean > 1 && mean < 1.1);
-    assert.equal(record.speed?.generationEvidence?.start, 10);
-    assert.equal(record.speed?.generationEvidence?.end, 9970);
+    assert.equal(record.tokens.output, 12);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
+    const totals = await createTotalsStorage({ historyPath: path }).read();
+    assert.equal(totals.sessions.s.tokens.output, 12);
+    assert.equal(totals.sessions.s.speed, undefined);
   });
 });
 
@@ -274,10 +272,9 @@ test("official pending snapshots before corresponding deltas resolve without inv
     await officialTextComplete(send, "m", 10, 0, 1500);
     const [record] = await records(path);
     assert.equal(record.time.firstContent, 100);
-    assert.equal(record.speed?.generation?.durationMs, 1100);
-    assert.equal(record.speed?.generation?.generatedTokens, 5);
-    assert.equal(record.speed?.generationEvidence?.start, 100);
-    assert.equal(record.speed?.generationEvidence?.end, 1200);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -289,11 +286,9 @@ test("official trimmed final trailing newline preserves raw arrival byte calibra
     await textSnapshot(send, "m", "helloworld", 1300, true);
     await officialTextComplete(send, "m", 10, 0, 1500);
     const [record] = await records(path);
-    assert.equal(record.speed?.generation?.durationMs, 1100);
-    assert.equal(record.speed?.generation?.generatedTokens, 60 / 11);
-    assert.equal(record.speed?.generation?.coverageGeneratedTokens, 10);
-    assert.deepEqual(record.speed?.generationEvidence?.bytes?.output, { total: 11, firstBatch: 5 });
-    assert.equal(record.samples.reduce((sum, sample) => sum + (sample.bytes ?? 0), 0), 11);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -305,10 +300,9 @@ test("official clean assistant start delayed 1.5s remains eligible after the sta
     await textSnapshot(send, "m", "helloworld", 2800, true);
     await officialTextComplete(send, "m", 10, 0, 3000);
     const [record] = await records(path);
-    assert.equal(record.speed?.generation?.durationMs, 1100);
-    assert.equal(record.speed?.generation?.generatedTokens, 5);
-    assert.equal(record.speed?.generationEvidence?.start, 1600);
-    assert.equal(record.speed?.generationEvidence?.end, 2700);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -328,16 +322,17 @@ test("official tool-call message stays invalid, while independent final plain as
     await textSnapshot(send, "final-message", "helloworld", 2900, true);
     await officialTextComplete(send, "final-message", 10, 1600, 3000);
     const stored = await records(path);
-    assert.equal(stored[0].speed?.generation, undefined);
-    assert.ok(stored[0].speed?.generationCoverage?.reasons.some((reason) => reason.includes("tool-usage-uncertain")));
-    assert.equal(stored[1].speed?.generation?.durationMs, 1100);
-    assert.equal(stored[1].speed?.generation?.generatedTokens, 5);
+    assert.equal(stored[0].tokens.output, 8);
+    assert.equal(stored[0].speed, undefined);
+    assert.equal(stored[1].tokens.output, 10);
+    assert.equal(stored[1].speed, undefined);
     const totals = await createTotalsStorage({ historyPath: path }).read();
     assert.equal(totals.sessions.s.tokens.output, 18);
     assert.equal(totals.sessions.s.responseCount, 2);
-    assert.equal(totals.sessions.s.speed?.generation.responseCount, 1);
+    assert.equal(totals.sessions.s.speed, undefined);
     await restart(3100);
-    assert.deepEqual((await records(path))[0].speed?.generationCoverage, stored[0].speed?.generationCoverage);
+    assert.equal((await records(path))[0].tokens.output, 8);
+    assert.equal((await records(path))[0].speed, undefined);
   });
 });
 
@@ -345,12 +340,11 @@ test("official assistant/step-start/content/completion events qualify output plu
   await backend(async ({ path, send }) => {
     await officialGeneration(send);
     const [record] = await records(path);
-    assert.equal(record.speed?.generationEvidence?.stepID, "official-step");
-    assert.equal(record.speed?.generationEvidence?.selectedStream, "legacy");
-    assert.equal(record.speed?.generation?.durationMs, 1100);
-    assert.equal(record.speed?.generation?.generatedTokens, 8);
-    assert.equal(record.speed?.generation?.coverageGeneratedTokens, 16);
-    assert.equal(record.speed?.generation?.estimated, true);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.tokens.reasoning, 6);
+    assert.equal(record.quality, "exact");
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -365,7 +359,7 @@ test("nested session info.id retry targets current or pending assistant, never t
     const [record] = await records(path);
     assert.equal(record.tokens.output, 10);
     assert.equal(record.tokens.reasoning, 6);
-    assert.equal(record.speed?.generation, undefined);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -386,10 +380,9 @@ test("missing reasoning corrections preserve exact usage and TPS, while explicit
     assert.equal(after.sessions.s.tokens.output, 12);
     assert.equal(after.sessions.s.tokens.reasoning, 0);
     assert.equal(after.sessions.s.responseCount, trimmed ? 2 : 1);
-    assert.equal(after.sessions.s.speed?.generation.durationMs, 1100);
-    assert.equal(after.sessions.s.speed?.generation.generatedTokens, 6);
-    assert.equal(after.sessions.s.speed?.generation.coverageGeneratedTokens, 12);
+    assert.equal(after.sessions.s.speed, undefined);
     assert.equal((await records(path))[0].tokens.reasoning, 0);
+    assert.equal((await records(path))[0].speed, undefined);
   }, undefined, 1);
 });
 
@@ -408,10 +401,7 @@ test("recent created time cannot predate startup or disruption observation epoch
     await v3Deltas(send, "before-disruption", 5200, 6300);
     await send(completed("before-disruption", 10, 0, 6500));
     const stored = await records(path);
-    assert.equal(stored[0].speed?.generation, undefined);
-    assert.equal(stored[1].speed?.generation?.durationMs, 1100);
-    assert.equal(stored[2].speed?.generation, undefined);
-    assert.ok(stored.every((record) => record.tokens.output === 10));
+    assert.ok(stored.every((record) => record.speed === undefined && record.tokens.output === 10));
   });
 });
 
@@ -434,18 +424,13 @@ test("v3 uses paired ingress clocks, excluding precontent wait and cleanup/tool 
     const [record] = await records(path);
     assert.equal(record.time.firstResponse, 100);
     assert.equal(record.time.firstContent, 5000);
-    assert.equal(record.speed?.generation?.durationMs, 1100);
-    assert.equal(record.speed?.generation?.generatedTokens, 5);
-    assert.equal(record.speed?.generation?.coverageGeneratedTokens, 10);
-    assert.equal(record.speed?.generationEvidence?.start, 5000);
-    assert.equal(record.speed?.generationEvidence?.end, 6100);
-    assert.equal(record.speed?.generationEvidence?.firstReceiveMono, 100);
-    assert.equal(record.speed?.generationEvidence?.lastReceiveMono, 1200);
-    assert.equal(record.speed?.generation?.estimated, true);
-    assert.equal(record.speed?.response?.durationMs, 20000);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
     await send({ type: "message.part.updated", timestamp: 25000, properties: { part: {
       id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 21000, end: 25000 } } } } });
-    assert.deepEqual((await records(path))[0].speed, record.speed);
+    assert.equal((await records(path))[0].speed, undefined);
+    assert.equal((await records(path))[0].tokens.output, 10);
   });
 });
 
@@ -455,13 +440,14 @@ test("same-message retry remains tainted after busy, correction and reload", asy
     await send({ type: "session.status", timestamp: 50, properties: { sessionID: "s", status: { type: "retry" } } });
     await send({ type: "session.status", timestamp: 60, properties: { sessionID: "s", status: { type: "busy" } } });
     await v3Deltas(send, "m"); await send(completed("m", 10, 0, 1500));
-    assert.equal((await records(path))[0].speed?.generation, undefined);
+    assert.equal((await records(path))[0].tokens.output, 10);
+    assert.equal((await records(path))[0].speed, undefined);
     await send(completed("m", 20, 0, 1600));
     await (await restart())(completed("m", 15, 0, 1700));
     const [record] = await records(path);
     assert.equal(record.tokens.output, 15);
     assert.equal(record.cost, 2);
-    assert.equal(record.speed?.generation, undefined);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -477,13 +463,10 @@ test("v2 category calibration excludes the entire first receive batch and dedupl
       type: "message.part.updated", timestamp: 5100, properties: { part: { id, messageID: "m", sessionID: "s", type, text, time: { end: 5100 } } } });
     await send(completed("m", 10, 4, 6000));
     const [record] = await records(path);
-    assert.equal(record.samples.length, 4);
-    assert.equal(record.speed?.generation?.durationMs, 1100);
-    assert.equal(record.speed?.generation?.generatedTokens, 7);
-    assert.equal(record.speed?.generation?.coverageGeneratedTokens, 14);
-    assert.equal(record.speed?.generationEvidence?.selectedStream, "v2");
-    assert.equal(record.speed?.generationEvidence?.observationCount, 2);
-    assert.equal(record.speed?.generationEvidence?.end, 1200);
+    assert.equal(record.tokens.output, 10);
+    assert.equal(record.tokens.reasoning, 4);
+    assert.equal(record.samples.length, 0);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -494,8 +477,10 @@ test("unknown retry binds one response, not the subsequent clean response", asyn
     await v3Start(send, "retry"); await v3Deltas(send, "retry"); await send(completed("retry", 10, 0, 1500));
     await v3Start(send, "clean"); await v3Deltas(send, "clean"); await send(completed("clean", 10, 0, 1500));
     const stored = await records(path);
-    assert.equal(stored[0].speed?.generation, undefined);
-    assert.equal(stored[1].speed?.generation?.durationMs, 1100);
+    assert.equal(stored[0].tokens.output, 10);
+    assert.equal(stored[0].speed, undefined);
+    assert.equal(stored[1].tokens.output, 10);
+    assert.equal(stored[1].speed, undefined);
   });
 });
 
@@ -505,7 +490,8 @@ test("step identities deduplicate repeats, while distinct steps invalidate and u
     for (const timestamp of [1300, 1350]) await send({ type: "session.next.step.ended", timestamp, properties: {
       sessionID: "s", messageID: "m", stepID: "m-step", tokens: { input: 1, output: 10, reasoning: 0 }, cost: 1 } });
     await send(completed("m", 10, 0, 1500));
-    assert.equal((await records(path))[0].speed?.generation?.durationMs, 1100);
+    assert.equal((await records(path))[0].tokens.output, 10);
+    assert.equal((await records(path))[0].speed, undefined);
   });
   await backend(async ({ path, send }) => {
     await v3Start(send, "m"); await v3Deltas(send, "m");
@@ -516,7 +502,7 @@ test("step identities deduplicate repeats, while distinct steps invalidate and u
     const [record] = await records(path);
     assert.equal(record.tokens.output, 20);
     assert.equal(record.cost, 2);
-    assert.equal(record.speed?.generation, undefined);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -532,7 +518,7 @@ test("complete snapshots cannot supply missing, historic or already-in-progress 
     await v3Deltas(send, "m", 5100, 6200); await send(completed("m", 10, 0, 6500));
     const [record] = await records(path);
     assert.equal(record.tokens.output, 10);
-    assert.equal(record.speed?.generation, undefined);
+    assert.equal(record.speed, undefined);
   });
 });
 
@@ -545,7 +531,7 @@ test("v2 failures and known transport boundaries taint active messages without l
       await v3Deltas(send, "m"); await send(completed("m", 10, 0, 1500));
       const [record] = await records(path);
       assert.equal(record.tokens.output, 10, type);
-      assert.equal(record.speed?.generation, undefined, type);
+      assert.equal(record.speed, undefined, type);
     });
   }
 });
@@ -573,7 +559,6 @@ test("server v3 migration preserves legacy usage across replay/restart/pruning w
     assert.equal(after.sessions.s.tokens.output, 40);
     assert.equal(after.sessions.s.responseCount, 3);
     assert.equal(after.sessions.s.cost, 6);
-    assert.equal(after.sessions.s.speed?.response.responseCount, 1);
-    assert.equal(after.sessions.s.speed?.generation.responseCount, 0);
+    assert.equal(after.sessions.s.speed, undefined);
   }, [legacy("good"), legacy("missing", { completed: 1000 })], 1);
 });

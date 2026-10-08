@@ -1,12 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { HISTORY_VERSION, bytesToTokens, calibrateResponseSamples, emptyTokenCounts, normalizeTokenCounts, timeToFirstToken, utf8ByteLength } from "./core.js";
+import { HISTORY_VERSION, normalizeTokenCounts, timeToFirstToken, utf8ByteLength } from "./core.js";
 import { ACTIVITY_VERSION, isActiveState, normalizeActivityEvent, replayActivity } from "./activity.js";
 import { createActivityLedger } from "./runs-storage.js";
-import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, contentSpeedObservations, createContentMetadataCache, createContentProgress, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, noteContentArrival, noteStepIdentity, parseModelDelta, taintContentProgress } from './statistics.js';
+import { cachedContentProgress, coerceCompletionUpdate, createContentMetadataCache, createContentProgress, earliestFirstOutput, isNewerCompletionUpdate, mergeContentProgress, noteStepIdentity, taintContentProgress } from './statistics.js';
 import { createHistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
-import { RECEIVE_CLOCK_RESOLUTION_MS } from "./statistics.js";
 import { createScopeRegistry, coerceScopeEvidence } from "./scope.js";
 const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
@@ -306,8 +305,9 @@ function isSnapshotIngress(event, properties) {
  * to an already-owned current assistant, but never creates activity/samples. */
 export function recordPartMetadata(active, properties, now, event = {}) {
   const metadata = runtimeContentMetadata(active);
-  cachePartSnapshot(metadata, properties);
   const part = asRecord(properties.part);
+  // Part snapshots repeat the whole text. Speed digests are gone, so do not hash them.
+  if (part && typeof part.messageID === "string" && typeof part.role === "string") metadata.roles.set(part.messageID, part.role);
   if (part?.type === "step-start") {
     noteStepIdentity(cachedContentProgress(metadata, part.messageID), part.stepID ?? properties.stepID ?? part.id);
   }
@@ -354,7 +354,6 @@ export const server = async (input, pluginOptions) => {
     warn("totals ledger initialization failed", error);
   })]).then(() => undefined);
   await eventQueue;
-  const bytesPerToken = validBytesPerToken(options.bytesPerToken);
   const active = new Map();
   const completedMessageIDs = new Set();
   const metadata = runtimeContentMetadata(active);
@@ -468,7 +467,6 @@ export const server = async (input, pluginOptions) => {
   const event = payload => {
     const rawEvent = payload?.event;
     const receivedAt = Date.now();
-    const receivedMonotonic = performance.now();
     const incoming = unwrapIncomingEvent(rawEvent);
     let ingressEpoch = 0;
     if (incoming) {
@@ -488,7 +486,7 @@ export const server = async (input, pluginOptions) => {
         ingressEpoch = source.epochs.get(sid) ?? 0;
       }
     }
-    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic, ingressEpoch)).catch(error => {
+    const next = eventQueue.then(() => handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, receivedAt, ingressEpoch)).catch(error => {
       warn("event handling failed", error);
     });
     eventQueue = next;
@@ -881,7 +879,7 @@ function unwrapIncomingEvent(value) {
   if (nested && typeof nested.type === "string") return nested;
   return outer;
 }
-async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, bytesPerToken, receivedAt, receivedMonotonic, ingressEpoch) {
+async function handleEvent(rawEvent, input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, receivedAt, ingressEpoch) {
   try {
     const event = unwrapIncomingEvent(rawEvent);
     if (!event) return;
@@ -947,8 +945,7 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
       return;
     }
     if (type === "message.part.delta" || type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") {
-      // Capture counters with the paired ingress clocks before any disk/SDK I/O.
-      recordDelta(active, properties, event, receivedAt, type === "message.part.delta" ? "legacy" : "v2", bytesPerToken, receivedMonotonic);
+      recordDelta(active, properties, event, receivedAt, type === "message.part.delta" ? "legacy" : "v2");
       if (scopeChanged) await persistScopeRegistry(source, totals);
       return;
     }
@@ -977,7 +974,7 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
     }
     if (type === "message.updated") {
       try {
-        await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt);
+        await handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, receivedAt);
       } finally {
         if (info?.role === "assistant" && messageID && sessionID && !isSnapshotIngress(event, properties) && isCompleted(info, properties, event)) {
           // Lifecycle ownership is independent of accepting a usage correction.
@@ -997,7 +994,7 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
       return;
     }
     if (isIdleEvent(type, properties, event)) {
-      await flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken);
+      await flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp);
       // An authoritative terminal event retires only this session's tool
       // ownership. A still-busy legitimate child remains independently active.
       for (const [id, tool] of source.tools) if (tool.sessionID === sessionID) source.tools.delete(id);
@@ -1007,7 +1004,7 @@ async function handleEvent(rawEvent, input, storage, totals, activity, active, c
     warn("event parsing failed", error);
   }
 }
-function recordDelta(active, properties, event, timestamp, stream, bytesPerToken, receivedMonotonic) {
+function recordDelta(active, properties, event, timestamp, stream) {
   const sessionID = readSessionIDFromEvent("message.part.delta", properties, event);
   if (!sessionID) return;
   const messageID = readMessageID(properties);
@@ -1016,49 +1013,35 @@ function recordDelta(active, properties, event, timestamp, stream, bytesPerToken
   if (!messageID && responseRuntime(active).closed.has(sessionID)) return;
   if (messageID && (metadata.completed.has(messageID) || metadata.roles.has(messageID) && metadata.roles.get(messageID) !== "assistant")) return;
   const delta = readDelta(properties, event);
-  if (!delta) return;
+  if (!acceptedContentDelta(properties, event, stream, delta)) return;
   const key = messageID ?? pendingKey(sessionID);
-  const existing = active.get(messageID ?? key) ?? active.get(pendingKey(sessionID));
-  const progress = existing?.progress ?? cachedContentProgress(metadata, messageID ?? key);
-  const parsed = parseModelDelta(progress, properties, event, stream, delta);
-  if (!parsed) return;
   const state = getOrCreateState(active, messageID, sessionID, timestamp);
   if (state.sessionID !== sessionID) return;
-  state.progress = mergeContentProgress(state.progress, progress);
   bindPendingTaint(active, state);
   if (!state.observedFromStart || !messageID) taintResponse(active, state, "unobserved-response-start");
   if (!state.liveAssistant || responseRuntime(active).current.get(sessionID) !== messageID) taintResponse(active, state, "not-current-assistant");
-  metadata.progress.set(messageID ?? key, state.progress);
-  const kind = parsed.kind;
   if (timestamp < state.startedAt) state.startedAt = timestamp;
   state.firstTokenAt = Math.min(state.firstTokenAt ?? timestamp, timestamp);
   state.timing = recordContentArrival({
     ...state.timing,
     start: state.startedAt
   }, timestamp);
-  const bytes = utf8ByteLength(delta);
-  noteContentArrival(state.progress, {
-    kind,
-    bytes,
-    partID: parsed.partID,
-    receivedAt: timestamp,
-    receivedMono: receivedMonotonic,
-    stream
-  }, {
-    clockSource: "performance.now",
-    clockResolutionMs: RECEIVE_CLOCK_RESOLUTION_MS
-  });
-  const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
-  const sample = {
-    timestamp,
-    tokens: estimatedTokens,
-    estimatedTokens,
-    bytes,
-    kind
-  };
   state[stream].hasData = true;
-  state[stream].samples.push(sample);
   active.set(messageID ?? key, state);
+}
+
+/** Accept a content delta without hashing its text or recording a speed sample. */
+function acceptedContentDelta(properties, event, stream, delta) {
+  if (!delta) return false;
+  const type = properties.part?.type ?? properties.kind ?? properties.type ?? (properties.reasoningID !== undefined || properties.field === "reasoning" || event.type === "session.next.reasoning.delta" ? "reasoning" : properties.callID !== undefined || event.type === "session.next.tool.input.delta" ? "tool" : "text");
+  const field = properties.field;
+  if (stream === "legacy") {
+    if (typeof type === "string" && !["text", "reasoning", "tool", "output"].includes(type)) return false;
+    if (type === "tool" && field !== "input" && field !== "state.input" && field !== "state.raw") return false;
+    if (typeof field === "string" && !["text", "reasoning", "input", "state.input", "state.raw"].includes(field)) return false;
+    if (properties.output !== undefined || properties.result !== undefined) return false;
+  }
+  return true;
 }
 function recordResponseStep(active, properties, event, timestamp) {
   const sessionID = readSessionIDFromEvent(event.type, properties, event);
@@ -1089,7 +1072,7 @@ function recordStepFallback(active, completedMessageIDs, properties, event, time
   state.cost = numberOrUndefined(info?.cost ?? properties.cost) ?? state.cost;
   active.set(messageID ?? pendingKey(sessionID), state);
 }
-async function handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, bytesPerToken, receivedAt) {
+async function handleMessageUpdated(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, event, properties, timestamp, receivedAt) {
   const info = eventInfo(properties, event);
   if (!info) return;
   const messageID = readMessageID(properties, info);
@@ -1195,11 +1178,10 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
   }
   const state = takeState(active, messageID, sessionID, timestamp);
   const fallback = state?.fallbackTokens ?? {};
-  const estimate = estimateStateTokens(state, bytesPerToken);
   const tokens = {
-    input: exactOrFallback(exactTokens.input, fallback.input, estimate.input),
-    output: exactOrFallback(exactTokens.output, fallback.output, estimate.output),
-    reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, estimate.reasoning),
+    input: exactOrFallback(exactTokens.input, fallback.input, 0),
+    output: exactOrFallback(exactTokens.output, fallback.output, 0),
+    reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, 0),
     cacheRead: cacheOrFallback(exactTokens.cacheRead, fallback.cacheRead),
     cacheWrite: cacheOrFallback(exactTokens.cacheWrite, fallback.cacheWrite)
   };
@@ -1211,11 +1193,6 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     metadata.completed.add(messageID);
     return;
   }
-  const candidateSamples = state ? chooseSamples(state) : previous?.samples ?? [];
-  const samples = calibrateResponseSamples(candidateSamples, {
-    output: tokens.output,
-    reasoning: tokens.reasoning
-  });
   const parentSessionID = resolveParentSessionID(input, parentSessionCache, sessionID, "message.updated", properties, event);
   await safeRecordParentFact(activity, "message.updated", sessionID, parentSessionID, timestamp, properties, event);
   const record = makeHistoryRecord({
@@ -1225,7 +1202,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     model: modelName(info) ?? state?.model,
     cost: numberOrUndefined(info.cost) ?? state?.cost ?? 0,
     tokens,
-    samples,
+    samples: [],
     state,
     info,
     completedAt: timestamp,
@@ -1246,14 +1223,14 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     }
   }
   record.time.ttft = timeToFirstToken(record);
-  record.speed = mergeRecordSpeed(record, prior, responseRuntime(active).tainted.has(messageID) || state && chooseSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
+  delete record.speed;
   record.update = update;
   if (await persistCompletedRecord(source, storage, totals, record)) {
     completedMessageIDs.add(messageID);
     metadata.completed.add(messageID);
   }
 }
-async function flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp, bytesPerToken) {
+async function flushIdleStates(input, storage, totals, activity, active, completedMessageIDs, parentSessionCache, properties, event, timestamp) {
   const sessionID = readSessionIDFromEvent("session.idle", properties, event);
   if (!sessionID) return;
   responseRuntime(active).pendingTaints.delete(sessionID);
@@ -1265,11 +1242,10 @@ async function flushIdleStates(input, storage, totals, activity, active, complet
     if (!state.legacy.hasData && !state.v2.hasData && Object.keys(state.fallbackTokens).length === 0) continue;
     if (state.messageID.startsWith("__pending__:")) continue;
     if (completedMessageIDs.has(state.messageID)) continue;
-    const estimate = estimateStateTokens(state, bytesPerToken);
     const tokens = {
-      input: state.fallbackTokens.input ?? estimate.input,
-      output: state.fallbackTokens.output ?? estimate.output,
-      reasoning: state.fallbackTokens.reasoning ?? estimate.reasoning,
+      input: state.fallbackTokens.input ?? 0,
+      output: state.fallbackTokens.output ?? 0,
+      reasoning: state.fallbackTokens.reasoning ?? 0,
       cacheRead: state.fallbackTokens.cacheRead ?? 0,
       cacheWrite: state.fallbackTokens.cacheWrite ?? 0
     };
@@ -1282,10 +1258,7 @@ async function flushIdleStates(input, storage, totals, activity, active, complet
       model: state.model,
       cost: state.cost ?? 0,
       tokens,
-      samples: calibrateResponseSamples(chooseSamples(state), {
-        output: tokens.output,
-        reasoning: tokens.reasoning
-      }),
+      samples: [],
       state,
       info: undefined,
       completedAt: timestamp,
@@ -1339,36 +1312,7 @@ function makeHistoryRecord(input) {
     });
   }
   record.time.ttft = timeToFirstToken(record);
-  const observations = contentSpeedObservations(record, input.state?.progress, input.state?.firstTokenAt, input.quality === "exact", numberOrUndefined(infoTime.start ?? infoTime.created) !== undefined && numberOrUndefined(infoTime.end ?? infoTime.completed) !== undefined, tokenFields(input.info?.tokens).reasoning !== undefined);
-  const speed = measureRecordSpeed(record, observations);
-  record.speed = {
-    ...speed,
-    ...(!speed.generation && observations.generationCoverage ? {
-      generationCoverage: observations.generationCoverage
-    } : {})
-  };
   return record;
-}
-function chooseSamples(state) {
-  if (!state) return [];
-  return state.v2.hasData ? [...state.v2.samples] : [...state.legacy.samples];
-}
-function estimateStateTokens(state, bytesPerToken) {
-  const samples = chooseSamples(state);
-  const result = emptyTokenCounts();
-  for (const sample of samples) {
-    const tokens = sample.estimatedTokens ?? sample.tokens;
-    if (sample.kind === "reasoning") result.reasoning += tokens;else result.output += tokens;
-  }
-  if (state && samples.length === 0) {
-    const legacy = state.legacy.samples;
-    const v2 = state.v2.samples;
-    for (const sample of [...legacy, ...v2]) {
-      const bytes = sample.bytes ?? 0;
-      result.output += bytesToTokens(bytes, bytesPerToken);
-    }
-  }
-  return result;
 }
 function takeState(active, messageID, sessionID, timestamp) {
   const direct = active.get(messageID);
@@ -1428,11 +1372,7 @@ function mergeStates(target, source) {
   target.cost = target.cost ?? source.cost;
   target.fallbackTokens = mergeFallbackTokens(source.fallbackTokens, target.fallbackTokens);
   target.legacy.hasData ||= source.legacy.hasData;
-  target.legacy.samples.push(...source.legacy.samples);
   target.v2.hasData ||= source.v2.hasData;
-  target.v2.samples.push(...source.v2.samples);
-  target.legacy.samples.sort((left, right) => left.timestamp - right.timestamp);
-  target.v2.samples.sort((left, right) => left.timestamp - right.timestamp);
 }
 function createState(messageID, sessionID, timestamp) {
   return {
@@ -1441,12 +1381,10 @@ function createState(messageID, sessionID, timestamp) {
     startedAt: timestamp,
     fallbackTokens: {},
     legacy: {
-      hasData: false,
-      samples: []
+      hasData: false
     },
     v2: {
-      hasData: false,
-      samples: []
+      hasData: false
     }
   };
 }
@@ -1576,9 +1514,6 @@ function resolveOptions(candidate) {
     maxRecords: numberOrUndefined(candidate.maxRecords),
     bytesPerToken: numberOrUndefined(candidate.bytesPerToken)
   };
-}
-function validBytesPerToken(value) {
-  return value !== undefined && Number.isFinite(value) && value > 0 ? value : 5.5;
 }
 function readMessageID(...sources) {
   return readStringFrom(sources, ["messageID", "messageId", "assistantMessageID", "assistantMessageId", "id", "message.id", "part.messageID"]);

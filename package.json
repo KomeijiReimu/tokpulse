@@ -1,7 +1,7 @@
 {
   "name": "@komeijireimu/tokpulse",
   "version": "0.1.0",
-  "description": "Token Pulse — live token speed, session totals, and response history for OpenCode",
+  "description": "Token Pulse — session token totals, cache, and task time for OpenCode",
   "license": "AGPL-3.0-or-later",
   "author": "KomeijiReimu",
   "repository": {
@@ -16,8 +16,8 @@
     "opencode",
     "plugin",
     "tokens",
-    "tps",
-    "throughput"
+    "usage",
+    "cache"
   ],
   "type": "module",
   "exports": {

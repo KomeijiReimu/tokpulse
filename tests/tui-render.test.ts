@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, TextareaRenderable, Yoga, LayoutEvents } from "@opentui/core";
+import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable, TextRenderable } from "@opentui/core";
 import { testRender, useRenderer } from "@opentui/solid";
 import type { JSX } from "@opentui/solid";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
@@ -90,215 +90,11 @@ if (!nativeChild) {
     ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /17 pass/);
+    assert.match(output.stderr + output.stdout, /14 pass/);
   });
 }
 
 if (nativeChild) {
-type PromptPhase = "WAITING" | "WARMUP" | "LIVE" | "LAST" | "SHORT" | "UNAVAILABLE";
-const promptPhases: PromptPhase[] = ["WAITING", "WARMUP", "LIVE", "LAST", "SHORT", "UNAVAILABLE"];
-const promptSID = "ses_input11_retained_session_complete_identifier_0000000000000000";
-async function promptFixture(budget: number, long = false, sidebar = false, options: { absent?: boolean; extras?: number; plugins?: number; custom?: boolean; terminal?: boolean; auto?: boolean } = {}) {
-  const ui = (await uiPromise)!;
-  const store = ui.createRuntimeStore(1, 0);
-  const api = host(320, 96);
-  api.state = { session: { get: () => ({ id: promptSID, agent: "build" }) }, part: () => [] } as unknown as TuiPluginApi["state"];
-  let serial = 0;
-  const phase = (value: PromptPhase) => {
-    store.active.clear(); store.sessionRuntime.delete(promptSID); store.lastCompletedBySession.delete(promptSID);
-    if (["LAST", "SHORT", "UNAVAILABLE"].includes(value)) {
-      const short = value === "SHORT", output = short ? 6 : 2000;
-      const speed = v3Generation(output, 0, short ? 150 : 2000, 27000);
-      if (short && speed.generation && speed.generationEvidence?.version === 3) {
-        speed.generation.observationQuality = "short";
-        speed.generationEvidence.observationQuality = "short";
-        speed.generationEvidence.clockSource = "performance.now"; speed.generationEvidence.clockResolutionMs = 1;
-      }
-      store.lastCompletedBySession.set(promptSID, ui.makeLastCompletedSnapshot({ version: 1, messageID: `last-${++serial}`, sessionID: promptSID,
-        tokens: { input: 1, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
-        time: { start: 0, firstToken: 26700, completed: 30000 }, samples: [], ...(value === "UNAVAILABLE" ? {} : { speed }) }));
-    } else {
-      const id = `live-${++serial}`;
-      ui.handleMessageUpdated(store, api, { info: { id, sessionID: promptSID, role: "assistant", time: { created: 0 } } }, { type: "message.updated", timestamp: 0 }, 4, 0);
-      const state = store.active.get(id)!;
-      state.selectedSource = "legacy"; state.firstTokenAt = 1000;
-      if (value !== "WAITING") {
-        state.legacy.hasData = true;
-        state.legacy.samples = value === "WARMUP" ? [{ timestamp: 57100, tokens: 5000 }]
-          : [{ timestamp: 56300, tokens: 1250 }, { timestamp: 57300, tokens: 3750 }];
-      }
-    }
-    store.bump();
-  };
-  phase("LIVE");
-  let allocation!: BoxRenderable, body!: BoxRenderable, textarea!: Renderable, row!: BoxRenderable, left!: BoxRenderable, model!: TextRenderable, right!: BoxRenderable;
-  const plugins: Renderable[] = [], extras: TextRenderable[] = [];
-  let originals: unknown;
-  const style = () => ({ wrap: row.getLayoutNode().getFlexWrap(), grow: right.getLayoutNode().getFlexGrow(),
-    basis: right.getLayoutNode().getFlexBasis(), min: right.getLayoutNode().getMinWidth(), leftMax: left.getLayoutNode().getMaxWidth() });
-  const rendered = await testRender(() => {
-    api.renderer = useRenderer();
-    const color = RGBA.fromHex("#eeeeee");
-    const box = (id: string, props: ConstructorParameters<typeof BoxRenderable>[1] = {}) => new BoxRenderable(api.renderer, { id, ...props });
-    const text = (id: string, content: string, props: ConstructorParameters<typeof TextRenderable>[1] = {}) => new TextRenderable(api.renderer, { id, content, fg: color, ...props });
-    allocation = box("session-layout", { width: options.terminal ? budget : budget + 9 + (sidebar ? 42 : 0), height: 96, flexDirection: "row", minHeight: 0 });
-    const main = box("main", { flexGrow: 1, minHeight: 0, paddingBottom: 1, paddingLeft: 2, paddingRight: 2, gap: 1 }); allocation.add(main);
-    main.add(box("messages", { flexGrow: 1, minHeight: 0 }));
-    const anchor = box("prompt", { width: "100%" }); main.add(anchor);
-    const border = box("prompt-border", { width: "100%", border: ["left"], borderColor: color }); anchor.add(border);
-    body = box("prompt-body", { paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexShrink: 0, flexGrow: 1, width: "100%" }); border.add(body);
-    textarea = options.custom ? text("not-a-textarea", "Custom input", { width: "100%" })
-      : new TextareaRenderable(api.renderer, { id: "prompt-textarea", width: "100%", minHeight: 1, maxHeight: 16, initialValue: "Input area - no request", textColor: color });
-    body.add(textarea);
-    row = box("prompt-metadata", { flexDirection: "row", flexShrink: 0, paddingTop: 1, gap: 1, justifyContent: "space-between" }); body.add(row);
-    left = box("agent-model", { flexDirection: "row", gap: 1 }); row.add(left);
-    left.add(text("agent", long ? "Build assistant" : "Build"));
-    if (options.auto) left.add(text("permission-mode", "auto"));
-    const models = box("models", { flexDirection: "row", gap: 1 }); left.add(models);
-    models.add(text("separator", "·"));
-    model = text("model", long ? "torchai-gpt/gpt-6.1-sol-extended-reasoning-model" : "gpt-5.4", { flexShrink: 0 }); models.add(model);
-    models.add(text("provider", "OpenAI")); models.add(text("variant-separator", "·")); models.add(text("variant", "thinking"));
-    right = box("prompt-right", { flexDirection: "row", gap: 1, alignItems: "center" });
-    if (!options.absent || options.extras) row.add(right);
-    for (let i = 0; i < (options.extras ?? 0); i++) { const extra = text(`extra-${i}`, "quota ready", { width: 12, flexShrink: 0 }); right.add(extra); extras.push(extra); }
-    originals = style();
-    if (!options.absent) for (let i = 0; i < (options.plugins ?? 1); i++) {
-      const plugin = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots.session_prompt_right!({ theme: api.theme }, { session_id: promptSID }) as unknown as Renderable;
-      plugins.push(plugin); right.add(plugin);
-    }
-    anchor.add(box("lower-border", { height: 1, border: ["left"], borderColor: color }));
-    const footer = box("prompt-controls", { width: "100%", flexDirection: "row", justifyContent: "space-between" }); anchor.add(footer);
-    footer.add(text("escape", "esc interrupt")); footer.add(text("commands", "tab agents  ctrl+p commands"));
-    if (sidebar) {
-      const overlay = options.terminal && budget <= 120;
-      const side = box("sidebar", { width: 42, height: "100%", paddingLeft: 2, paddingRight: 2, ...(overlay ? { position: "absolute", right: 0, top: 0 } : {}) });
-      allocation.add(side); side.add(text("sidebar-title", "Sidebar fixture"));
-    }
-    return allocation as unknown as JSX.Element;
-  }, { width: options.terminal ? budget : 320, height: 96 });
-  const settle = async () => { for (let i = 0; i < 8; i++) await rendered.renderOnce(); };
-  const frame = (node: Renderable) => rendered.captureCharFrame().split("\n").slice(node.y, node.y + node.height).map(line => line.slice(node.x, node.x + node.width).trimEnd());
-  const assertFields = () => {
-    for (const plugin of plugins.filter(node => !node.isDestroyed)) {
-      const fields = (plugin.getChildren()[0] as TextRenderable).plainText.split(/\n| · /);
-      const lines = frame(plugin);
-      for (const field of fields) {
-        if (field.length <= plugin.width) assert.ok(lines.some(line => line.includes(field)), `${field}: ${JSON.stringify(lines)}`);
-        else assert.ok(lines.join("").replace(/\s/g, "").includes(field.replace(/\s/g, "")), `physical wrap dropped ${field}: ${JSON.stringify(lines)}`);
-      }
-      assert.ok(!lines.some(line => /\.\.\.|…/.test(line)));
-      assert.ok(plugin.x >= row.x && plugin.x + plugin.width <= row.x + row.width);
-    }
-  };
-  await settle();
-  return { store, rendered, allocation, textarea, body, row, left, model, right, plugins, extras, originals, style, phase, settle, frame, assertFields,
-    dispose() { rendered.renderer.destroy(); store.disposeSignals(); } };
-}
-
-test("native prompt parent budget preserves textarea and model across six widths and states", { timeout: 20000 }, async () => {
-  const now = Date.now; Date.now = () => 57300;
-  try {
-    for (const sidebar of [false, true]) for (const long of [true, false]) for (const budget of [160, 120, 100, 80, 60, 40]) {
-      const absent = await promptFixture(budget, long, sidebar, { absent: true });
-      const present = await promptFixture(budget, long, sidebar);
-      try { for (const phase of promptPhases) {
-        present.phase(phase); await present.settle();
-        assert.equal(present.textarea.x, absent.textarea.x); assert.equal(present.textarea.width, budget);
-        assert.equal(present.textarea.width, absent.textarea.width); assert.equal(present.row.width, budget);
-        assert.equal(present.model.width, absent.model.width, `${budget}/${phase}: model stolen`);
-        assert.equal(present.left.width, absent.left.width, `${budget}/${phase}: left stolen`);
-        assert.equal(present.textarea.width, present.body.width - 4);
-        const plugin = present.plugins[0]; assert.equal(plugin.width, present.right.width);
-        assert.equal(present.right.x + present.right.width, present.row.x + present.row.width);
-        present.assertFields();
-        if (long && sidebar && budget === 40) reportFrame(`INPUT11-40-${phase}`, present.frame(present.row).join("\n"));
-      } } finally { present.dispose(); absent.dispose(); }
-    }
-    // Real viewport budgets too: narrow official sidebar is an overlay, not a
-    // fictional 42-column deduction from a 40-column terminal.
-    for (const sidebar of [false, true]) for (const width of [160, 120, 100, 80, 60, 40]) {
-      const absent = await promptFixture(width, true, sidebar, { absent: true, terminal: true });
-      const present = await promptFixture(width, true, sidebar, { terminal: true });
-      try {
-        assert.equal(present.textarea.x, absent.textarea.x); assert.equal(present.textarea.width, absent.textarea.width);
-        assert.equal(present.model.width, absent.model.width); present.assertFields();
-      } finally { present.dispose(); absent.dispose(); }
-    }
-  } finally { Date.now = now; }
-});
-
-test("native prompt remaining budget preserves another right sibling and resizes both ways", async () => {
-  const now = Date.now; Date.now = () => 57300;
-  const fixture = await promptFixture(160, true, false, { extras: 1 });
-  try {
-    for (const budget of [160, 120, 80, 40, 20, 40, 80, 120, 160]) {
-      fixture.allocation.width = budget + 9;
-      for (const phase of promptPhases) {
-        fixture.phase(phase); await fixture.settle();
-        const absent = await promptFixture(budget, true, false, { absent: true, extras: 1 });
-        try {
-          assert.equal(fixture.textarea.width, absent.textarea.width); assert.equal(fixture.textarea.x, absent.textarea.x);
-          assert.equal(fixture.model.width, absent.model.width, `${budget}/${phase}: model ${fixture.model.width}/${absent.model.width}, left ${fixture.left.width}/${absent.left.width}, max ${JSON.stringify(fixture.left.getLayoutNode().getMaxWidth())}`); assert.equal(fixture.extras[0].width, 12);
-          assert.ok(fixture.frame(fixture.extras[0]).join("").includes("quota ready"));
-          assert.equal(fixture.plugins[0].width + 13, fixture.right.width); fixture.assertFields();
-        } finally { absent.dispose(); }
-      }
-    }
-    const layoutChanges = fixture.row.listenerCount(LayoutEvents.RESIZED);
-    const comparison = await promptFixture(160, true, false, { absent: true, extras: 1 });
-    try {
-      for (const model of ["gpt-5.4", "torchai-gpt/gpt-6.1-sol-extended-reasoning-model"]) {
-        fixture.model.content = model; comparison.model.content = model; fixture.store.tick(); await fixture.settle(); await comparison.settle();
-        assert.equal(fixture.model.width, comparison.model.width); assert.equal(fixture.left.width, comparison.left.width);
-      }
-    } finally { comparison.dispose(); }
-    const node = fixture.row.getLayoutNode(), calculate = node.calculateLayout.bind(node);
-    let measurements = 0;
-    node.calculateLayout = (...args: Parameters<typeof calculate>) => { measurements++; return calculate(...args); };
-    const minimum = fixture.right.getLayoutNode().getMinWidth();
-    for (let i = 0; i < 16; i++) { fixture.store.bump(); fixture.store.tick(); await fixture.rendered.renderOnce(); }
-    assert.deepEqual(fixture.right.getLayoutNode().getMinWidth(), minimum);
-    assert.equal(fixture.row.listenerCount(LayoutEvents.RESIZED), layoutChanges);
-    assert.equal(measurements, 0, "unchanged data/frames must not re-measure the baseline");
-    reportFrame("INPUT11-extra-sibling", fixture.frame(fixture.row).join("\n"));
-  } finally { fixture.dispose(); Date.now = now; }
-});
-
-test("native prompt leases clean up, share ownership, respect foreign styles and reject custom hosts", async () => {
-  const now = Date.now; Date.now = () => 57300;
-  try {
-    const shared = await promptFixture(120, false, false, { plugins: 2, extras: 1 });
-    try {
-      shared.assertFields(); assert.equal(shared.extras[0].width, 12);
-      shared.plugins[0].destroyRecursively(); await shared.settle();
-      assert.equal(shared.row.getLayoutNode().getFlexWrap(), Yoga.Wrap.Wrap); shared.assertFields();
-      shared.plugins[1].destroyRecursively(); await shared.settle();
-      assert.deepEqual(shared.style(), shared.originals);
-      assert.equal(shared.row.listenerCount(LayoutEvents.RESIZED), 0); assert.equal(shared.right.listenerCount(LayoutEvents.LAYOUT_CHANGED), 0);
-    } finally { shared.dispose(); }
-    const foreign = await promptFixture(120);
-    try {
-      foreign.row.flexWrap = "wrap-reverse"; foreign.right.flexGrow = 3; foreign.right.flexBasis = 9; foreign.right.minWidth = 17; foreign.left.maxWidth = 23;
-      const changed = foreign.style(); foreign.phase("SHORT"); await foreign.settle();
-      assert.deepEqual(foreign.style(), changed);
-      foreign.plugins[0].destroyRecursively(); await foreign.settle();
-      assert.deepEqual(foreign.style(), changed);
-    } finally { foreign.dispose(); }
-    const custom = await promptFixture(120, true, false, { custom: true });
-    try {
-      assert.deepEqual(custom.style(), custom.originals);
-      custom.phase("SHORT"); await custom.settle(); assert.deepEqual(custom.style(), custom.originals);
-      assert.equal(custom.row.listenerCount(LayoutEvents.RESIZED), 0);
-    } finally { custom.dispose(); }
-    const auto = await promptFixture(80, true, false, { auto: true });
-    const absentAuto = await promptFixture(80, true, false, { auto: true, absent: true });
-    try {
-      assert.equal(auto.model.width, absentAuto.model.width); assert.equal(auto.left.width, absentAuto.left.width);
-      auto.assertFields();
-    } finally { auto.dispose(); absentAuto.dispose(); }
-  } finally { Date.now = now; }
-});
-
 function reportFrame(name: string, frame: string): void {
   if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`FRAME ${name}\n${frame.split("\n").map((line) => line.trimEnd()).filter(Boolean).join("\n")}\nEND FRAME`);
 }
@@ -360,7 +156,6 @@ async function ledgerPluginFixture(lateDirectory = false, gateInitialHistory = f
     rendered = await testRender(() => {
       api.renderer = useRenderer();
       const panel = new BoxRenderable(api.renderer, { width: 80, flexDirection: "column" });
-      panel.add(registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
       panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
       return panel as unknown as JSX.Element;
     }, { width: 80, height: 40 });
@@ -403,7 +198,8 @@ test("initialization drains watcher-invalidated authoritative hydration before r
     assert.equal(owned.progress!.fromCurrentStart, true);
     assert.equal(owned.legacy.samples.length + owned.v2.samples.length, 0);
     await f.rendered.renderOnce();
-    assert.match(f.rendered.captureCharFrame(), /^WAITING --/);
+    assert.match(f.rendered.captureCharFrame(), /0 total/);
+    assert.doesNotMatch(f.rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT/i);
     const initialGeneration = f.store.historyGeneration;
     const record = { version: 1, messageID: "m", sessionID: "s", quality: "exact", tokens: { input: 1, output: 6, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
       cost: 0, time: { start: f.startedAt, completed: f.startedAt + 100 }, samples: [] };
@@ -431,7 +227,8 @@ test("initialization drains watcher-invalidated authoritative hydration before r
     assert.deepEqual({ completedOnReturn, activeOnReturn, activeAfterLate, eventuallyClosed: !f.store.active.has("m") },
       { completedOnReturn: true, activeOnReturn: false, activeAfterLate: false, eventuallyClosed: true },
       "initialization must drain, not return during the stale-read/deferred-read window");
-    assert.match(immediate, /^LAST --/);
+    assert.match(immediate, /7 total/);
+    assert.doesNotMatch(immediate, /tok\/s|LAST|LIVE|WARMUP|TTFT|avg/i);
     assert.equal(f.store.sessionRuntime.get("s")!.activeMessageID, undefined);
     assert.equal(f.store.records.find((record) => record.messageID === "m")!.tokens.output, 6);
   } finally { await f.close(); }
@@ -506,7 +303,8 @@ test("ledger watcher re-arms through late directories and projects a later atomi
     f.send(40, "message.updated", { info: { id: "mc-message", sessionID: "mc", role: "assistant", tokens: { input: 1, output: 100, reasoning: 0 }, time: { created: f.startedAt + 20, completed: f.startedAt + 40 } } });
     f.send(60, "message.updated", { info: { id: "mc-live", sessionID: "mc", role: "assistant", time: { created: f.startedAt + 60 } } });
     const before = f.ui.__testActivityReads.length; f.complete(); await f.awaitEventRead(before);
-    assert.equal(f.ui.buildSessionDetailsTree(f.store, "s").average.totalGeneratedTokens, 106, "unknown identity retains usage until positive proof arrives");
+    const retained = f.ui.buildSessionDetailsTree(f.store, "s").including;
+    assert.equal(retained.tokens.output + retained.tokens.reasoning, 106, "unknown identity retains usage until positive proof arrives");
     await mkdir(f.ledgerDirectory, { recursive: true });
     await f.commitRuns([f.fact("s", "busy", 0), f.fact("s", "idle", 200)]);
     await waitForLedger(() => f.store.sessionRuntime.get("s")!.status === "idle", "new ledger directories and file creation must be observed");
@@ -520,7 +318,8 @@ test("ledger watcher re-arms through late directories and projects a later atomi
     await waitForLedger(() => f.store.sourceScopes.isExcluded("mc"), "a late totals scope proof must invalidate projections without host events");
     assert.equal(f.store.active.has("mc-live"), false);
     assert.ok(f.store.records.every((record) => record.sessionID !== "mc"), "late proof retracts maintenance history too");
-    assert.equal(f.ui.buildSessionDetailsTree(f.store, "s").average.totalGeneratedTokens, 6, "raw usage overlays cannot restore excluded maintenance totals");
+    const projected = f.ui.buildSessionDetailsTree(f.store, "s").including;
+    assert.equal(projected.tokens.output + projected.tokens.reasoning, 6, "raw usage overlays cannot restore excluded maintenance totals");
     assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("mc"), false);
     assert.equal(f.ui.hasLiveTaskWallActivity(f.store), false);
     assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 60000), 200);
@@ -531,6 +330,41 @@ test("ledger watcher re-arms through late directories and projects a later atomi
     assert.equal(f.ui.__testActivityReads.length, reads, "unrelated directory changes must not replay activity");
     assert.equal(f.store.historyGeneration, historyGeneration);
   } finally { await f.close(); }
+});
+
+test("actual plugin content subscriptions do no session lookup or totals projection", async () => {
+  const ui = (await uiPromise)!;
+  await mkdir(cacheRoot, { recursive: true });
+  const directory = await mkdtemp(join(cacheRoot, "content-noop-"));
+  const handlers = new Map<string, (event: unknown) => void>();
+  const disposers: (() => void | Promise<void>)[] = [];
+  let lookups = 0;
+  const api = { ...host(80, 24),
+    state: { path: { worktree: directory, directory }, session: { get: () => { lookups += 1; return undefined; } }, part: () => [] },
+    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
+    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
+    slots: { register: () => "content-noop" },
+    event: { on: (type: string, callback: (event: unknown) => void) => { handlers.set(type, callback); return () => handlers.delete(type); } },
+    lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
+  } as unknown as TuiPluginApi;
+  try {
+    await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
+    const store = ui.__testRuntimeStores.at(-1)!;
+    const revision = store.revision();
+    const before = lookups;
+    const types = ["message.part.delta", "message.part.updated", "session.next.text.delta", "session.next.reasoning.delta", "session.next.tool.input.delta"];
+    for (let index = 0; index < 40; index++) {
+      const type = types[index % types.length];
+      handlers.get(type)!({ type, properties: { sessionID: "s", messageID: "m", partID: "p", textID: "p", reasoningID: "p", callID: "p",
+        field: "text", delta: "x".repeat(1000), part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "x".repeat(1000) } } });
+    }
+    assert.equal(lookups, before);
+    assert.equal(store.revision(), revision);
+    assert.equal(store.active.size, 0);
+  } finally {
+    for (const dispose of disposers.reverse()) await dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("actual plugin subscription retires anonymous step compatibility before idle and retains the real two-part gap", async () => {
@@ -566,7 +400,6 @@ test("actual plugin subscription retires anonymous step compatibility before idl
     rendered = await testRender(() => {
       api.renderer = useRenderer();
       const panel = new BoxRenderable(api.renderer, { width: 120, flexDirection: "column" });
-      panel.add(registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
       panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
       return panel as unknown as JSX.Element;
     }, { width: 120, height: 160 });
@@ -582,11 +415,12 @@ test("actual plugin subscription retires anonymous step compatibility before idl
     send(11756, "message.part.delta", { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "！" });
     send(11760, "message.part.updated", { part: { id: "body", messageID: "m", sessionID: "s", type: "text", text: "你好！", time: { end: 11760 } } });
     await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /WARMUP --/);
-    reportFrame("two-part WARMUP", rendered.captureCharFrame());
+    assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
+    reportFrame("two-part before completion", rendered.captureCharFrame());
     send(11770, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 10, reasoning: 0 }, time: { created: 1100, completed: 11770 } } });
     await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /LAST ~1 tok\/s generation/, "completion must retire the anonymous pending ghost before session idle, without shortening the 10s part gap");
+    assert.match(rendered.captureCharFrame(), /10/, "completion must retire the anonymous pending ghost before session idle, without shortening the 10s part gap");
+    assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
     reportFrame("two-part completed LAST", rendered.captureCharFrame());
     send(11800, "session.idle", { sessionID: "s" });
     await rendered.renderOnce();
@@ -664,10 +498,10 @@ test("actual plugin initial hydrate overlaps subscribed live start then rejects 
     assert.equal(owned.legacy.samples.length + owned.v2.samples.length, 0);
     rendered = await testRender(() => {
       api.renderer = useRenderer();
-      return registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as JSX.Element;
+      return registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as JSX.Element;
     }, { width: 80, height: 30 });
     await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /WAITING --|WARMUP --/);
+    assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
     assert.equal(store.active.get("m"), owned, "disk hydration must still be waiting");
     await writeFile(historyPath, completedBytes);
     released = true;
@@ -678,8 +512,8 @@ test("actual plugin initial hydrate overlaps subscribed live start then rejects 
     send(1210, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "late-step" });
     await rendered.renderOnce();
     const frame = rendered.captureCharFrame();
-    assert.match(frame, /LAST --/);
-    assert.doesNotMatch(frame, /WAITING|WARMUP|LIVE|elapsed/);
+    assert.match(frame, /7 total/);
+    assert.doesNotMatch(frame, /tok\/s|WAITING|WARMUP|LIVE|elapsed|TTFT|avg/i);
     assert.equal(store.active.has("m"), false);
     assert.equal(store.sessionRuntime.get("s")!.activeMessageID, undefined);
     reportFrame("initial hydrate completed unavailable", frame);
@@ -731,7 +565,6 @@ test("actual plugin individual SDK flush arrivals qualify short LAST and average
       rendered = await testRender(() => {
         api.renderer = useRenderer();
         const panel = new BoxRenderable(api.renderer, { width: 80, flexDirection: "column" });
-        panel.add(registered.slots!.session_prompt_right!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
         panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
         return panel as unknown as JSX.Element;
       }, { width: 80, height: 60 });
@@ -744,27 +577,22 @@ test("actual plugin individual SDK flush arrivals qualify short LAST and average
       const arrivals = span === 0 ? [[1200, "你好"]] as const : [[1200, "你"], [1200 + span, "好"]] as const;
       for (const [at, delta] of arrivals) send(at, "message.part.delta", { sessionID: "s", messageID: "m", partID: "p", field: "text", delta });
       await rendered.renderOnce();
-      assert.match(rendered.captureCharFrame(), /WARMUP --/);
-      assert.doesNotMatch(rendered.captureCharFrame(), /LIVE ~/);
+      assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
       send(1210 + span, "message.part.updated", { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "你好", time: { end: 1210 + span } } });
       send(1220 + span, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 6, reasoning: 0 }, time: { created: 1100, completed: 1220 + span } } });
       send(1230 + span, "session.idle", { sessionID: "s" });
       await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
-      if (span === 150) assert.match(frame, /LAST ~20 tok\/s generation · short, low confidence/);
-      else assert.match(frame, /LAST --/);
+      assert.match(frame, /7 total/);
+      assert.doesNotMatch(frame, /tok\/s|LIVE|WARMUP|TTFT|avg|low confidence/i);
       reportFrame(`short ${span}ms completed`, frame);
       commands.get(ui.DETAILS_COMMAND_NAME)!();
       assert.ok(dialog, "the actual details command must open its registered dialog");
       details = await testRender(() => { api.renderer = useRenderer(); return dialog(); }, { width: 120, height: 160 });
       await details.renderOnce();
       const detailFrame = details.captureCharFrame();
-      if (span === 150) {
-        assert.match(detailFrame, /Generation avg TPS  ~20 tok\/s/);
-        assert.match(detailFrame, /1 short \(low confidence\)/);
-        assert.match(detailFrame, /short, low confidence/);
-      } else assert.match(detailFrame, /Generation avg TPS  --/);
-      assert.match(detailFrame, /Arrival peaks: -- \(insufficient window observations\)/);
+      assert.match(detailFrame, /6/);
+      assert.doesNotMatch(detailFrame, /tok\/s|TPS|TTFT|peak|throughput|low confidence/i);
       reportFrame(`short ${span}ms details`, detailFrame);
     } finally {
       for (const dispose of disposers.reverse()) await dispose();
@@ -807,11 +635,11 @@ test("actual narrow sidebar preserves full metric fields and task time without e
         const frame = rendered.captureCharFrame();
         if (speed !== undefined) reportFrame(`sidebar ${width} compact`, frame);
         const visible = frame.split("\n").map((line) => line.slice(0, width).trim()).filter(Boolean);
-        assert.deepEqual(visible, ["+ Token Pulse", ...ui.formatPulseMetrics(counts, speed, width - 4, elapsed).split("\n")], `${width}: all visible cells must match whole fields`);
+        assert.deepEqual(visible, ["+ Token Pulse", ...ui.formatPulseMetrics(counts, width - 4, elapsed).split("\n")], `${width}: all visible cells must match whole fields`);
         assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: metrics must not spill outside the sidebar`);
-        assert.doesNotMatch(frame, /\.\.\.|…|incl TPS|Main avg TPS|Observed/);
-        assert.ok(panel.getChildren()[0].height <= 6, `${width}: collapsed contains only toggle + at most four metric rows`);
-        for (const field of ["16.3M total", speed === undefined ? "-- tok/s" : "~57.5k tok/s", "cache 61%", "time 123h45m56s"]) {
+        assert.doesNotMatch(frame, /\.\.\.|…|tok\/s|TPS|avg/i);
+        assert.ok(panel.getChildren()[0].height <= 5, `${width}: collapsed contains only toggle + at most three metric rows`);
+        for (const field of ["16.3M total", "cache 61%", "time 123h45m56s"]) {
           assert.ok(visible.some((line) => line.includes(field)), `${width}: missing or clipped ${field}`);
         }
         ui.togglePulse(store);
@@ -821,15 +649,9 @@ test("actual narrow sidebar preserves full metric fields and task time without e
         const visibleGlyphs = expanded.replace(/\s+/g, "");
         assert.ok(visibleGlyphs.includes(`session${sessionID}`), `${width}: wrapping must preserve every full session ID character`);
         assert.doesNotMatch(expanded, /\.\.\.|…/);
-        if (speed === undefined) {
-          assert.match(expanded, /Main avg TPS\s+--/);
-          assert.match(expanded, /Observed 0\/100\s+calls/);
-          assert.match(expanded, /No\s+qualified\s+generation\s+timing\./);
-          assert.match(expanded.replace(/\s+/g, " "), /Compact usage and TPS include subagents\./);
-          assert.doesNotMatch(expanded, /hidden reasoning|tool waits caused|reconnect caused/);
-        } else {
-          assert.match(expanded, /Main avg TPS\s+~57\.5k tok\/s/);
-        }
+        assert.match(expanded, /SESSION ONLY/);
+        assert.match(expanded, /16\.3M/);
+        assert.doesNotMatch(expanded, /tok\/s|TPS|TTFT|peak|throughput|low confidence/i);
         ui.togglePulse(store);
         await rendered.renderOnce();
       }
@@ -878,10 +700,10 @@ test("narrow child rows preserve full IDs, models, counts and TPS across wrapped
       assert.doesNotMatch(visible, /\.\.\.|…/);
       assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: child rows must stay within the sidebar`);
       assert.ok(glyphs.includes(`session${sessionID}`));
-      assert.ok(glyphs.includes("MainavgTPS~57.5ktok/s"));
+      assert.doesNotMatch(visible, /tok\/s|TPS|avg/i);
       for (const child of children) {
         assert.ok(glyphs.includes(`${child.id}${ui.formatCompactNumber(child.calls)}responses${ui.formatCompactNumber(child.output)}generated`), `${width}: full child ID, counts and units must survive wrapping`);
-        assert.ok(glyphs.includes(`model${child.model}${child.expectedRate.replace(/\s+/g, "")}`), `${width}: full model and direct TPS must survive wrapping`);
+        assert.ok(glyphs.includes(`model${child.model}`), `${width}: full model must survive wrapping`);
       }
       assert.ok(glyphs.indexOf(children[0].id) < glyphs.indexOf(children[1].id));
       assert.ok(glyphs.indexOf(children[1].id) < glyphs.indexOf(children[2].id));
@@ -913,10 +735,10 @@ test("native child rows show direct cumulative generation estimates or unavailab
     await rendered.renderOnce();
     const frame = rendered.captureCharFrame();
     assert.match(frame, /CHILD AGENTS/);
-    assert.match(frame, /model child-model\s+~50 tok\/s/);
-    assert.match(frame, /model grand-model\s+~200 tok\/s/);
-    assert.match(frame, /model unavailable-model\s+--/);
-    assert.doesNotMatch(frame, /200k tok\/s|800k tok\/s|100k tok\/s/);
+    assert.match(frame, /model child-model/);
+    assert.match(frame, /model grand-model/);
+    assert.match(frame, /model unavailable-model/);
+    assert.doesNotMatch(frame, /tok\/s|TPS/i);
     assert.ok(frame.indexOf("model child-model") < frame.indexOf("model grand-model"));
     assert.ok(frame.indexOf("model grand-model") < frame.indexOf("model unavailable-model"));
   } finally { rendered.renderer.destroy(); store.disposeSignals(); }
@@ -944,21 +766,16 @@ test("native sidebar stays compact when collapsed and shows direct average only 
       await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
       assert.match(frame, /\+ Token Pulse/);
-      assert.doesNotMatch(frame, /(?:Main|Session) avg TPS|Observed \d|~30 tok\/s/);
-      assert.match(frame, /~40 tok\/s/); // Empty history; cumulative including differs from direct ~30.
+      assert.doesNotMatch(frame, /tok\/s|TPS|avg/i);
+      assert.match(frame, /133 total|cache|time/);
       assert.doesNotMatch(frame, /SESSION ONLY/);
-      assert.ok(rendered.renderer.root.getChildren()[0].height <= (width === 80 ? 3 : 6), `${width}: compact whole-field rows only`);
+      assert.ok(rendered.renderer.root.getChildren()[0].height <= (width === 80 ? 3 : 5), `${width}: compact whole-field rows only`);
       assert.equal(store.pulseExpanded, false);
       ui.togglePulse(store);
       await rendered.renderOnce();
       assert.match(rendered.captureCharFrame(), /- Token Pulse/);
       assert.match(rendered.captureCharFrame(), /SESSION ONLY/);
-      assert.match(rendered.captureCharFrame(), /Main avg TPS/);
-      assert.match(rendered.captureCharFrame(), /~30 tok\/s/);
-      assert.match(rendered.captureCharFrame(), /Observed 1\/2/);
-      assert.ok(rendered.captureCharFrame().indexOf("SESSION ONLY") < rendered.captureCharFrame().indexOf("Main avg TPS"));
-      const includingPosition = rendered.captureCharFrame().indexOf("INCLUDING SUBAGENTS");
-      if (includingPosition !== -1) assert.ok(rendered.captureCharFrame().indexOf("Main avg TPS") < includingPosition);
+      assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|TPS|avg/i);
     } finally {
       rendered.renderer.destroy();
       store.disposeSignals();
@@ -1002,10 +819,9 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     const frame = rendered.captureCharFrame();
     assert.equal(frame.match(/Token Pulse details/g)?.length, 1);
     if (width === 110) {
-      assert.match(frame, /Generation avg TPS\s+~30 tok\/s/);
-      assert.match(frame, /Response throughput\s+30 tok\/s/);
-      assert.match(frame, /120\/120 generated tokens · 1\/2 calls/);
-      assert.match(frame, /may include tool waits/);
+      assert.match(frame, /133/);
+      assert.match(frame, /Model calls/);
+      assert.doesNotMatch(frame, /tok\/s|TPS|TTFT|throughput|peak/i);
     }
     assert.match(frame, /esc \/ ctrl\+c to close/);
     assert.ok(content!.y + content!.height <= height - 1, `${width}x${height}: content exceeds host-visible budget`);
@@ -1027,16 +843,12 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
     scroll.scrollTo(scroll.scrollHeight);
     await rendered.renderOnce();
     const bottom = rendered.captureCharFrame();
-    assert.match(bottom, /model\./);
+    assert.match(bottom, /Estimated cost/);
     assert.match(bottom, /Token Pulse details/);
     assert.ok(scroll.scrollTop > 0);
     assert.equal(children[0].y, titleY);
     assert.equal(children.at(-1)!.y, closeHintY);
-    if (width === 110) {
-      assert.match(bottom.replace(/[█▀▄]/g, ""), /not an average of call\s+speeds/);
-      assert.match(bottom, /~ means a host-observed estimate, not provider-internal speed/);
-      assert.match(bottom, /byte-based windowed event arrivals, not token generation inside the model\./);
-    }
+    assert.doesNotMatch(bottom, /tok\/s|TPS|TTFT|throughput|peak/i);
     assert.match(bottom, /esc \/ ctrl\+c to close/);
     if (width === 110) {
       rendered.resize(80, 24);
@@ -1052,7 +864,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
       assert.equal(content!.height, 16);
       scroll.scrollTo(scroll.scrollHeight);
       await rendered.renderOnce();
-      assert.match(rendered.captureCharFrame(), /model\./);
+      assert.match(rendered.captureCharFrame(), /Estimated cost/);
     }
   } finally {
     rendered.renderer.destroy();
@@ -1112,7 +924,7 @@ test("native session-tree selector switches direct details, retains ledger-only 
       assert.ok(footer.y + footer.height <= height - 1);
       assert.match(rendered.captureCharFrame(), /Token Pulse details/);
       assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
-      if (width === 110) assert.match(rendered.captureCharFrame(), /Generation avg TPS\s+~50 tok\/s/);
+      if (width === 110) assert.match(rendered.captureCharFrame(), /113/);
       rendered.mockInput.pressArrow("down");
       await rendered.renderOnce();
       assert.equal(selector.getSelectedOption()?.value, "child");
@@ -1130,16 +942,12 @@ test("native session-tree selector switches direct details, retains ledger-only 
         assert.equal(footer.y, footerY);
         assert.equal(children[0].y, titleY);
       }
-      assert.match(selectedFrames, /Generation avg TPS\s+~150 tok\/s/);
-      assert.match(selectedFrames, /Response throughput\s+200 tok\/s/);
       assert.match(selectedFrames, /known-child-model/);
-      assert.match(selectedFrames, /222ms/);
-      assert.match(selectedFrames, /~150 tok\/s \(generation\)/);
       assert.match(selectedFrames, /INCLUDING SUBAGENTS/);
       assert.match(selectedFrames, /730/);
-      assert.match(selectedFrames.replace(/[█▀▄]/g, ""), /not\s+wall-\s*clock/);
+      assert.doesNotMatch(selectedFrames, /tok\/s|TPS|TTFT|throughput|peak|222ms/i);
       scroll.scrollTo(scroll.scrollHeight); await rendered.renderOnce();
-      assert.match(rendered.captureCharFrame(), /model\./);
+      assert.match(rendered.captureCharFrame(), /Estimated cost/);
       assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
       const next = fixed.flatMap((node) => [node, ...node.getChildren()]).find((node) => node instanceof TextRenderable && node.plainText === "[next]")!;
       await rendered.mockMouse.click(next.x, next.y);
@@ -1163,59 +971,4 @@ test("native session-tree selector switches direct details, retains ledger-only 
   }
 });
 
-test("native prompt renders WARMUP, LIVE and a host-observed tool WAIT", async () => {
-  const ui = (await uiPromise)!;
-  const now = Date.now();
-  const store = ui.createRuntimeStore(10, now - 1000);
-  const api = host(80, 8);
-  ui.handleMessageUpdated(store, api, { info: { id: "m", sessionID: "root", role: "assistant", time: { created: now - 1000 } } }, { type: "message.updated", timestamp: now - 1000 }, 4, now - 1000);
-  const active = store.active.get("m")!;
-  active.selectedSource = "legacy";
-  store.active.set("m", active);
-  const partState = api.state as unknown as { part: () => unknown[] };
-  partState.part = () => [];
-  const prompt = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.session_prompt_right!;
-  let panel!: BoxRenderable;
-  const rendered = await testRender(() => {
-    api.renderer = useRenderer();
-    panel = new BoxRenderable(api.renderer, { width: 20, flexDirection: "column", flexShrink: 0 });
-    panel.add(prompt({ theme: api.theme }, { session_id: "root" }) as unknown as Renderable);
-    return panel as unknown as JSX.Element;
-  }, { width: 80, height: 20 });
-  try {
-    await rendered.renderOnce();
-    await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /WAITING --/);
-    assert.match(rendered.captureCharFrame(), /gen --/);
-    assert.doesNotMatch(rendered.captureCharFrame(), /gen ~0/);
-    reportFrame("prompt waiting content 20", rendered.captureCharFrame());
-    active.legacy.hasData = true;
-    active.legacy.samples = [{ timestamp: now - 1000, tokens: 10 }];
-    store.bump(); await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /WARMUP --/);
-    assert.doesNotMatch(rendered.captureCharFrame(), /LIVE ~0/);
-    active.legacy.samples.push({ timestamp: now, tokens: 20 });
-    store.bump();
-    await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /LIVE ~\d+ tok\/s/);
-    for (const width of [20, 24, 28, 32]) {
-      panel.width = width;
-      await rendered.renderOnce(); await rendered.renderOnce();
-      const frame = rendered.captureCharFrame();
-      const visible = frame.split("\n").map((line) => line.slice(0, width).trim()).join("\n");
-      assert.doesNotMatch(visible, /\.\.\.|…/);
-      for (const field of [/LIVE ~\d+ tok\/s/, /gen ~30/, /ttft --/, /elapsed 1s/, /total 0/]) assert.match(visible, field);
-      assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), "LIVE cannot spill outside its slot");
-      reportFrame(`prompt LIVE ${width}`, frame);
-    }
-    partState.part = () => [{ type: "tool", state: { status: "running", time: { start: now } } }];
-    store.bump();
-    await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /WAIT TOOL --/);
-    reportFrame("prompt tool waiting 32", rendered.captureCharFrame());
-  } finally {
-    rendered.renderer.destroy();
-    store.disposeSignals();
-  }
-});
 }
