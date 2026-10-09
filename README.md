@@ -40,7 +40,7 @@ absolute path with your checkout.
     [
       "file:///absolute/path/to/tokpulse/dist/server.js",
       {
-        "historyPath": ".opencode/oc-tps/history.jsonl",
+        "historyPath": ".tokpulse/history.jsonl",
         "maxRecords": 1000
       }
     ]
@@ -56,7 +56,7 @@ absolute path with your checkout.
     [
       "file:///absolute/path/to/tokpulse/dist/tui.js",
       {
-        "historyPath": ".opencode/oc-tps/history.jsonl",
+        "historyPath": ".tokpulse/history.jsonl",
         "maxRecords": 1000
       }
     ]
@@ -122,18 +122,38 @@ remain available. Keep this setting inside the plugin options, not the top-level
 Default history file, relative to the OpenCode worktree:
 
 ```text
-.opencode/oc-tps/history.jsonl
+.tokpulse/history.jsonl
 ```
 
-Activity timing is stored beside it as `runs.jsonl`. If `historyPath` is
-overridden, use the same path in both configs. History is JSONL, one record
-per completed response, kept to the most recent **1,000 records** by default.
+Activity timing and cumulative totals are stored beside it as `runs.jsonl` and
+`totals.json`. If `historyPath` is overridden, use the same path in both configs.
+History is JSONL, one record per completed response, kept to the most recent
+**1,000 records** by default.
+
+On startup with the default path, Token Pulse copies the old `history.jsonl`,
+`runs.jsonl`, and `totals.json` from `.opencode/oc-tps/` into `.tokpulse/`, keeping
+the originals and never overwriting existing destination data. Custom paths are
+not automatically migrated. If your configs explicitly use the old path, update
+`historyPath` in both the server and TUI plugin options, then restart OpenCode.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `historyPath` | `.opencode/oc-tps/history.jsonl` | Relative path under the worktree, or an absolute path. |
+| `historyPath` | `.tokpulse/history.jsonl` | Relative path under the worktree, or an absolute path. |
 | `runsPath` | same directory as `historyPath`, file `runs.jsonl` | Activity ledger path. |
 | `maxRecords` | `1000` | Number of response records to keep. |
+
+For Git repositories, keep project-local ledgers out of version control. You can
+add this reusable rule to your global `AGENTS.md`:
+
+```text
+In Git repositories, add the project's .tokpulse/ directory to .gitignore.
+```
+
+Add this directory line to the project's `.gitignore`:
+
+```gitignore
+.tokpulse/
+```
 
 ## Development
 

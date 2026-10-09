@@ -50,6 +50,7 @@ import {
 } from "./storage.js";
 import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
+import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import type { TotalsRollup } from "./totals-aggregate.js";
 import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "./totals-storage.js";
@@ -59,7 +60,6 @@ import type {
   TotalsLedger,
 } from "./totals-storage.js";
 
-const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
 const COMMAND_NAME = "oc-tps.history";
@@ -3299,7 +3299,7 @@ export function tokenPulseBindings(options: TuiOptions) {
   return keys.gather("token-pulse", [COMMAND_NAME, DETAILS_COMMAND_NAME]);
 }
 
-function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefined): string {
+export function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefined): string {
   const base = api.state.path.worktree
     && api.state.path.worktree !== "/"
     ? api.state.path.worktree

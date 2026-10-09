@@ -38,7 +38,7 @@ bun run build
     [
       "file:///absolute/path/to/tokpulse/dist/server.js",
       {
-        "historyPath": ".opencode/oc-tps/history.jsonl",
+        "historyPath": ".tokpulse/history.jsonl",
         "maxRecords": 1000
       }
     ]
@@ -54,7 +54,7 @@ bun run build
     [
       "file:///absolute/path/to/tokpulse/dist/tui.js",
       {
-        "historyPath": ".opencode/oc-tps/history.jsonl",
+        "historyPath": ".tokpulse/history.jsonl",
         "maxRecords": 1000
       }
     ]
@@ -114,18 +114,36 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 默认历史文件相对于 OpenCode worktree：
 
 ```text
-.opencode/oc-tps/history.jsonl
+.tokpulse/history.jsonl
 ```
 
-活动时间记在同目录的 `runs.jsonl`。如果覆盖 `historyPath`，server 和 TUI
-要用同一个路径。历史是 JSONL，每条完成的响应对应一条记录，默认保留最近
-**1000 条**。
+活动时间和累计总量分别记在同目录的 `runs.jsonl` 和 `totals.json`。如果覆盖
+`historyPath`，server 和 TUI 要用同一个路径。历史是 JSONL，每条完成的响应对应
+一条记录，默认保留最近 **1000 条**。
+
+使用默认路径启动时，Token Pulse 会将 `.opencode/oc-tps/` 中的旧 `history.jsonl`、
+`runs.jsonl` 和 `totals.json` 复制到 `.tokpulse/`，保留原文件，且不覆盖目标位置
+已有的数据。自定义路径不会自动迁移。如果配置显式使用旧路径，请同时修改 server
+和 TUI 插件选项中的 `historyPath`，然后重启 OpenCode。
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `historyPath` | `.opencode/oc-tps/history.jsonl` | worktree 下的相对路径，也可以是绝对路径。 |
+| `historyPath` | `.tokpulse/history.jsonl` | worktree 下的相对路径，也可以是绝对路径。 |
 | `runsPath` | 与 `historyPath` 同目录的 `runs.jsonl` | 活动账本路径。 |
 | `maxRecords` | `1000` | 保留的响应记录数。 |
+
+对于 Git 仓库，建议将项目本地账本排除在版本控制之外。可以在全局 `AGENTS.md`
+中加入以下可复用规则：
+
+```text
+对于 Git 仓库，将项目下的 .tokpulse/ 目录加入 .gitignore。
+```
+
+在项目的 `.gitignore` 中加入这一目录行：
+
+```gitignore
+.tokpulse/
+```
 
 ## 开发
 

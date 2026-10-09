@@ -7,8 +7,8 @@ import { createHistoryStorage, readHistoryFile } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
 import { normalizeAgentName } from "./agent-names.js";
+import { DEFAULT_HISTORY_PATH, migrateDefaultLedgers } from "./storage-paths.js";
 import { createScopeRegistry, coerceScopeEvidence } from "./scope.js";
-const DEFAULT_HISTORY_PATH = ".opencode/oc-tps/history.jsonl";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
 const PARENT_LOOKUP_TIMEOUT_MS = 200;
 const QUERY_CONCURRENCY = 4;
@@ -349,6 +349,11 @@ export const server = async (input, pluginOptions) => {
     writtenFacts: new Set(),
     rawTimestamps: new Map()
   };
+  await migrateDefaultLedgers(baseDirectory, {
+    historyPath,
+    totalsPath: totals.path,
+    runsPath: activity.ledger.path
+  });
   let eventQueue = Promise.all([initializeActivityRuntime(activity).catch(error => {
     warn("activity ledger initialization failed", error);
   }), initializeTotals(storage, totals, historyPath).catch(error => {
