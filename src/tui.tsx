@@ -7,7 +7,9 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import type { MouseEvent, ScrollBoxRenderable, SelectRenderable } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
-import { createBindingLookup, type BindingConfig, type BindingValue } from "@opencode-ai/plugin/tui";
+import type { BindingConfig, BindingValue } from "@opencode-ai/plugin/tui";
+import { Plugin } from "@opencode/plugin/tui";
+import { createV2TuiBridge } from "./tui-v2.js";
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -2152,16 +2154,24 @@ function rootSessionIDFor(
   sessionID: string,
   info?: ObjectRecord,
 ): string {
+  const previous = store.sourceScopes.revision;
   try {
-    const cached = api.state.session.get(sessionID);
-    if (cached) {
-      const previous = store.sourceScopes.revision;
-      store.sourceScopes.observeSessionMetadata(sessionID, cached);
-      if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
+    // A V2 TUI may attach after parent creation events. Cached ancestor
+    // metadata is still authoritative Magic Context evidence; no network read.
+    const visited = new Set<string>();
+    let id: string | undefined = sessionID;
+    while (id && !visited.has(id)) {
+      visited.add(id);
+      const cached = api.state.session.get(id);
+      if (cached) store.sourceScopes.observeSessionMetadata(id, cached);
+      const parent: string | undefined = cached?.parentID ?? store.sessionParents.get(id);
+      if (parent) rememberSessionParent(store, id, parent);
+      id = parent;
     }
   } catch { /* SDK state may not be ready; unknown is not exclusion evidence. */ }
   const parent = parentSessionID(api, sessionID, info, store);
   if (parent) rememberSessionParent(store, sessionID, parent);
+  if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
   return rootSessionID;
@@ -2719,7 +2729,7 @@ export function handleMessageUpdated(
   const previousUpdate = coerceCompletionUpdate((previous as MeasuredHistoryRecord | undefined)?.update);
   if (snapshot && snapshotUpdate && (!previousUpdate || isNewerCompletionUpdate(snapshotUpdate, previousUpdate))) prior = snapshot;
   const priorUpdate = coerceCompletionUpdate((prior as MeasuredHistoryRecord | undefined)?.update);
-  const fingerprint = createHash("sha256").update(serializeCompletionFact(info)).digest("hex");
+  const fingerprint = createHash("sha256").update(serializeCompletionFact(properties.v2Completion ?? info)).digest("hex");
   const revision = readNumber(event.revision ?? properties.revision);
   const update: CompletionUpdate = { source: "live", instanceID: observations.instanceID, sequence: observations.metadata.nextSequence++, receivedAt,
     ...(revision !== undefined ? { revision } : {}), fingerprint,
@@ -3275,7 +3285,7 @@ function isKeybindValue(value: unknown): value is BindingValue {
   const item = asRecord(value);
   if (!item) return false;
   if (typeof item.name === "string") {
-    return ["ctrl", "shift", "meta", "super", "hyper"].every((flag) => item[flag] === undefined || typeof item[flag] === "boolean");
+    return ["ctrl", "shift", "meta", "alt", "option", "super", "hyper"].every((flag) => item[flag] === undefined || typeof item[flag] === "boolean");
   }
   return typeof item.key === "string" || (isRecord(item.key) && typeof item.key.name === "string" && isKeybindValue(item.key));
 }
@@ -3291,12 +3301,22 @@ function resolvePluginKeybinds(value: unknown): BindingConfig | undefined {
 }
 
 export function tokenPulseBindings(options: TuiOptions) {
-  const keys = createBindingLookup({
+  const config: BindingConfig = {
     [COMMAND_NAME]: "ctrl+shift+t",
     [DETAILS_COMMAND_NAME]: "ctrl+shift+y",
     ...options.keybinds,
+  };
+  // These two commands only need native keys/Binding objects, not V1's runtime
+  // keymap package (which the V2 host no longer resolves).
+  return [COMMAND_NAME, DETAILS_COMMAND_NAME].flatMap((cmd) => {
+    const value = config[cmd];
+    if (value === false || value === "none") return [];
+    const items = Array.isArray(value) ? value : [value];
+    return items.filter((item) => item !== "none" && item !== undefined).map((item) => {
+      const binding = asRecord(item);
+      return (binding && "key" in binding ? { ...binding, cmd } : { key: item, cmd }) as NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["bindings"]>[number];
+    });
   });
-  return keys.gather("token-pulse", [COMMAND_NAME, DETAILS_COMMAND_NAME]);
 }
 
 export function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | undefined): string {
@@ -4374,6 +4394,7 @@ function Header(props: { theme: TuiPluginApi["theme"]; sessionID?: string }): JS
   return (
     <box
       height={2}
+      flexShrink={0}
       paddingX={1}
       flexDirection="column"
       backgroundColor={props.theme.current.backgroundPanel}
@@ -4412,10 +4433,10 @@ function SummaryBlock(props: {
     ];
   });
   return (
-    <box paddingX={1} flexDirection="column" backgroundColor={props.theme.current.background}>
-      <text fg={props.theme.current.secondary}>totals</text>
+    <box paddingX={1} flexShrink={0} flexDirection="column" backgroundColor={props.theme.current.background}>
+      <text flexShrink={0} fg={props.theme.current.secondary}>totals</text>
       {lines().map((line) => (
-        <text fg={props.theme.current.text} wrapMode="word">{line}</text>
+        <text flexShrink={0} fg={props.theme.current.text} wrapMode="word">{line}</text>
       ))}
     </box>
   );
@@ -4435,13 +4456,14 @@ function HistoryView(props: {
     <box flexDirection="column" flexGrow={1} backgroundColor={props.api.theme.current.background}>
       <Header theme={props.api.theme} sessionID={props.sessionID} />
       <SummaryBlock theme={props.api.theme} store={props.store} sessionID={props.sessionID} />
-      <box height={1} paddingX={1} backgroundColor={props.api.theme.current.backgroundElement}>
+      <box height={1} flexShrink={0} paddingX={1} backgroundColor={props.api.theme.current.backgroundElement}>
         <text fg={props.api.theme.current.textMuted} truncate wrapMode="none">
           TIME     SESSION      MODEL            OUT/REAS     COST
         </text>
       </box>
       <scrollbox
         flexGrow={1}
+        minHeight={0}
         flexDirection="column"
         paddingX={1}
         stickyScroll
@@ -4758,7 +4780,7 @@ function watchLedgerPaths(paths: readonly { path: string; changed: () => void }[
   };
 }
 
-const tui: TuiPlugin = async (api, rawOptions) => {
+const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<void> => {
   const options = resolveOptions(rawOptions);
   if (!options.enabled) return;
 
@@ -5042,8 +5064,18 @@ const tui: TuiPlugin = async (api, rawOptions) => {
 };
 
 const plugin = {
-  id: "oc-tps",
-  tui,
+  ...Plugin.define({
+    id: "oc-tps",
+    async setup(context) {
+      const options = resolveOptions(context.options);
+      if (!options.enabled) return;
+      const bridge = createV2TuiBridge(context, tokenPulseBindings(options));
+      try { await initializeTui(bridge.api, context.options); }
+      catch (error) { await bridge.dispose(); throw error; }
+      return () => bridge.dispose();
+    },
+  }),
+  tui: initializeTui as TuiPlugin,
 };
 
 export default plugin;

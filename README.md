@@ -6,12 +6,13 @@ Token Pulse is an OpenCode plugin for session totals, cache, and task time.
 It ships two independent entry points: the server records completed usage and
 activity, and the TUI shows those totals.
 
-It requires **OpenCode 1.18 or later**.
+Requires **OpenCode V2, 2.0.27 or later**.
 
 ## Features
 
 - Session totals in the sidebar Token Pulse block, including input, output,
   reasoning, cache read/write, and cost, with recursive child-agent sessions.
+  The block sits at the end of the sidebar's scrollable list, not in a fixed footer.
 - Persistent task time across turns and OpenCode restarts.
 - History view via `/tps` or `Ctrl+Shift+T`.
 - Session details via `/tps-details`, **Token Pulse details** in the command
@@ -20,56 +21,41 @@ It requires **OpenCode 1.18 or later**.
 ## Install
 
 ```sh
-bun install
+bun install --frozen-lockfile
 bun run build
 ```
 
-The build writes `dist/server.js` and `dist/tui.js`. Configure OpenCode against
-those files, not the TypeScript sources.
+The build writes `dist/server.js` and `dist/tui.js`.
+Configure V2 against the built `dist` directory.
 
 ## OpenCode configuration
 
-Enable both entries and keep the history settings the same. Replace the
-absolute path with your checkout.
+### OpenCode V2
 
-`opencode.json` (server):
+Add the built `dist` directory to `opencode.json(c)`. OpenCode loads the server
+entry and its `./tui` entry automatically. Replace the absolute path with your
+checkout.
 
 ```json
 {
-  "plugin": [
-    [
-      "file:///absolute/path/to/tokpulse/dist/server.js",
-      {
+  "plugins": [
+    {
+      "package": "/absolute/path/to/tokpulse/dist",
+      "options": {
         "historyPath": ".tokpulse/history.jsonl",
         "maxRecords": 1000
       }
-    ]
+    }
   ]
 }
 ```
 
-`tui.json` (TUI):
-
-```json
-{
-  "plugin": [
-    [
-      "file:///absolute/path/to/tokpulse/dist/tui.js",
-      {
-        "historyPath": ".tokpulse/history.jsonl",
-        "maxRecords": 1000
-      }
-    ]
-  ]
-}
-```
+For a published package version with V2 support, use `@komeijireimu/tokpulse` as
+the `package` value. The package's TUI loads automatically; adding it again to
+`cli.json` would enable a duplicate entry.
 
 The server keeps recording even if the TUI is not running. The TUI reads the
 same JSONL files for completed usage and activity.
-
-For the published npm package, use `@komeijireimu/tokpulse/server` in
-`opencode.json` and `@komeijireimu/tokpulse/tui` in `tui.json` in place of the
-file URLs above.
 
 ## Session totals and task time
 
@@ -94,20 +80,19 @@ its known descendant agents. Select an agent to inspect its own usage, cache, an
 task time; a separate summary covers the entire tree. Press `Esc` or `Ctrl+C` to close.
 `/tps` and `Ctrl+Shift+T` open history.
 
-Customize the details shortcut in the TUI plugin's tuple options:
+Customize the details shortcut in the package's plugin options:
 
 ```json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": [
-    [
-      "@komeijireimu/tokpulse/tui",
-      {
+  "plugins": [
+    {
+      "package": "/absolute/path/to/tokpulse/dist",
+      "options": {
         "keybinds": {
           "oc-tps.details": "ctrl+shift+y,<leader>y"
         }
       }
-    ]
+    }
   ]
 }
 ```
@@ -119,14 +104,14 @@ remain available. Keep this setting inside the plugin options, not the top-level
 
 ## History and options
 
-Default history file, relative to the OpenCode worktree:
+Default history file, relative to the current project working directory:
 
 ```text
 .tokpulse/history.jsonl
 ```
 
 Activity timing and cumulative totals are stored beside it as `runs.jsonl` and
-`totals.json`. If `historyPath` is overridden, use the same path in both configs.
+`totals.json`. Separate server and TUI entries must use the same `historyPath`.
 History is JSONL, one record per completed response, kept to the most recent
 **1,000 records** by default.
 
@@ -138,7 +123,7 @@ not automatically migrated. If your configs explicitly use the old path, update
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `historyPath` | `.tokpulse/history.jsonl` | Relative path under the worktree, or an absolute path. |
+| `historyPath` | `.tokpulse/history.jsonl` | Relative path under the project working directory, or an absolute path. |
 | `runsPath` | same directory as `historyPath`, file `runs.jsonl` | Activity ledger path. |
 | `maxRecords` | `1000` | Number of response records to keep. |
 

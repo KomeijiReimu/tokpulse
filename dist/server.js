@@ -9,6 +9,7 @@ import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
 import { normalizeAgentName } from "./agent-names.js";
 import { DEFAULT_HISTORY_PATH, migrateDefaultLedgers } from "./storage-paths.js";
 import { createScopeRegistry, coerceScopeEvidence } from "./scope.js";
+import { createV2EventAdapter, readV2Idle } from "./v2-server.js";
 const ACTIVITY_EVENT_NAMESPACE = "oc-tps";
 const PARENT_LOOKUP_TIMEOUT_MS = 200;
 const QUERY_CONCURRENCY = 4;
@@ -106,18 +107,36 @@ async function retryPendingPersistence(source, storage, totals, sessionID) {
 function scheduleIdleReconciliation(input, source, activity, active, sessionID, messageID, info, epoch) {
   const sessionClient = input.client?.session;
   const status = sessionClient?.status;
+  const v2Idle = input.readV2Idle;
   // A tool-call/next-loop completion is never a final-answer candidate.
-  if (typeof status !== "function" || !["stop", "end_turn"].includes(info.finish) || source.reconciled.has(messageID) || !eligibleSession(source, sessionID)) return;
+  if (typeof status !== "function" && typeof v2Idle !== "function" || !["stop", "end_turn"].includes(info.finish) || source.reconciled.has(messageID) || !eligibleSession(source, sessionID)) return;
   // A status result closes only the queried participant. Children keep their
   // own activity intervals; they never suppress an authoritative parent idle.
   const activeOwn = () => [...active.values()].some(state => state.sessionID === sessionID) || [...source.tools.values()].some(tool => tool.pending && tool.sessionID === sessionID);
-  const fresh = () => (source.epochs.get(sessionID) ?? 0) === epoch && source.responses.get(sessionID) === messageID && eligibleSession(source, sessionID) && !activeOwn();
+  const fresh = () => (source.epochs.get(sessionID) ?? 0) === epoch && !input.v2Signal?.aborted && source.responses.get(sessionID) === messageID && eligibleSession(source, sessionID) && !activeOwn();
   if (!fresh()) return;
   source.reconciled.add(messageID);
   runDeferred(source, async () => {
     if (!fresh()) return;
     const controller = new AbortController();
     try {
+      if (typeof v2Idle === "function") {
+        const terminal = await withTimeout(v2Idle(sessionID, controller.signal), PARENT_LOOKUP_TIMEOUT_MS);
+        // Older idle watermarks belong to a previous execution, not this step.
+        if (!terminal || controller.signal.aborted || !fresh() || terminal.timestamp < (info.time?.completed ?? Infinity)) return;
+        await source.enqueue(async () => {
+          if (!fresh()) return;
+          source.states.set(sessionID, terminal.state);
+          await captureActivityForEvent(activity, "session.status", {
+            sessionID,
+            status: {
+              type: terminal.state
+            }
+          }, {}, terminal.timestamp);
+          await source.retryPersistence(sessionID);
+        });
+        return;
+      }
       const directory = typeof input.directory === "string" && input.directory.length ? input.directory : undefined;
       // One deadline covers status and (only for a missing SID) fresh existence
       // proof. No polling, cached existence, or second independent 200ms wait.
@@ -272,7 +291,7 @@ function recordResponseLifecycle(active, type, properties, event, receivedAt) {
     runtime.observedSince = Math.max(runtime.observedSince, receivedAt);
     for (const state of active.values()) taintResponse(active, state, "transport-disruption");
   }
-  const failure = status === "retry" || type.startsWith("session.next.") && (type.endsWith(".retried") || type.endsWith(".failed")) || type === "session.error" || type.includes("provider.error") || type.includes("provider-error") || eventInfo(properties, event)?.error !== undefined;
+  const failure = status === "retry" || type === "session.step.failed" || type.startsWith("session.next.") && (type.endsWith(".retried") || type.endsWith(".failed")) || type === "session.error" || type.includes("provider.error") || type.includes("provider-error") || eventInfo(properties, event)?.error !== undefined;
   if (!failure) return;
   const sessionID = readSessionIDFromEvent(type, properties, event);
   const current = sessionID ? runtime.current.get(sessionID) : undefined;
@@ -328,6 +347,7 @@ export function recordPartMetadata(active, properties, now, event = {}) {
   }, signal);
 }
 export const server = async (input, pluginOptions) => {
+  const shutdownSignal = input.v2Signal;
   const options = resolveOptions(pluginOptions ?? input.options ?? input.config);
   const baseDirectory = resolveProjectDirectory(input);
   const historyPath = resolveHistoryPath(baseDirectory, options.historyPath);
@@ -393,14 +413,14 @@ export const server = async (input, pluginOptions) => {
     reconciled: new Set(),
     retryPersistence: sessionID => retryPendingPersistence(source, storage, totals, sessionID),
     enqueue: job => {
-      const next = eventQueue.then(job).catch(error => warn("reconciliation apply failed", error));
+      const next = eventQueue.then(() => shutdownSignal?.aborted ? undefined : job()).catch(error => warn("reconciliation apply failed", error));
       eventQueue = next;
       return next;
     },
     requestMetadata: (sessionID, prioritize = true) => {
       const sessionClient = input.client?.session;
       const get = sessionClient?.get;
-      if (typeof get !== "function" || source.scopes.isExcluded(sessionID) || source.outstanding.has(sessionID)) return;
+      if (shutdownSignal?.aborted || typeof get !== "function" || source.scopes.isExcluded(sessionID) || source.outstanding.has(sessionID)) return;
       const now = performance.now();
       if (now - (source.queried.get(sessionID) ?? -Infinity) < QUERY_RETRY_MS) return;
       source.queried.delete(sessionID);
@@ -409,6 +429,10 @@ export const server = async (input, pluginOptions) => {
       source.outstanding.add(sessionID);
       const generation = source.metadataGeneration.get(sessionID) ?? 0;
       runDeferred(source, async () => {
+        if (shutdownSignal?.aborted) {
+          source.outstanding.delete(sessionID);
+          return;
+        }
         const controller = new AbortController();
         try {
           // SDK v1's generated get(options) takes path.id. SDK v2's generated
@@ -425,7 +449,7 @@ export const server = async (input, pluginOptions) => {
             signal: controller.signal
           })), PARENT_LOOKUP_TIMEOUT_MS);
           const arrivedAt = Date.now();
-          if (!response || response.error) return;
+          if (shutdownSignal?.aborted || !response || response.error) return;
           const raw = asRecord(response.data) ?? asRecord(response);
           const session = asRecord(raw?.session) ?? raw;
           if (!session || session.id !== sessionID) return;
@@ -473,6 +497,7 @@ export const server = async (input, pluginOptions) => {
   // Establish the epoch when ingress is ready, not before asynchronous startup.
   responseRuntime(active).observedSince = Date.now();
   const event = payload => {
+    if (shutdownSignal?.aborted) return Promise.resolve();
     const rawEvent = payload?.event;
     const receivedAt = Date.now();
     const incoming = unwrapIncomingEvent(rawEvent);
@@ -500,6 +525,7 @@ export const server = async (input, pluginOptions) => {
     eventQueue = next;
     return next;
   };
+  input.registerV2Drain?.(() => eventQueue);
   return {
     event
   };
@@ -1179,7 +1205,7 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     return;
   }
   const priorUpdate = coerceCompletionUpdate(prior?.update);
-  const fingerprint = createHash("sha256").update(stableSerialize(info)).digest("hex");
+  const fingerprint = createHash("sha256").update(stableSerialize(properties.v2Completion ?? info)).digest("hex");
   const update = {
     source: "live",
     instanceID: activity.instanceID,
@@ -1225,12 +1251,18 @@ async function handleMessageUpdated(input, storage, totals, activity, active, co
     messageID,
     sessionID,
     parentSessionID,
-    model: modelName(info) ?? state?.model,
+    model: modelName(info) ?? state?.model ?? previous?.model,
     cost: numberOrUndefined(info.cost) ?? state?.cost ?? 0,
     tokens,
     samples: [],
     state,
-    info,
+    info: previous && !hasNumber(info.time?.created) && !hasNumber(info.time?.start) ? {
+      ...info,
+      time: {
+        ...info.time,
+        created: previous.time.start
+      }
+    } : info,
     completedAt: timestamp,
     quality
   });
@@ -1607,8 +1639,74 @@ function asRecord(value) {
 function isRecord(value) {
   return typeof value === "object" && value !== null;
 }
+
+/** V1 hooks are retained explicitly; V2 loads setup, never returned hooks. */
+export async function setup(ctx) {
+  const controller = new AbortController();
+  const adapter = createV2EventAdapter();
+  let drainBackend = () => Promise.resolve();
+  const input = {
+    directory: ctx.location.directory,
+    worktree: ctx.location.directory,
+    project: ctx.location.project,
+    v2Signal: controller.signal,
+    registerV2Drain: drain => {
+      drainBackend = drain;
+    },
+    client: {
+      session: {
+        get: async (parameters, options) => {
+          const signal = AbortSignal.any([controller.signal, options.signal]);
+          const session = await ctx.session.get(parameters, {
+            signal
+          });
+          signal.throwIfAborted();
+          if (session.id !== parameters.sessionID || session.location.directory !== ctx.location.directory) {
+            throw new Error("V2 metadata response belongs to another session or directory");
+          }
+          return session;
+        }
+      }
+    },
+    readV2Idle: (sessionID, signal) => readV2Idle(ctx, sessionID, AbortSignal.any([controller.signal, signal]))
+  };
+  const hooks = await server(input, ctx.options);
+  const subscription = (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({
+        signal: controller.signal
+      })) {
+        if (controller.signal.aborted) break;
+        // The public stream is server-wide. One location instance is the sole
+        // writer for its own events; never attribute another directory to ctx.
+        const data = asRecord(event.data);
+        const dataLocation = asRecord(data?.location);
+        const location = event.location ?? dataLocation;
+        if (event.location && event.location.directory !== ctx.location.directory || dataLocation && dataLocation.directory !== ctx.location.directory) continue;
+        // Location is optional in the public envelope, but unscoped session
+        // events from a server-wide subscription are not same-directory proof.
+        if (event.type.startsWith("session.") && !location) continue;
+        for (const adapted of adapter.events(event)) {
+          if (controller.signal.aborted) break;
+          await hooks.event?.({
+            event: adapted
+          });
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) warn("V2 event subscription failed", error);
+    }
+  })();
+  return async () => {
+    controller.abort();
+    await subscription;
+    await drainBackend();
+    adapter.clear();
+  };
+}
 const plugin = {
   id: "oc-tps",
-  server
+  server,
+  setup
 };
 export default plugin;

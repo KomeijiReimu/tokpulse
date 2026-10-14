@@ -30,7 +30,9 @@ const cacheRoot = process.env.TMPDIR || join(homedir(), ".cache", "tokpulse-test
 
 // Compile only this isolated UI module as the real build does, without writing
 // dist or changing how the non-rendering runtime tests import the source.
-type RenderedTui = typeof import("../src/tui.js") & { __testRuntimeStores: ReturnType<typeof import("../src/tui.js").createRuntimeStore>[]; __testActivityReads: number[] };
+type RenderedTui = typeof import("../src/tui.js") & { __testRuntimeStores: ReturnType<typeof import("../src/tui.js").createRuntimeStore>[]; __testActivityReads: number[];
+  __testSidebarList: (input: { render: () => JSX.Element; scrollRef: (node: ScrollBoxRenderable) => void }) => JSX.Element;
+  __testHistoryView: (input: { api: TuiPluginApi; store: ReturnType<typeof import("../src/tui.js").createRuntimeStore>; sessionID: string; options: ReturnType<typeof import("../src/tui.js").resolveOptions> }) => JSX.Element };
 async function loadRenderedTui(): Promise<RenderedTui> {
   const bunModule = "bun";
   const runtime = await import(bunModule);
@@ -48,7 +50,22 @@ async function loadRenderedTui(): Promise<RenderedTui> {
   // plugin's store. It does not replace event adapters, subscribers or hydration.
   const storeCreation = "const store = createRuntimeStore(options.maxRecords);";
   assert.equal(sourceText.split(storeCreation).length, 2);
-  const observedSource = `export const __testRuntimeStores = []; export const __testActivityReads = [];\n${sourceText.replace(storeCreation, `${storeCreation}\n__testRuntimeStores.push(store);`).replace("const activityEvents = await readActivityFile(path);", "const activityEvents = await readActivityFile(path); __testActivityReads.push(generation);")}`;
+  const observedSource = `export const __testRuntimeStores = []; export const __testActivityReads = [];\n${sourceText.replace(storeCreation, `${storeCreation}\n__testRuntimeStores.push(store);`).replace("const activityEvents = await readActivityFile(path);", "const activityEvents = await readActivityFile(path); __testActivityReads.push(generation);")}
+// Host layout evidence: OpenCode v2.0.27 packages/tui/src/routes/session/sidebar.tsx.
+// Sidebar content is inside scrollbox; the host footer is its following sibling.
+export function __testSidebarList(input) {
+  return <box width={40} height={14} flexDirection="column">
+    <text flexShrink={0}>SESSION TITLE</text>
+    <scrollbox flexGrow={1} minHeight={0} ref={input.scrollRef}>
+      <box flexShrink={0} gap={1}>
+        <text flexShrink={0} height={18}>{Array.from({ length: 18 }, (_, i) => 'Existing list row ' + i).join('\\n')}</text>
+        {input.render()}
+      </box>
+    </scrollbox>
+    <text flexShrink={0}>HOST FOOTER</text>
+  </box>;
+}
+export const __testHistoryView = HistoryView;`;
   const transformed = await transformAsync(observedSource, {
     filename: source, babelrc: false, configFile: false,
     presets: [[solid.default, { moduleName: "@opentui/solid", generate: "universal" }],
@@ -82,15 +99,15 @@ function host(width: number, height: number, child = false): TuiPluginApi {
 }
 
 if (!nativeChild) {
-  test("native OpenTUI sidebar and dialog render checks (isolated Solid host)", async () => {
+  test("native OpenTUI sidebar and dialog render checks (isolated Solid host)", { timeout: 30000 }, async () => {
     // The host preloads Solid's client runtime. Isolate it so these checks do
     // not change the Solid instance used by the pure runtime test suite.
     const output = await promisify(execFile)(process.execPath, [
       "test", "--preload", "@opentui/solid/preload", fileURLToPath(import.meta.url),
-    ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
+    ], { timeout: 25000, cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /14 pass/);
+    assert.match(output.stderr + output.stdout, /16 pass/);
   });
 }
 
@@ -994,6 +1011,151 @@ test("native session-tree selector switches direct details, retains ledger-only 
       assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
       assert.equal(store.records.length, 0);
     } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
+test("native complete history page keeps summary lines separate from its scrollable records", async () => {
+  const ui = await uiPromise!;
+  for (const [width, height] of [[140, 50], [140, 40], [80, 40], [80, 24], [40, 50], [40, 40]]) {
+    const store = ui.createRuntimeStore(100);
+    store.sessionParents.set("child", "root");
+    store.records = Array.from({ length: 36 }, (_, index) => ({
+      version: 1, messageID: `history-${index}`, sessionID: index % 2 ? "child" : "root",
+      ...(index % 2 ? { parentSessionID: "root" } : {}), model: "fixture-model",
+      tokens: { input: 12345, output: 6789, reasoning: 234, cacheRead: 90123, cacheWrite: 4567 },
+      cost: 0.125, time: { start: 1000 + index * 1000, completed: 1500 + index * 1000 }, samples: [],
+    }));
+    const api = host(width, height);
+    const rendered = await testRender(() => ui.__testHistoryView({ api, store, sessionID: "root", options: ui.resolveOptions({}) }), { width, height });
+    try {
+      await rendered.renderOnce(); await rendered.renderOnce();
+      const frame = rendered.captureCharFrame();
+      reportFrame(`full history ${width}x${height}`, frame);
+      const page = rendered.renderer.root.getChildren()[0];
+      const [header, summary, columns, records] = page.getChildren();
+      const summaryRows = summary.getChildren() as TextRenderable[];
+      if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`HISTORY GEOMETRY ${width}x${height}: ${JSON.stringify(summaryRows.map((row) => ({ text: row.plainText, y: row.y, height: row.height })))}`);
+      assert.equal(header.height, 2);
+      assert.equal(summaryRows.length, 15);
+      for (const [index, row] of summaryRows.entries()) {
+        assert.ok(row.height >= 1, `summary line has no drawable row: ${row.plainText}`);
+        if (index) assert.ok(row.y >= summaryRows[index - 1].y + summaryRows[index - 1].height,
+          `summary lines overlap: ${summaryRows[index - 1].plainText} / ${row.plainText}`);
+      }
+      assert.ok(summary.y >= header.y + header.height);
+      assert.ok(columns.y >= summary.y + summary.height);
+      assert.equal(columns.height, 1);
+      assert.ok(records instanceof ScrollBoxRenderable);
+      assert.ok(records.viewport.y >= columns.y + columns.height);
+      assert.ok(records.viewport.height > 0);
+      assert.ok(records.viewport.y + records.viewport.height <= height);
+      assert.match(frame, /Token history/); assert.match(frame, /Session only/);
+      assert.match(frame, /Including subagents/); assert.match(frame, /Cache hit rate/);
+      assert.match(frame, /00:00:36 child/);
+      if (width >= 80) assert.match(frame, /fixture-model/);
+      assert.doesNotMatch(frame, /tok\/s|TPS|TTFT|SeTotal|Cachehh/i);
+      const summaryBeforeScroll = summaryRows.map((row) => ({ text: row.plainText, y: row.y, height: row.height }));
+      records.scrollTo(records.scrollHeight); await rendered.renderOnce();
+      assert.deepEqual(summaryRows.map((row) => ({ text: row.plainText, y: row.y, height: row.height })), summaryBeforeScroll);
+      assert.ok(records.scrollTop > 0);
+      assert.match(rendered.captureCharFrame(), /00:00:13 root/);
+      if (width >= 80) assert.match(rendered.captureCharFrame(), /fixture-model/);
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
+test("V2 TUI scrollable sidebar, history and details preserve native layout and usage without speed fields", async () => {
+  const ui = await uiPromise!;
+  const directory = await mkdtemp(join(cacheRoot, "v2-tui-render-"));
+  const originalNow = Date.now;
+  let now = originalNow();
+  Date.now = () => now;
+  const color = RGBA.fromHex("#eeeeee");
+  let listener: (input: { details: any }) => void = () => {};
+  let sidebarContent: any;
+  let page: any;
+  let dialog: () => JSX.Element = () => null;
+  const layers: any[] = [];
+  const context = {
+    options: { maxRecords: 100 }, location: { directory }, app: { version: "2.0.27" },
+    renderer: { width: 120, height: 100 },
+    theme: { hue: { interactive: { 500: color }, accent: { 500: color } },
+      text: { base: color, muted: color, action: { secondary: { base: color } }, feedback: { info: { base: color } } },
+      background: { base: color, raised: { base: color, high: color } }, border: { base: color } },
+    data: { listen(callback: typeof listener) { listener = callback; return () => {}; }, session: {
+      get: (id: string) => ({ id, title: id === "child" ? "Review" : "Root", ...(id === "child" ? { parentID: "root" } : {}) }),
+    } },
+    keymap: { layer(factory: () => unknown) { layers.push(factory()); }, mode: { current: () => "base", push: () => () => {} } },
+    ui: { slot(claim: any) { sidebarContent = claim; return () => {}; },
+      router: { register(value: any) { page = value; return () => {}; }, current: () => ({ type: "session", sessionID: "root" }), navigate: () => {} },
+      dialog: { show(render: () => JSX.Element) { dialog = render; }, set: () => {}, clear: () => { dialog = () => null; } }, toast: { show: () => {} } },
+  };
+  let cleanup: (() => void | Promise<void>) | undefined;
+  const renders: Awaited<ReturnType<typeof testRender>>[] = [];
+  try {
+    cleanup = await ui.default.setup(context as any) as () => Promise<void>;
+    assert.equal(sidebarContent.append, "sidebar.content");
+    const store = ui.__testRuntimeStores.at(-1)!;
+    let seq = 0;
+    const send = (type: string, data: any, elapsed: number) => { now += elapsed; listener({ details: {
+      id: `evt_${++seq}`, created: now, type, data, durable: { aggregateID: data.sessionID, seq, version: 1 }, location: { directory },
+    } }); };
+    for (const [id, agent] of [["root", "build"], ["child", "review"]]) {
+      send("session.execution.started", { sessionID: id }, 1);
+      send("session.step.started", { sessionID: id, assistantMessageID: `msg_${id}`, agent,
+        model: { providerID: "fixture", id: "fixture-model" }, started: now + 1 }, 1);
+      send("session.step.ended", { sessionID: id, assistantMessageID: `msg_${id}`, finish: "stop", cost: 0.5,
+        tokens: { input: 12, output: 7, reasoning: 3, cache: { read: 9, write: 2 } } }, 1000);
+      send("session.execution.succeeded", { sessionID: id }, 1);
+    }
+    const noSpeed = (frame: string) => assert.doesNotMatch(frame, /tok\/s|TPS|TTFT|throughput|peak|WARMUP/i);
+    for (const width of [20, 40, 80]) {
+      store.pulseExpanded = false; store.bump();
+      const rendered = await testRender(() => sidebarContent.render({ sessionID: "root" }), { width, height: 100 });
+      renders.push(rendered);
+      await rendered.renderOnce(); await rendered.renderOnce();
+      const collapsed = rendered.captureCharFrame();
+      assert.match(collapsed, /\+ Token Pulse/); assert.match(collapsed, /66 total/);
+      assert.match(collapsed, /cache 39%/); assert.match(collapsed, /time 2s/); noSpeed(collapsed);
+      const header = rendered.renderer.root.getChildren()[0].getChildren()[0];
+      await rendered.mockMouse.click(header.x + 1, header.y); await rendered.renderOnce();
+      const expanded = rendered.captureCharFrame();
+      assert.match(expanded, /SESSION ONLY/); assert.match(expanded, /INCLUDING\s+SUBAGENTS/);
+      assert.match(expanded, /CHILD AGENTS/); assert.match(expanded, /review/); noSpeed(expanded);
+      reportFrame(`v2 sidebar content ${width}`, expanded);
+      rendered.renderer.destroy(); renders.pop();
+    }
+    store.pulseExpanded = false; store.bump();
+    let sidebarScroll!: ScrollBoxRenderable;
+    const list = await testRender(() => ui.__testSidebarList({ render: () => sidebarContent.render({ sessionID: "root" }),
+      scrollRef: (node) => { sidebarScroll = node; } }), { width: 40, height: 14 }); renders.push(list);
+    await list.renderOnce(); await list.renderOnce();
+    const descendants = (node: Renderable): Renderable[] => node.getChildren().flatMap((child) => [child, ...descendants(child)]);
+    const pulse = descendants(sidebarScroll.content).find((node) => node instanceof TextRenderable && node.plainText === "+ Token Pulse")!;
+    assert.ok(pulse, "Pulse is inside the sidebar scrollbox content, not the fixed footer");
+    const fixedFooter = descendants(list.renderer.root).find((node) => node instanceof TextRenderable && node.plainText === "HOST FOOTER")!;
+    const pulseY = pulse.y; const footerY = fixedFooter.y;
+    assert.doesNotMatch(list.captureCharFrame(), /Token Pulse/, "Pulse follows existing list rows below the viewport");
+    sidebarScroll.scrollTo(sidebarScroll.scrollHeight); await list.renderOnce();
+    assert.match(list.captureCharFrame(), /\+ Token Pulse/);
+    assert.ok(pulse.y < pulseY, "Pulse moves with the list when it scrolls");
+    assert.equal(fixedFooter.y, footerY, "Only the host's footer remains fixed");
+    noSpeed(list.captureCharFrame());
+    list.renderer.destroy(); renders.pop();
+    layers[0].commands.find((command: any) => command.id === "oc-tps.details").run();
+    const details = await testRender(dialog, { width: 120, height: 100 }); renders.push(details);
+    await details.renderOnce();
+    assert.match(details.captureCharFrame(), /Token Pulse details/);
+    assert.match(details.captureCharFrame(), /Estimated cost/); noSpeed(details.captureCharFrame());
+    details.renderer.destroy(); renders.pop();
+    const history = await testRender(() => page.render({ data: { sessionID: "root" } }), { width: 120, height: 40 }); renders.push(history);
+    await history.renderOnce();
+    assert.match(history.captureCharFrame(), /Token history/); assert.match(history.captureCharFrame(), /fixture-model/);
+    noSpeed(history.captureCharFrame());
+  } finally {
+    for (const rendered of renders) rendered.renderer.destroy();
+    await cleanup?.(); Date.now = originalNow;
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

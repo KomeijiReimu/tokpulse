@@ -5,12 +5,13 @@
 Token Pulse 是 OpenCode 的会话总量、缓存和任务时间插件。它提供两个彼此独立的
 入口：server 负责记录完成用量和活动时间，TUI 负责显示这些总量。
 
-需要 **OpenCode 1.18 或更高版本**。
+需要 **OpenCode V2，2.0.27 或更高版本**。
 
 ## 功能
 
 - 侧栏 Token Pulse 显示当前会话总量，包含 input、output、reasoning、
   cache read/write 和 cost，并递归计入子 agent。
+  插件位于侧栏可滚动列表的内部末尾，不占用列表外侧的固定底部。
 - 会话有效工作时间会跨多轮对话、跨 OpenCode 重启累计。
 - 用 `/tps` 或 `Ctrl+Shift+T` 打开历史视图。
 - 用 `/tps-details`、命令面板中的 **Token Pulse details** 或 `Ctrl+Shift+Y`
@@ -19,54 +20,39 @@ Token Pulse 是 OpenCode 的会话总量、缓存和任务时间插件。它提�
 ## 安装
 
 ```sh
-bun install
+bun install --frozen-lockfile
 bun run build
 ```
 
-构建会生成 `dist/server.js` 和 `dist/tui.js`。请把 OpenCode 配到这两个
-文件，不要指向 TypeScript 源码。
+构建会生成 `dist/server.js` 和 `dist/tui.js`。
+V2 请按下方配置加载构建后的 `dist` 目录。
 
 ## OpenCode 配置
 
-两个入口都要启用，并且历史配置保持一致。把绝对路径换成你的项目目录。
+### OpenCode V2
 
-`opencode.json`（server）：
+在 `opencode.json(c)` 中添加构建后的 `dist` 目录。OpenCode 会自动加载 server
+入口和包的 `./tui` 入口。把绝对路径换成你的项目目录。
 
 ```json
 {
-  "plugin": [
-    [
-      "file:///absolute/path/to/tokpulse/dist/server.js",
-      {
+  "plugins": [
+    {
+      "package": "/absolute/path/to/tokpulse/dist",
+      "options": {
         "historyPath": ".tokpulse/history.jsonl",
         "maxRecords": 1000
       }
-    ]
+    }
   ]
 }
 ```
 
-`tui.json`（TUI）：
-
-```json
-{
-  "plugin": [
-    [
-      "file:///absolute/path/to/tokpulse/dist/tui.js",
-      {
-        "historyPath": ".tokpulse/history.jsonl",
-        "maxRecords": 1000
-      }
-    ]
-  ]
-}
-```
+使用支持 V2 的已发布版本时，将 `package` 换成 `@komeijireimu/tokpulse`。
+包的 TUI 会自动加载，再将它加入 `cli.json` 会重复启用。
 
 即使 TUI 没开，server 也会继续记历史。TUI 读取同一套 JSONL 来显示已完成的
 用量和活动时间。
-
-使用已发布的 npm 包时，把上面的文件 URL 分别替换为：`opencode.json` 中的
-`@komeijireimu/tokpulse/server` 和 `tui.json` 中的 `@komeijireimu/tokpulse/tui`。
 
 ## 会话总量与任务时间
 
@@ -87,20 +73,19 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 查看其自身用量、缓存和任务时间，并查看整棵会话树的独立汇总。按 `Esc` 或 `Ctrl+C` 关闭。
 `/tps` 和 `Ctrl+Shift+T` 仍用于打开历史视图。
 
-在 `tui.json` 的插件配置选项中自定义详情快捷键：
+在包的插件配置选项中自定义详情快捷键：
 
 ```json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": [
-    [
-      "@komeijireimu/tokpulse/tui",
-      {
+  "plugins": [
+    {
+      "package": "/absolute/path/to/tokpulse/dist",
+      "options": {
         "keybinds": {
           "oc-tps.details": "ctrl+shift+y,<leader>y"
         }
       }
-    ]
+    }
   ]
 }
 ```
@@ -111,7 +96,7 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 
 ## 历史记录与配置项
 
-默认历史文件相对于 OpenCode worktree：
+默认历史文件相对于当前项目工作目录：
 
 ```text
 .tokpulse/history.jsonl
@@ -128,7 +113,7 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `historyPath` | `.tokpulse/history.jsonl` | worktree 下的相对路径，也可以是绝对路径。 |
+| `historyPath` | `.tokpulse/history.jsonl` | 项目工作目录下的相对路径，也可以是绝对路径。 |
 | `runsPath` | 与 `historyPath` 同目录的 `runs.jsonl` | 活动账本路径。 |
 | `maxRecords` | `1000` | 保留的响应记录数。 |
 

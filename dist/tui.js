@@ -14,7 +14,8 @@ import { watch, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
-import { createBindingLookup } from "@opencode-ai/plugin/tui";
+import { Plugin } from "@opencode/plugin/tui";
+import { createV2TuiBridge } from "./tui-v2.js";
 import { DEFAULT_BYTES_PER_TOKEN, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calibrateResponseSamples, bytesToTokens, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, timeToFirstToken } from "./core.js";
 import { replayActivity, resolveRootSessionID } from "./activity.js";
 import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
@@ -1443,16 +1444,24 @@ export function cacheSessionParentFromEvent(store, input) {
   return mapped || store.sourceScopes.revision !== before;
 }
 function rootSessionIDFor(store, api, sessionID, info) {
+  const previous = store.sourceScopes.revision;
   try {
-    const cached = api.state.session.get(sessionID);
-    if (cached) {
-      const previous = store.sourceScopes.revision;
-      store.sourceScopes.observeSessionMetadata(sessionID, cached);
-      if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
+    // A V2 TUI may attach after parent creation events. Cached ancestor
+    // metadata is still authoritative Magic Context evidence; no network read.
+    const visited = new Set();
+    let id = sessionID;
+    while (id && !visited.has(id)) {
+      visited.add(id);
+      const cached = api.state.session.get(id);
+      if (cached) store.sourceScopes.observeSessionMetadata(id, cached);
+      const parent = cached?.parentID ?? store.sessionParents.get(id);
+      if (parent) rememberSessionParent(store, id, parent);
+      id = parent;
     }
   } catch {/* SDK state may not be ready; unknown is not exclusion evidence. */}
   const parent = parentSessionID(api, sessionID, info, store);
   if (parent) rememberSessionParent(store, sessionID, parent);
+  if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
   return rootSessionID;
@@ -1845,7 +1854,7 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
   const previousUpdate = coerceCompletionUpdate(previous?.update);
   if (snapshot && snapshotUpdate && (!previousUpdate || isNewerCompletionUpdate(snapshotUpdate, previousUpdate))) prior = snapshot;
   const priorUpdate = coerceCompletionUpdate(prior?.update);
-  const fingerprint = createHash("sha256").update(serializeCompletionFact(info)).digest("hex");
+  const fingerprint = createHash("sha256").update(serializeCompletionFact(properties.v2Completion ?? info)).digest("hex");
   const revision = readNumber(event.revision ?? properties.revision);
   const update = {
     source: "live",
@@ -2264,7 +2273,7 @@ function isKeybindValue(value) {
   const item = asRecord(value);
   if (!item) return false;
   if (typeof item.name === "string") {
-    return ["ctrl", "shift", "meta", "super", "hyper"].every(flag => item[flag] === undefined || typeof item[flag] === "boolean");
+    return ["ctrl", "shift", "meta", "alt", "option", "super", "hyper"].every(flag => item[flag] === undefined || typeof item[flag] === "boolean");
   }
   return typeof item.key === "string" || isRecord(item.key) && typeof item.key.name === "string" && isKeybindValue(item.key);
 }
@@ -2278,12 +2287,28 @@ function resolvePluginKeybinds(value) {
   return result;
 }
 export function tokenPulseBindings(options) {
-  const keys = createBindingLookup({
+  const config = {
     [COMMAND_NAME]: "ctrl+shift+t",
     [DETAILS_COMMAND_NAME]: "ctrl+shift+y",
     ...options.keybinds
+  };
+  // These two commands only need native keys/Binding objects, not V1's runtime
+  // keymap package (which the V2 host no longer resolves).
+  return [COMMAND_NAME, DETAILS_COMMAND_NAME].flatMap(cmd => {
+    const value = config[cmd];
+    if (value === false || value === "none") return [];
+    const items = Array.isArray(value) ? value : [value];
+    return items.filter(item => item !== "none" && item !== undefined).map(item => {
+      const binding = asRecord(item);
+      return binding && "key" in binding ? {
+        ...binding,
+        cmd
+      } : {
+        key: item,
+        cmd
+      };
+    });
   });
-  return keys.gather("token-pulse", [COMMAND_NAME, DETAILS_COMMAND_NAME]);
 }
 export function resolveHistoryPath(api, configuredPath) {
   const base = api.state.path.worktree && api.state.path.worktree !== "/" ? api.state.path.worktree : api.state.path.directory;
@@ -3514,6 +3539,7 @@ function Header(props) {
     _$insertNode(_el$50, _el$51);
     _$insertNode(_el$50, _el$53);
     _$setProp(_el$50, "height", 2);
+    _$setProp(_el$50, "flexShrink", 0);
     _$setProp(_el$50, "paddingX", 1);
     _$setProp(_el$50, "flexDirection", "column");
     _$insertNode(_el$51, _$createTextNode(`Token history`));
@@ -3550,10 +3576,13 @@ function SummaryBlock(props) {
       _el$56 = _$createElement("text");
     _$insertNode(_el$55, _el$56);
     _$setProp(_el$55, "paddingX", 1);
+    _$setProp(_el$55, "flexShrink", 0);
     _$setProp(_el$55, "flexDirection", "column");
     _$insertNode(_el$56, _$createTextNode(`totals`));
+    _$setProp(_el$56, "flexShrink", 0);
     _$insert(_el$55, () => lines().map(line => (() => {
       var _el$58 = _$createElement("text");
+      _$setProp(_el$58, "flexShrink", 0);
       _$setProp(_el$58, "wrapMode", "word");
       _$insert(_el$58, line);
       _$effect(_$p => _$setProp(_el$58, "fg", props.theme.current.text, _$p));
@@ -3607,11 +3636,13 @@ function HistoryView(props) {
     }), _el$60);
     _$insertNode(_el$60, _el$61);
     _$setProp(_el$60, "height", 1);
+    _$setProp(_el$60, "flexShrink", 0);
     _$setProp(_el$60, "paddingX", 1);
     _$insertNode(_el$61, _$createTextNode(`TIME SESSION MODEL OUT/REAS COST`));
     _$setProp(_el$61, "truncate", true);
     _$setProp(_el$61, "wrapMode", "none");
     _$setProp(_el$63, "flexGrow", 1);
+    _$setProp(_el$63, "minHeight", 0);
     _$setProp(_el$63, "flexDirection", "column");
     _$setProp(_el$63, "paddingX", 1);
     _$setProp(_el$63, "stickyScroll", true);
@@ -4020,7 +4051,7 @@ function watchLedgerPaths(paths) {
     for (const dispose of disposers) dispose();
   };
 }
-const tui = async (api, rawOptions) => {
+const initializeTui = async (api, rawOptions) => {
   const options = resolveOptions(rawOptions);
   if (!options.enabled) return;
   const store = createRuntimeStore(options.maxRecords);
@@ -4283,7 +4314,21 @@ const tui = async (api, rawOptions) => {
   } while (!disposed && (historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration));
 };
 const plugin = {
-  id: "oc-tps",
-  tui
+  ...Plugin.define({
+    id: "oc-tps",
+    async setup(context) {
+      const options = resolveOptions(context.options);
+      if (!options.enabled) return;
+      const bridge = createV2TuiBridge(context, tokenPulseBindings(options));
+      try {
+        await initializeTui(bridge.api, context.options);
+      } catch (error) {
+        await bridge.dispose();
+        throw error;
+      }
+      return () => bridge.dispose();
+    }
+  }),
+  tui: initializeTui
 };
 export default plugin;
