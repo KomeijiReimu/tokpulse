@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { rename } from "node:fs/promises";
+import { inspectLedgerFile, readLedgerText, replaceLedgerText } from "./persistence-files.js";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { addTokenCounts, emptyTokenCounts, normalizeTokenCounts } from "./core.js";
 import { GENERATION_BASIS_VERSION, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, emptySpeedTotals, isNewerCompletionUpdate, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
@@ -32,52 +33,87 @@ export function resolveTotalsPath(input) {
   }
   throw new TypeError("Provide historyPath or an explicit totalsPath");
 }
-export function createTotalsStorage(pathOrOptions) {
+export function createTotalsStorage(pathOrOptions, options = {}) {
   const path = typeof pathOrOptions === "string" ? requireExplicitPath(pathOrOptions) : resolveTotalsPath(pathOrOptions);
+  const lease = typeof pathOrOptions === "string" ? options.lease : pathOrOptions.lease;
+  const owned = operation => () => {
+    lease?.assertOwned(path);
+    return operation();
+  };
   return {
     path,
-    apply: (record, options = {}) => enqueuePath(path, async () => {
+    apply: (record, options = {}) => enqueuePath(path, owned(async () => {
       const ledger = await loadLedger(path);
       applyRecord(ledger, record, options);
       return persistLedger(path, ledger);
-    }),
-    applyMany: (records, options = {}) => enqueuePath(path, async () => {
+    })),
+    applyMany: (records, options = {}) => enqueuePath(path, owned(async () => {
       if (!Array.isArray(records)) throw new TypeError("Totals apply records must be an array");
       const ledger = await loadLedger(path);
       for (const record of records) applyOpenRecord(ledger, record);
       freezeRetained(ledger, options.retainedMessageIDs);
       return persistLedger(path, ledger);
-    }),
-    seed: records => enqueuePath(path, () => seedLedger(path, records)),
-    backfillSpeed: records => enqueuePath(path, async () => {
+    })),
+    seed: records => enqueuePath(path, owned(() => seedLedger(path, records))),
+    backfillSpeed: records => enqueuePath(path, owned(async () => {
       if (!Array.isArray(records)) throw new TypeError("Totals backfill records must be an array");
       const ledger = await loadLedger(path);
       // Compatibility entry point only. Old history cannot reconstruct the new
       // observation basis, nor introduce guessed response timing.
       return cloneLedger(ledger);
-    }),
-    read: () => enqueuePath(path, () => loadLedger(path)),
-    setSessionScope: (sessionID, evidence) => enqueuePath(path, async () => {
+    })),
+    read: () => enqueuePath(path, owned(async () => cloneLedger(await loadLedger(path)))),
+    setSessionScope: (sessionID, evidence) => enqueuePath(path, owned(async () => {
       const proof = coerceScopeEvidence(evidence);
       if (!sessionID || !proof || proof.sourceScope === "magic-message") throw new TypeError("Invalid session scope");
       const ledger = await loadLedger(path);
-      ledger.sessionScopes ??= {};
-      ledger.sessionScopes[sessionID] = mergeScopeEvidence(ledger.sessionScopes[sessionID], proof);
+      const scopes = ledger.sessionScopes ??= Object.create(null);
+      scopes[sessionID] = mergeScopeEvidence(scopes[sessionID], proof);
       return persistLedger(path, ledger);
-    }),
-    setSessionAgent: (sessionID, agent) => enqueuePath(path, async () => {
+    })),
+    setSessionAgent: (sessionID, agent) => enqueuePath(path, owned(async () => {
       const ledger = await loadLedger(path);
       if (!rememberSessionAgent(ledger, sessionID, agent)) return cloneLedger(ledger);
       return persistLedger(path, ledger);
-    }),
-    excludeMessage: (messageID, scopeProof) => enqueuePath(path, async () => {
+    })),
+    setSessionMetadataMany: updates => enqueuePath(path, owned(async () => {
+      // Validate the entire batch before reading or changing the canonical
+      // ledger. No partial publication if a later entry is invalid.
+      const normalized = normalizeSessionMetadataUpdates(updates);
+      const ledger = (await readExistingLedger(path)) ?? emptyLedger();
+      // Fold legacy migration into this same atomic publication rather than
+      // letting loadLedger publish once and metadata publish a second time.
+      let changed = migrateGenerationBasis(ledger);
+      for (const update of normalized) {
+        if (update.scope) {
+          const scopes = ledger.sessionScopes ??= Object.create(null);
+          const previous = scopes[update.sessionID];
+          const next = mergeScopeEvidence(previous, update.scope);
+          if (!sameSessionScope(previous, next)) {
+            scopes[update.sessionID] = next;
+            changed = true;
+          }
+        }
+        if (update.agents?.length) {
+          const agents = ledger.sessionAgents ??= Object.create(null);
+          const previous = agents[update.sessionID];
+          const next = normalizeAgentNames([...(previous ?? []), ...update.agents]);
+          if (!previous || previous.length !== next.length || previous.some((name, index) => name !== next[index])) {
+            agents[update.sessionID] = next;
+            changed = true;
+          }
+        }
+      }
+      return changed ? persistLedger(path, ledger) : cloneLedger(ledger);
+    })),
+    excludeMessage: (messageID, scopeProof) => enqueuePath(path, owned(async () => {
       const proof = coerceScopeEvidence(scopeProof);
       if (!messageID || !proof || !["magic-message", "magic-session"].includes(proof.sourceScope)) throw new TypeError("Invalid message exclusion");
       const ledger = await loadLedger(path);
       excludeContribution(ledger, messageID, proof);
       return persistLedger(path, ledger);
-    }),
-    quarantine: () => enqueuePath(path, () => quarantineFile(path))
+    })),
+    quarantine: () => enqueuePath(path, owned(() => quarantineFile(path)))
   };
 }
 
@@ -107,19 +143,19 @@ async function seedLedger(path, records) {
 async function loadLedger(path) {
   let content;
   try {
-    content = await readFile(path, "utf8");
+    content = await readLedgerText(path);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return emptyLedger();
     throw error;
   }
   const ledger = parseTotalsJson(content);
-  if (migrateGenerationBasis(ledger)) return persistLedger(path, ledger);
-  return cloneLedger(ledger);
+  if (migrateGenerationBasis(ledger)) await persistLedger(path, ledger);
+  return ledger;
 }
 async function readExistingLedger(path) {
   let content;
   try {
-    content = await readFile(path, "utf8");
+    content = await readLedgerText(path);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return undefined;
     throw error;
@@ -131,6 +167,7 @@ async function persistLedger(path, ledger) {
   return cloneLedger(ledger);
 }
 async function quarantineFile(path) {
+  await inspectLedgerFile(path);
   const destination = join(dirname(path), `${basename(path)}.corrupt-${Date.now()}`);
   try {
     await rename(path, destination);
@@ -140,20 +177,7 @@ async function quarantineFile(path) {
   }
 }
 async function writeTotalsFile(path, ledger) {
-  const directory = dirname(path);
-  await mkdir(directory, {
-    recursive: true
-  });
-  const temporaryPath = join(directory, `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`);
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(cloneLedger(ledger))}\n`, "utf8");
-    await rename(temporaryPath, path);
-  } catch (error) {
-    await rm(temporaryPath, {
-      force: true
-    }).catch(() => undefined);
-    throw error;
-  }
+  await replaceLedgerText(path, `${JSON.stringify(cloneLedger(ledger))}\n`);
 }
 function parseTotalsJson(content) {
   return coerceLedger(JSON.parse(content));
@@ -169,11 +193,36 @@ function rememberSessionAgent(ledger, sessionID, agent) {
   const current = ledger.sessionAgents?.[sessionID];
   const next = normalizeAgentNames([...(current ?? []), name]);
   if (current && current.length === next.length && current.every((entry, index) => entry === next[index])) return false;
-  ledger.sessionAgents = {
-    ...ledger.sessionAgents,
-    [sessionID]: next
-  };
+  const agents = ledger.sessionAgents ??= Object.create(null);
+  agents[sessionID] = next;
   return true;
+}
+function normalizeSessionMetadataUpdates(updates) {
+  if (!Array.isArray(updates)) throw new TypeError("Session metadata updates must be an array");
+  return updates.map(update => {
+    if (!isPlainObject(update) || typeof update.sessionID !== "string" || !update.sessionID.length) {
+      throw new TypeError("Invalid session metadata identity");
+    }
+    const scope = update.scope === undefined ? undefined : coerceScopeEvidence(update.scope);
+    if (update.scope !== undefined && (!scope || scope.sourceScope === "magic-message")) {
+      throw new TypeError("Invalid session metadata scope");
+    }
+    if (update.agents !== undefined && (!Array.isArray(update.agents) || update.agents.some(agent => typeof agent !== "string" || !normalizeAgentName(agent)))) {
+      throw new TypeError("Invalid session metadata agents");
+    }
+    return {
+      sessionID: update.sessionID,
+      ...(scope ? {
+        scope
+      } : {}),
+      ...(update.agents === undefined ? {} : {
+        agents: normalizeAgentNames(update.agents)
+      })
+    };
+  });
+}
+function sameSessionScope(previous, next) {
+  return previous !== undefined && previous.sourceScope === next.sourceScope && previous.parentSessionID === next.parentSessionID && previous.reasons.length === next.reasons.length && previous.reasons.every((reason, index) => reason === next.reasons[index]);
 }
 
 /** Names are metadata. Magic exclusions stay on the scope path and are not reclassified here. */
@@ -237,8 +286,8 @@ function excludeContribution(ledger, messageID, proof) {
     // The existing per-message settled scheme is the replay guard; no separate
     // unbounded event cache, and no fabricated amount for legacy true markers.
     ledger.settled[messageID] = true;
-    ledger.messageScopes ??= {};
-    ledger.messageScopes[messageID] = mergeScopeEvidence(ledger.messageScopes[messageID], proof);
+    const scopes = ledger.messageScopes ??= Object.create(null);
+    scopes[messageID] = mergeScopeEvidence(scopes[messageID], proof);
   }
   delete ledger.open[messageID];
 }
@@ -278,13 +327,15 @@ export function getExcludedMessageIDs(ledger) {
 export function projectTotalsMeasurementScope(ledger, parents) {
   const cached = scopeProjectionCache.get(ledger);
   if (cached && cached.parents === parents) return cached.projected;
-  const sessions = {};
+  const sessions = Object.create(null);
   for (const [id, session] of Object.entries(ledger.sessions)) {
     if (!isSessionScopeExcluded(id, ledger.sessionScopes, parents)) sessions[id] = cloneSession(session);
   }
   const projected = {
     ...ledger,
-    sessions
+    sessions: {
+      ...sessions
+    }
   };
   scopeProjectionCache.set(ledger, {
     parents,
@@ -415,9 +466,9 @@ function emptyLedger() {
   return {
     version: TOTALS_VERSION,
     generationBasisVersion: GENERATION_BASIS_VERSION,
-    sessions: {},
-    open: {},
-    settled: {}
+    sessions: Object.create(null),
+    open: Object.create(null),
+    settled: Object.create(null)
   };
 }
 function emptySession() {
@@ -428,11 +479,11 @@ function emptySession() {
   };
 }
 function cloneLedger(ledger) {
-  const sessions = {};
+  const sessions = Object.create(null);
   for (const [sessionID, session] of Object.entries(ledger.sessions)) {
     sessions[sessionID] = cloneSession(session);
   }
-  const open = {};
+  const open = Object.create(null);
   for (const [messageID, contribution] of Object.entries(ledger.open)) {
     open[messageID] = cloneContribution(contribution);
   }
@@ -442,17 +493,32 @@ function cloneLedger(ledger) {
     ...(ledger.generationBasisVersion === GENERATION_BASIS_VERSION ? {
       generationBasisVersion: GENERATION_BASIS_VERSION
     } : {}),
-    sessions,
-    open,
-    settled: cloneSettled(ledger.settled),
+    // Public snapshots keep the existing ordinary-object API. Spread defines
+    // own data properties even for __proto__; mutation/load paths use the
+    // null-prototype dictionaries above and in coerceLedger exclusively.
+    sessions: {
+      ...sessions
+    },
+    open: {
+      ...open
+    },
+    settled: {
+      ...cloneSettled(ledger.settled)
+    },
     ...(ledger.sessionScopes ? {
-      sessionScopes: cloneSessionScopes(ledger.sessionScopes)
+      sessionScopes: {
+        ...cloneSessionScopes(ledger.sessionScopes)
+      }
     } : {}),
     ...(ledger.messageScopes ? {
-      messageScopes: cloneMessageScopes(ledger.messageScopes, ledger.settled)
+      messageScopes: {
+        ...cloneMessageScopes(ledger.messageScopes, ledger.settled)
+      }
     } : {}),
     ...(sessionAgents ? {
-      sessionAgents
+      sessionAgents: {
+        ...sessionAgents
+      }
     } : {})
   };
 }
@@ -494,7 +560,7 @@ function cloneContribution(contribution) {
   };
 }
 function cloneSettled(settled) {
-  const copy = {};
+  const copy = Object.create(null);
   if (!settled) return copy;
   for (const [messageID, value] of Object.entries(settled)) {
     if (value === true) copy[messageID] = true;else copy[messageID] = cloneContribution(value);
@@ -508,11 +574,11 @@ function coerceLedger(value) {
   if (!isPlainObject(value.sessions) || !isPlainObject(value.open)) {
     throw new TypeError("Invalid totals ledger");
   }
-  const sessions = {};
+  const sessions = Object.create(null);
   for (const [sessionID, sessionValue] of Object.entries(value.sessions)) {
     sessions[sessionID] = coerceSession(sessionValue);
   }
-  const open = {};
+  const open = Object.create(null);
   for (const [messageID, contributionValue] of Object.entries(value.open)) {
     open[messageID] = coerceContribution(contributionValue);
   }
@@ -538,7 +604,7 @@ function coerceLedger(value) {
 }
 function cloneSessionAgents(value) {
   if (!isPlainObject(value)) return undefined;
-  const sessionAgents = {};
+  const sessionAgents = Object.create(null);
   for (const [sessionID, raw] of Object.entries(value)) {
     if (sessionID.length === 0) continue;
     const names = normalizeAgentNames(raw);
@@ -548,7 +614,7 @@ function cloneSessionAgents(value) {
 }
 function cloneSessionScopes(value) {
   if (!isPlainObject(value)) throw new TypeError("Invalid totals ledger");
-  const scopes = {};
+  const scopes = Object.create(null);
   for (const [id, raw] of Object.entries(value)) {
     const proof = coerceScopeEvidence(raw);
     if (!id || !proof || proof.sourceScope === "magic-message") throw new TypeError("Invalid totals ledger");
@@ -558,7 +624,7 @@ function cloneSessionScopes(value) {
 }
 function cloneMessageScopes(value, settled) {
   if (!isPlainObject(value)) throw new TypeError("Invalid totals ledger");
-  const scopes = {};
+  const scopes = Object.create(null);
   for (const [id, raw] of Object.entries(value)) {
     const proof = coerceScopeEvidence(raw);
     if (!id || !proof || !["magic-message", "magic-session"].includes(proof.sourceScope) || settled[id] !== true) throw new TypeError("Invalid totals ledger");
@@ -567,9 +633,9 @@ function cloneMessageScopes(value, settled) {
   return scopes;
 }
 function coerceSettled(value) {
-  if (value === undefined) return {};
+  if (value === undefined) return Object.create(null);
   if (!isPlainObject(value)) throw new TypeError("Invalid totals ledger");
-  const settled = {};
+  const settled = Object.create(null);
   for (const [messageID, marker] of Object.entries(value)) {
     if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
     if (marker === true) {
@@ -664,7 +730,11 @@ function enqueuePath(path, operation) {
   const key = resolve(path);
   const previous = pathQueues.get(key) ?? Promise.resolve();
   const result = previous.then(operation);
-  pathQueues.set(key, result.then(() => undefined, () => undefined));
+  const tail = result.then(() => undefined, () => undefined);
+  pathQueues.set(key, tail);
+  void tail.then(() => {
+    if (pathQueues.get(key) === tail) pathQueues.delete(key);
+  });
   return result;
 }
 function isPlainObject(value) {

@@ -1,5 +1,6 @@
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, basename, join } from "node:path";
+import { readdir, rm } from "node:fs/promises";
+import { dirname, basename, join, resolve } from "node:path";
+import { inspectLedgerFile, readLedgerText, replaceLedgerText } from "./persistence-files.js";
 import { HISTORY_VERSION } from "./core.js";
 import { coerceCompletionUpdate, coerceSpeedContribution, isNewerCompletionUpdate, mergeRecordSpeed } from './statistics.js';
 import { normalizeAgentName } from "./agent-names.js";
@@ -28,6 +29,7 @@ export function hasOriginalResponseTiming(record) {
   const time = record.time;
   return time.startMissing !== true && Number.isFinite(time.start) && time.start >= 0 && typeof time.completed === "number" && Number.isFinite(time.completed) && time.completed > time.start;
 }
+const historyQueues = new Map();
 export function createHistoryStorage(pathOrOptions, options = {}) {
   const settings = typeof pathOrOptions === "string" ? {
     path: pathOrOptions,
@@ -35,45 +37,67 @@ export function createHistoryStorage(pathOrOptions, options = {}) {
   } : pathOrOptions;
   const path = settings.path;
   const maxRecords = normalizeMaxRecords(settings.maxRecords);
-  let queue = Promise.resolve();
   const enqueue = operation => {
-    const result = queue.then(operation);
-    queue = result.then(() => undefined, () => undefined);
+    const key = resolve(path);
+    const result = (historyQueues.get(key) ?? Promise.resolve()).then(operation);
+    const tail = result.then(() => undefined, () => undefined);
+    historyQueues.set(key, tail);
+    void tail.then(() => {
+      if (historyQueues.get(key) === tail) historyQueues.delete(key);
+    });
     return result;
+  };
+  const retain = (records, options = {}) => {
+    const recent = new Set(records.slice(-maxRecords).map(record => record.messageID));
+    return records.filter(record => recent.has(record.messageID) || options.protectedMessageIDs?.has(record.messageID));
+  };
+  const upsertWithSnapshot = (record, options) => enqueue(async () => {
+    settings.lease?.assertOwned(path);
+    const records = await readHistoryFile(path);
+    const next = retain(upsertRecord(records, record), options);
+    await writeHistoryFile(path, next);
+    return {
+      records: next,
+      retainedMessageIDs: new Set(next.slice(-maxRecords).map(entry => entry.messageID))
+    };
+  });
+  const upsert = async (record, options) => {
+    await upsertWithSnapshot(record, options);
   };
   const read = () => enqueue(async () => {
     const records = await readHistoryFile(path);
     return records.slice(-maxRecords);
   });
   return {
-    append: record => enqueue(async () => {
-      const records = await readHistoryFile(path);
-      const next = upsertRecord(records, record);
-      await writeHistoryFile(path, next.slice(-maxRecords));
-    }),
-    upsert: record => enqueue(async () => {
-      const records = await readHistoryFile(path);
-      const next = upsertRecord(records, record);
-      await writeHistoryFile(path, next.slice(-maxRecords));
-    }),
+    maxRecords,
+    upsertWithSnapshot,
+    append: upsert,
+    upsert,
     read,
+    readAll: () => enqueue(() => readHistoryFile(path)),
     clear: () => enqueue(async () => {
-      try {
-        await rm(path, {
-          force: true
-        });
-      } catch {
-        // A missing or concurrently removed history file is already clear.
-      }
+      settings.lease?.assertOwned(path);
+      await inspectLedgerFile(path);
+      await rm(path, {
+        force: true
+      });
     }),
-    prune: () => enqueue(async () => {
-      const records = (await readHistoryFile(path)).slice(-maxRecords);
-      await writeHistoryFile(path, records);
+    prune: options => enqueue(async () => {
+      settings.lease?.assertOwned(path);
+      const all = await readHistoryFile(path);
+      const records = retain(all, options);
+      if (records.length !== all.length) await writeHistoryFile(path, records);
       return records;
     })
   };
 }
 export async function readHistoryFile(path) {
+  return readPrimaryHistoryFile(path);
+}
+
+/** Ownership is required before scanning, merging or removing orphan files. */
+export async function recoverHistoryFile(path, lease) {
+  lease.assertOwned(path);
   const records = await readPrimaryHistoryFile(path);
   const orphanTemps = await findRecoverableTemps(path);
   if (orphanTemps.length === 0) return records;
@@ -81,7 +105,7 @@ export async function readHistoryFile(path) {
   const recoveredRecords = [];
   for (const orphan of orphanTemps) {
     try {
-      const content = await readFile(orphan.path, "utf8");
+      const content = await readLedgerText(orphan.path);
       recoveredPaths.push(orphan.path);
       recoveredRecords.push(...parseHistoryJsonl(content));
     } catch (error) {
@@ -115,7 +139,7 @@ export function mergeHistoryRecords(mainRecords, recoveredRecords) {
 async function readPrimaryHistoryFile(path) {
   let content;
   try {
-    content = await readFile(path, "utf8");
+    content = await readLedgerText(path);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return [];
     throw error;
@@ -148,20 +172,7 @@ async function findRecoverableTemps(path) {
   }).filter(temp => temp !== undefined).sort((left, right) => left.timestamp - right.timestamp || left.path.localeCompare(right.path));
 }
 export async function writeHistoryFile(path, records) {
-  const directory = dirname(path);
-  await mkdir(directory, {
-    recursive: true
-  });
-  const temporaryPath = join(directory, `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`);
-  try {
-    await writeFile(temporaryPath, serializeHistoryJsonl(records), "utf8");
-    await rename(temporaryPath, path);
-  } catch (error) {
-    await rm(temporaryPath, {
-      force: true
-    }).catch(() => undefined);
-    throw error;
-  }
+  await replaceLedgerText(path, serializeHistoryJsonl(records));
 }
 export function parseHistoryJsonl(content) {
   const byMessage = new Map();
@@ -247,9 +258,9 @@ function upsertRecord(records, record) {
   if (!normalized) throw new TypeError("Invalid history record");
   const existing = records.find(entry => entry.messageID === normalized.messageID);
   const chosen = existing && !isPreferredRecord(normalized, existing) ? mergeHistoryScope(existing, normalized) : mergeAcceptedRecord(normalized, existing);
-  const result = records.filter(entry => entry.messageID !== normalized.messageID);
-  result.push(chosen);
-  return result;
+  // First durable admission defines history order. Corrections (even newer
+  // revisions) update in place, never turn an old completion into a new one.
+  return existing ? records.map(entry => entry.messageID === normalized.messageID ? chosen : entry) : [...records, chosen];
 }
 
 /** Usage corrections reuse only the shared module's qualified v3 evidence. */

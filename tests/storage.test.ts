@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord } from "../src/core.js";
 import { measureRecordSpeed, mergeRecordSpeed, type MeasuredHistoryRecord } from "../src/statistics.js";
@@ -10,11 +10,13 @@ import {
   mergeHistoryRecords,
   parseHistoryJsonl,
   readHistoryFile,
+  recoverHistoryFile,
   serializeHistoryJsonl,
   hasOriginalResponseTiming,
   filterHistoryRecords,
   type ScopedHistoryRecord,
 } from "../src/storage.js";
+import { acquireWriterLease, prepareLedgerPaths } from "../src/persistence.js";
 import { classifyMessageMetadata, createScopeRegistry } from "../src/scope.js";
 
 
@@ -26,7 +28,7 @@ test("late session scope projects old history without destroying raw records or 
   for (const record of records) await storage.upsert(record);
   const raw = await readFile(path, "utf8");
   const registry = createScopeRegistry();
-  registry.observeMessageMetadata("mc", { agent: "historian-editor" });
+  registry.observeSessionMetadata("mc", { agent: "historian-editor" });
   assert.deepEqual(filterHistoryRecords(await storage.read(), registry.serialize()), [records[0], records[3]]);
   assert.equal(await readFile(path, "utf8"), raw);
   assert.equal((await storage.read()).length, 4);
@@ -81,7 +83,7 @@ test("recovers valid records from a temp-only file", async (context) => {
   const expected = historyRecord("temp-only", { tokens: { input: 2, output: 9, reasoning: 0, cacheRead: 0, cacheWrite: 0 } });
   await writeFile(tempPath, serializeHistoryJsonl([expected]), "utf8");
 
-  const records = await readHistoryFile(historyPath);
+  const records = await recoverForTest(historyPath, context);
 
   assert.deepEqual(records.map((record) => record.messageID), ["temp-only"]);
   assert.equal(records[0].tokens.output, 9);
@@ -108,7 +110,7 @@ test("merges orphan records with the main file and keeps the more complete dupli
   const tempPath = tempFilePath(historyPath, exitedPid(), 200);
   await writeFile(tempPath, serializeHistoryJsonl([tempOnly, recoveredDuplicate]), "utf8");
 
-  const records = await readHistoryFile(historyPath);
+  const records = await recoverForTest(historyPath, context);
   const byMessage = new Map(records.map((record) => [record.messageID, record]));
 
   assert.deepEqual([...byMessage.keys()], ["main-only", "same", "temp-only"]);
@@ -140,7 +142,7 @@ test("skips corrupt lines and cleans an exited orphan temp", async (context) => 
   await writeFile(tempPath, `not-json\n${JSON.stringify(valid)}\n{broken\n`, "utf8");
   await writeFile(corruptOnlyPath, "not-json\n{broken\n", "utf8");
 
-  const records = await readHistoryFile(historyPath);
+  const records = await recoverForTest(historyPath, context);
 
   assert.deepEqual(records.map((record) => record.messageID), ["valid-after-corruption"]);
   assert.equal(await exists(tempPath), false);
@@ -271,10 +273,52 @@ test("v3 evidence round trips and authoritative history corrections rescale inte
 });
 
 async function makeTestDirectory(context: { after: (callback: () => Promise<void>) => void }): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-storage-"));
+  const cache = join(homedir(), ".cache", "tokpulse-tests");
+  await mkdir(cache, { recursive: true });
+  const directory = await mkdtemp(join(cache, "oc-tps-storage-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
 }
+
+async function recoverForTest(historyPath: string, context: { after: (callback: () => Promise<void>) => void }) {
+  const lease = await acquireWriterLease(await prepareLedgerPaths(dirnameOf(historyPath), { historyPath }));
+  context.after(() => lease.release());
+  return recoverHistoryFile(historyPath, lease);
+}
+
+test("pure history readers ignore orphan files without creating directories or changing bytes", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const path = join(directory, "history.jsonl");
+  const orphan = tempFilePath(path, exitedPid(), 500);
+  const bytes = serializeHistoryJsonl([historyRecord("orphan")]);
+  await writeFile(orphan, bytes);
+  assert.deepEqual(await readHistoryFile(path), []);
+  assert.deepEqual(await createHistoryStorage(path).readAll(), []);
+  assert.equal(await readFile(orphan, "utf8"), bytes);
+  assert.equal(await exists(path), false);
+  const missing = join(directory, "missing", "history.jsonl");
+  assert.deepEqual(await createHistoryStorage(missing).read(), []);
+  assert.equal(await exists(join(directory, "missing")), false);
+});
+
+test("replayed and corrected completions retain first admission order; protected facts outlive the window", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createHistoryStorage(join(directory, "history.jsonl"), { maxRecords: 2 });
+  await storage.upsert(historyRecord("old"));
+  await storage.upsert(historyRecord("new"));
+  await storage.upsert(historyRecord("old"));
+  await storage.upsert(historyRecord("old", { cost: 2 }));
+  await storage.upsert(historyRecord("newest", { time: { start: -10, completed: -1 } }));
+  assert.deepEqual((await storage.readAll()).map((r) => r.messageID), ["new", "newest"]);
+  const protectedMessageIDs = new Set(["new"]);
+  await storage.upsert(historyRecord("four"), { protectedMessageIDs });
+  await storage.upsert(historyRecord("five"), { protectedMessageIDs });
+  assert.deepEqual((await storage.readAll()).map((r) => r.messageID), ["new", "four", "five"]);
+  await storage.prune({ protectedMessageIDs });
+  assert.equal((await storage.readAll()).length, 3);
+  await storage.prune();
+  assert.deepEqual((await storage.readAll()).map((r) => r.messageID), ["four", "five"]);
+});
 
 function tempFilePath(historyPath: string, pid: number, timestamp: number): string {
   return join(dirnameOf(historyPath), `.${basename(historyPath)}.${pid}.${timestamp}.test.tmp`);

@@ -1,14 +1,86 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import type { MeasuredHistoryRecord } from "../src/statistics.js";
 import { filterHistoryRecords, parseHistoryJsonl } from "../src/storage.js";
-import { createTotalsStorage, getExcludedMessageIDs, isCorruptTotalsError, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "../src/totals-storage.js";
+import { createTotalsStorage, getExcludedMessageIDs, isCorruptTotalsError, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath, type SessionMetadataUpdate } from "../src/totals-storage.js";
 import { getSessionAverageSummary, measureRecordSpeed, mergeRecordSpeed } from "../src/statistics.js";
 import { classifyMessageMetadata, classifySessionMetadata, createScopeRegistry } from "../src/scope.js";
+
+test("metadata batch merges same-SID agents and durable scopes without changing usage or downgrading exclusions", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  const baseline = await storage.apply(historyRecord("normal", { sessionID: "root", tokens: tokens(1, 20, 2, 3, 4), cost: 5 }));
+  const proof = classifySessionMetadata({ id: "root", parentID: "parent", agent: "dreamer" });
+  const updates: readonly SessionMetadataUpdate[] = [
+    { sessionID: "root", agents: [" fixer ", "oracle", "fixer"] },
+    { sessionID: "root", agents: ["build", "oracle"], scope: proof },
+    { sessionID: "root", scope: classifySessionMetadata({ agent: "build" }) },
+    { sessionID: "other", agents: ["designer"] },
+  ];
+  const merged = await storage.setSessionMetadataMany(updates);
+  assert.deepEqual(merged.sessions, baseline.sessions);
+  assert.deepEqual(merged.open, baseline.open);
+  assert.deepEqual(merged.settled, baseline.settled);
+  assert.deepEqual(merged.sessionAgents?.root, ["build", "fixer", "oracle"]);
+  assert.deepEqual(merged.sessionAgents?.other, ["designer"]);
+  assert.equal(merged.sessionScopes?.root.sourceScope, "magic-session");
+  assert.equal(merged.sessionScopes?.root.parentSessionID, "parent");
+  assert.equal(projectTotalsMeasurementScope(merged).sessions.root, undefined);
+  assert.deepEqual(await createTotalsStorage(storage.path).setSessionMetadataMany(updates), merged);
+  merged.sessionAgents!.root.push("mutated");
+  merged.sessionScopes!.root.reasons.length = 0;
+  const canonical = await storage.read();
+  assert.deepEqual(canonical.sessionAgents?.root, ["build", "fixer", "oracle"]);
+  assert.ok(canonical.sessionScopes!.root.reasons.length > 0);
+  // The new method is not a cache: an external authoritative replacement is
+  // observed even by an empty/no-op batch.
+  canonical.sessionAgents!.other = ["external"];
+  await writeFile(storage.path, JSON.stringify(canonical));
+  assert.deepEqual((await storage.setSessionMetadataMany([])).sessionAgents?.other, ["external"]);
+});
+
+test("metadata batch validates all entries before publication and safely handles special session IDs", async (context) => {
+  const directory = await makeTestDirectory(context);
+  const storage = createTotalsStorage(join(directory, "totals.json"));
+  await storage.seed([]);
+  const before = await readFile(storage.path, "utf8");
+  for (const invalid of [
+    { sessionID: "", agents: ["fixer"] },
+    { sessionID: 1 },
+    { sessionID: "bad", agents: "fixer" },
+    { sessionID: "bad", agents: ["ok", 1] },
+    { sessionID: "bad", agents: ["bad\u001bname"] },
+    { sessionID: "bad", scope: { version: 1, sourceScope: "invalid" } },
+    { sessionID: "bad", scope: classifyMessageMetadata({ providerID: "magic-context" }) },
+  ]) {
+    await assert.rejects(storage.setSessionMetadataMany([{ sessionID: "good", agents: ["oracle"] }, invalid] as unknown as SessionMetadataUpdate[]), TypeError);
+    assert.equal(await readFile(storage.path, "utf8"), before);
+  }
+  await assert.rejects(storage.setSessionMetadataMany({} as unknown as SessionMetadataUpdate[]), TypeError);
+  const ids = ["constructor", "toString", "__proto__"];
+  const updates = ids.flatMap((sessionID): SessionMetadataUpdate[] => [
+    { sessionID, agents: ["fixer"], scope: classifySessionMetadata({ agent: "build" }) },
+    { sessionID, agents: ["oracle"] },
+  ]);
+  const merged = await storage.setSessionMetadataMany(updates);
+  for (const id of ids) {
+    assert.equal(Object.hasOwn(merged.sessionAgents!, id), true);
+    assert.deepEqual(merged.sessionAgents![id], ["fixer", "oracle"]);
+    assert.equal(Object.hasOwn(merged.sessionScopes!, id), true);
+    assert.equal(merged.sessionScopes![id].sourceScope, "user");
+  }
+  assert.equal(({} as any).sourceScope, undefined);
+  assert.deepEqual(await storage.setSessionMetadataMany(updates), merged);
+  const concurrent = await Promise.all([
+    storage.setSessionMetadataMany([{ sessionID: "__proto__", agents: ["build"] }]),
+    createTotalsStorage(storage.path).setSessionMetadataMany([{ sessionID: "__proto__", agents: ["designer"] }]),
+  ]);
+  assert.deepEqual(concurrent[1].sessionAgents!["__proto__"], ["build", "designer", "fixer", "oracle"]);
+});
 
 test("late MC identity projects all usage/speed and descendants while preserving raw cumulative data and epoch", async (context) => {
   const directory = await makeTestDirectory(context);
@@ -37,6 +109,65 @@ test("late MC identity projects all usage/speed and descendants while preserving
   assert.equal(projectTotalsMeasurementScope(await storage.read()).sessions.mc, undefined);
   assert.equal((await storage.read()).sessions.mc.tokens.output, 10);
 });
+
+for (const settled of [false, true]) {
+  test(`maintenance message in ordinary session excludes only its ${settled ? "settled" : "open"} contribution, not session or child`, async (context) => {
+    const directory = await makeTestDirectory(context);
+    const storage = createTotalsStorage(join(directory, "totals.json"));
+    const normal = historyRecord("normal", { sessionID: "root", quality: "exact", tokens: tokens(2, 20, 4, 5, 6), cost: 3 });
+    const child = historyRecord("child-work", { sessionID: "child", parentSessionID: "root", quality: "exact", tokens: tokens(7, 30, 8, 9, 10), cost: 4 });
+    await storage.apply(normal);
+    const baseline = await storage.apply(child);
+    const maintenance = historyRecord("maintenance", { sessionID: "root", quality: "exact", tokens: tokens(100, 200, 30, 40, 50), cost: 9 });
+    const retainedMessageIDs = settled ? [normal.messageID, child.messageID] : [normal.messageID, child.messageID, maintenance.messageID];
+    const included = await storage.apply(maintenance, { retainedMessageIDs });
+    assert.equal(included.sessions.root.responseCount, 2);
+    assert.equal(included.sessions.root.cost, 12);
+    assert.deepEqual(included.sessions.root.tokens, tokens(102, 220, 34, 45, 56));
+    assert.equal(settled ? included.settled.maintenance !== undefined : included.open.maintenance !== undefined, true);
+
+    const registry = createScopeRegistry();
+    registry.observeSessionMetadata("root", { id: "root", agent: "build" });
+    registry.observeSessionMetadata("child", { id: "child", parentID: "root", agent: "fixer" });
+    const proof = registry.observeMessageMetadata("root", { agent: "historian-editor" });
+    assert.equal(proof.sourceScope, "magic-message");
+    assert.equal(registry.isExcluded("root"), false);
+    assert.equal(registry.isExcluded("child"), false);
+    for (const [id, evidence] of Object.entries(registry.serialize())) await storage.setSessionScope(id, evidence);
+    const excluded = await storage.excludeMessage(maintenance.messageID, proof);
+    assert.deepEqual(excluded.sessions, baseline.sessions);
+    const projected = projectTotalsMeasurementScope(excluded);
+    assert.deepEqual(Object.keys(projected.sessions).sort(), ["child", "root"]);
+    assert.deepEqual(projected.sessions.root.tokens, normal.tokens);
+    assert.equal(projected.sessions.root.cost, 3);
+    assert.equal(projected.sessions.root.responseCount, 1);
+    assert.deepEqual(projected.sessions.child.tokens, child.tokens);
+    assert.equal(projected.sessions.child.cost, 4);
+    assert.equal(projected.sessions.child.responseCount, 1);
+    assert.equal(excluded.sessionScopes?.root?.sourceScope === "magic-session", false);
+    const tombstone = excluded.settled.maintenance;
+    assert.notEqual(tombstone, true);
+    if (tombstone === true) throw new Error("Expected reversible exclusion snapshot");
+    assert.deepEqual(tombstone.excluded, proof);
+    assert.deepEqual(tombstone.tokens, maintenance.tokens);
+    assert.equal(tombstone.cost, 9);
+    assert.equal(excluded.open.maintenance, undefined);
+    assert.deepEqual([...getExcludedMessageIDs(excluded)], [maintenance.messageID]);
+    assert.deepEqual(filterHistoryRecords([normal, maintenance, child], excluded.sessionScopes, undefined, getExcludedMessageIDs(excluded)), [normal, child]);
+
+    const reopened = createTotalsStorage(storage.path);
+    assert.deepEqual(await reopened.excludeMessage(maintenance.messageID, proof), excluded);
+    assert.deepEqual(await reopened.apply(maintenance, { retainedMessageIDs }), excluded);
+    const correction: MeasuredHistoryRecord = { ...maintenance, cost: 99, tokens: tokens(1000, 2000), update: {
+      source: "live", instanceID: "new-writer", sequence: 2, receivedAt: 100,
+      fingerprint: "correction", seenFingerprints: ["correction"],
+    } };
+    assert.deepEqual(await reopened.apply(correction, { retainedMessageIDs }), excluded);
+    assert.deepEqual(await reopened.apply(child, { retainedMessageIDs }), excluded);
+    assert.deepEqual(await reopened.apply(normal, { retainedMessageIDs }), excluded);
+    assert.deepEqual(projectTotalsMeasurementScope(await reopened.read()).sessions, baseline.sessions);
+  });
+}
 
 test("message-only exclusion reverses exact open and settled contributions once and prevents corrected replay", async (context) => {
   const directory = await makeTestDirectory(context);
@@ -782,7 +913,9 @@ test("a ledger JSON without settled reads with an empty settled set", async (con
 });
 
 async function makeTestDirectory(context: { after: (callback: () => Promise<void>) => void }): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-totals-"));
+  const cache = join(homedir(), ".cache", "tokpulse-tests");
+  await mkdir(cache, { recursive: true });
+  const directory = await mkdtemp(join(cache, "oc-tps-totals-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
 }
@@ -971,8 +1104,8 @@ for (const settled of [false, true]) {
   });
 }
 
-test("speed survives trimming and reload, time-only settled corrections and migration are reversible", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-speed-"));
+test("speed survives trimming and reload, time-only settled corrections and migration are reversible", async (context) => {
+  const directory = await makeTestDirectory(context);
   const path = join(directory, "totals.json");
   try {
     const storage = createTotalsStorage(path);

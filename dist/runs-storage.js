@@ -1,7 +1,125 @@
-import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { appendLedgerText, inspectLedgerFile, openLedgerFile, readLedgerText, replaceLedgerText } from "./persistence-files.js";
+import { constants } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { dedupeActivityEvents, normalizeActivityEvent, replayActivity, filterActivityEvents } from "./activity.js";
 export const DEFAULT_RUNS_FILENAME = "runs.jsonl";
+const activityReadCursorBrand = Symbol("ActivityReadCursor");
+/** Opaque immutable checkpoint. Save only after applying a current-generation result. */
+
+const ACTIVITY_GUARD_BYTES = 4096;
+class ActivityCursor {
+  [activityReadCursorBrand] = true;
+  #checkpoint;
+  constructor(checkpoint) {
+    this.#checkpoint = checkpoint;
+    Object.freeze(this);
+  }
+  static checkpoint(cursor) {
+    return cursor instanceof ActivityCursor ? cursor.#checkpoint : undefined;
+  }
+}
+
+/**
+ * Pure safe-FD snapshot reader for the lease writer's append/atomic-replace
+ * protocol. There is no singleton cursor and no retained historical event set.
+ * Growth validates the old first/last 4KiB before trusting an append; equal-size
+ * timestamp changes, truncation, replacement and changed guards reset. Bounded
+ * checks cannot detect arbitrary middle-only overwrite combined with growth;
+ * this is not an integrity monitor for writers violating that protocol.
+ * Cross-batch stable-ID deduplication belongs to the consumer (notably legacy
+ * valid EOF can be emitted again when its terminating newline later arrives).
+ */
+export async function readActivityDelta(path, cursor) {
+  let file;
+  try {
+    file = await openLedgerFile(path, constants.O_RDONLY);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return {
+      mode: "reset",
+      events: [],
+      cursor: undefined
+    };
+    throw error;
+  }
+  try {
+    const stat = await file.stat({
+      bigint: true
+    });
+    const size = Number(stat.size);
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error("Activity ledger size exceeds safe offsets");
+    const key = resolve(path);
+    const previous = ActivityCursor.checkpoint(cursor);
+    let append = previous !== undefined && previous.path === key && previous.stat.dev === stat.dev && previous.stat.ino === stat.ino && size > previous.size;
+    if (previous && previous.path === key && sameActivitySnapshot(previous.stat, stat)) {
+      await assertActivitySnapshot(file, path, stat);
+      return {
+        mode: "unchanged",
+        events: [],
+        cursor
+      };
+    }
+    if (append && previous) {
+      const head = await readActivityRange(file, 0, previous.head.length);
+      const tail = await readActivityRange(file, previous.size - previous.tail.length, previous.tail.length);
+      append = head.equals(previous.head) && tail.equals(previous.tail);
+    }
+    const start = append && previous ? previous.lineStart : 0;
+    const data = await readActivityRange(file, start, size - start);
+    await assertActivitySnapshot(file, path, stat);
+    const lineStart = start + data.lastIndexOf(10) + 1;
+    let head, tail;
+    if (append && previous) {
+      const added = data.subarray(previous.size - start);
+      head = Buffer.concat([previous.head, added.subarray(0, ACTIVITY_GUARD_BYTES - previous.head.length)]);
+      const tailWindow = Buffer.concat([previous.tail, added.subarray(-ACTIVITY_GUARD_BYTES)]);
+      tail = Buffer.from(tailWindow.subarray(-ACTIVITY_GUARD_BYTES));
+    } else {
+      // Copy bounded guards, rather than keeping a slice that retains the
+      // entire cold-read buffer through the cursor's lifetime.
+      head = Buffer.from(data.subarray(0, ACTIVITY_GUARD_BYTES));
+      tail = Buffer.from(data.subarray(-ACTIVITY_GUARD_BYTES));
+    }
+    const events = parseActivityJsonl(`${start === 0 ? "" : "\n"}${data.toString("utf8")}`);
+    return {
+      mode: append ? "append" : "reset",
+      events,
+      cursor: new ActivityCursor({
+        path: key,
+        stat,
+        size,
+        lineStart,
+        head,
+        tail
+      })
+    };
+  } finally {
+    await file.close();
+  }
+}
+function sameActivitySnapshot(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+async function assertActivitySnapshot(file, path, snapshot) {
+  const after = await file.stat({
+    bigint: true
+  });
+  const named = await inspectLedgerFile(path);
+  if (!sameActivitySnapshot(snapshot, after) || !named || BigInt(named.dev) !== after.dev || BigInt(named.ino) !== after.ino) {
+    throw new Error(`Activity ledger changed during read: ${path}`);
+  }
+}
+async function readActivityRange(file, position, length) {
+  const buffer = Buffer.allocUnsafe(length);
+  let offset = 0;
+  while (offset < length) {
+    const {
+      bytesRead
+    } = await file.read(buffer, offset, length - offset, position + offset);
+    if (bytesRead === 0) throw new Error("Activity ledger truncated during read");
+    offset += bytesRead;
+  }
+  return buffer;
+}
 /** Derives the independent activity ledger beside a history.jsonl file. */
 export function deriveRunsPath(historyPath) {
   if (typeof historyPath !== "string" || historyPath.length === 0) {
@@ -58,7 +176,7 @@ export function serializeActivityJsonl(events) {
 export async function readActivityFile(path, options = {}) {
   let content;
   try {
-    content = await readFile(path, "utf8");
+    content = await readLedgerText(path);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return [];
     throw error;
@@ -68,20 +186,7 @@ export async function readActivityFile(path, options = {}) {
 
 /** Atomically rewrites a runs file; normal reads never call this function. */
 export async function writeActivityFile(path, events) {
-  const directory = dirname(path);
-  await mkdir(directory, {
-    recursive: true
-  });
-  const temporaryPath = join(directory, `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`);
-  try {
-    await writeFile(temporaryPath, serializeActivityJsonl(events), "utf8");
-    await rename(temporaryPath, path);
-  } catch (error) {
-    await rm(temporaryPath, {
-      force: true
-    }).catch(() => undefined);
-    throw error;
-  }
+  await replaceLedgerText(path, serializeActivityJsonl(events));
 }
 const pathQueues = new Map();
 
@@ -91,14 +196,17 @@ const pathQueues = new Map();
  */
 export class ActivityLedger {
   path;
-  constructor(pathOrOptions) {
+  lease;
+  constructor(pathOrOptions, options = {}) {
     // A bare string is an explicit runs file. Use { historyPath } when the
     // default sibling runs.jsonl path is desired.
     this.path = typeof pathOrOptions === "string" ? pathOrOptions : resolveRunsPath(pathOrOptions);
+    this.lease = typeof pathOrOptions === "string" ? options.lease : pathOrOptions.lease;
   }
   append(event) {
     const normalized = requireActivityEvent(event);
     return enqueuePath(this.path, async () => {
+      this.lease?.assertOwned(this.path);
       await appendEventsToFile(this.path, [normalized]);
       return normalized;
     });
@@ -110,6 +218,7 @@ export class ActivityLedger {
     });
     if (normalized.kind !== "lifecycle") throw new TypeError("Invalid lifecycle activity event");
     return enqueuePath(this.path, async () => {
+      this.lease?.assertOwned(this.path);
       await appendEventsToFile(this.path, [normalized]);
       return normalized;
     });
@@ -121,6 +230,7 @@ export class ActivityLedger {
     });
     if (normalized.kind !== "parent") throw new TypeError("Invalid parent activity event");
     return enqueuePath(this.path, async () => {
+      this.lease?.assertOwned(this.path);
       await appendEventsToFile(this.path, [normalized]);
       return normalized;
     });
@@ -128,6 +238,7 @@ export class ActivityLedger {
   appendMany(events) {
     const normalized = events.map(requireActivityEvent);
     return enqueuePath(this.path, async () => {
+      this.lease?.assertOwned(this.path);
       await appendEventsToFile(this.path, normalized);
       return normalized;
     });
@@ -139,29 +250,30 @@ export class ActivityLedger {
     return replayActivity(await this.read(), options);
   }
   rewrite(events) {
-    return enqueuePath(this.path, () => writeActivityFile(this.path, events));
+    return enqueuePath(this.path, () => {
+      this.lease?.assertOwned(this.path);
+      return writeActivityFile(this.path, events);
+    });
   }
   compact() {
     return enqueuePath(this.path, async () => {
+      this.lease?.assertOwned(this.path);
       const events = await readActivityFile(this.path);
       await writeActivityFile(this.path, events);
       return events;
     });
   }
 }
-export function createActivityLedger(pathOrOptions) {
-  return new ActivityLedger(pathOrOptions);
+export function createActivityLedger(pathOrOptions, options = {}) {
+  return new ActivityLedger(pathOrOptions, options);
 }
 export const createRunsStorage = createActivityLedger;
 async function appendEventsToFile(path, events) {
   if (events.length === 0) return;
-  await mkdir(dirname(path), {
-    recursive: true
-  });
   // A delimiter before every append avoids an O(file-size) read just to
   // inspect the previous final byte. Empty lines are ignored by the parser.
   const content = `\n${events.map(event => JSON.stringify(event)).join("\n")}\n`;
-  await appendFile(path, content, "utf8");
+  await appendLedgerText(path, content);
 }
 function requireActivityEvent(value) {
   const event = normalizeActivityEvent(value);
@@ -172,7 +284,11 @@ function enqueuePath(path, operation) {
   const key = resolve(path);
   const previous = pathQueues.get(key) ?? Promise.resolve();
   const result = previous.then(operation);
-  pathQueues.set(key, result.then(() => undefined, () => undefined));
+  const tail = result.then(() => undefined, () => undefined);
+  pathQueues.set(key, tail);
+  void tail.then(() => {
+    if (pathQueues.get(key) === tail) pathQueues.delete(key);
+  });
   return result;
 }
 function isNodeError(value) {
