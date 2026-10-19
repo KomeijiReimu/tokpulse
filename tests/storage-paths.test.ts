@@ -19,7 +19,14 @@ async function project(context: { after: (callback: () => Promise<void>) => void
   const cache = join(homedir(), ".cache", "tokpulse-tests");
   await mkdir(cache, { recursive: true });
   const directory = await mkdtemp(join(cache, "storage-paths-"));
-  context.after(() => rm(directory, { recursive: true, force: true }));
+  context.after(async () => {
+    const instances = testServers.get(context);
+    if (instances) {
+      for (const hooks of instances.values()) await (hooks as unknown as { dispose(): Promise<void> }).dispose();
+      instances.clear();
+    }
+    await rm(directory, { recursive: true, force: true });
+  });
   return directory;
 }
 
@@ -34,6 +41,21 @@ function paths(base: string, options: ServerOptions = {}) {
 
 function input(base: string, worktree = base): PluginInput {
   return { directory: base, worktree } as PluginInput;
+}
+
+const testServers = new WeakMap<object, Map<string, Awaited<ReturnType<typeof server>>>>();
+/** A restart now means disposing the old owner, not silently racing two writers. */
+async function startServer(context: { after(callback: () => Promise<void>): void }, pluginInput: PluginInput, options: ServerOptions = {}) {
+  let instances = testServers.get(context);
+  if (!instances) {
+    instances = new Map(); testServers.set(context, instances);
+  }
+  const key = JSON.stringify(paths(resolveProjectDirectory(pluginInput), options));
+  const previous = instances.get(key);
+  if (previous) await (previous as unknown as { dispose(): Promise<void> }).dispose();
+  const hooks = await server(pluginInput, { ...options });
+  instances.set(key, hooks);
+  return hooks;
 }
 
 function tuiApi(base: string, worktree = base): TuiPluginApi {
@@ -86,9 +108,49 @@ test("server and read-only TUI share the new default but retain their project ba
   } finally { store.disposeSignals(); }
 });
 
+test("fresh TUI ignores recoverable orphan history without any filesystem mutation", async (context) => {
+  const base = await project(context);
+  const resolved = paths(base);
+  await mkdir(dirname(resolved.historyPath), { recursive: true });
+  await writeFile(resolved.historyPath, `${JSON.stringify(record("main"))}\n`);
+  const orphan = join(dirname(resolved.historyPath), ".history.jsonl.2147483647.1.test.tmp");
+  const orphanBytes = `${JSON.stringify(record("orphan"))}\n`;
+  await writeFile(orphan, orphanBytes);
+  const entries = await readdir(dirname(resolved.historyPath));
+  const mainBytes = await readFile(resolved.historyPath, "utf8");
+  const store = createRuntimeStore(1, 0);
+  try {
+    await reloadHistory(store, tuiApi(base), resolved.historyPath, resolved.totalsPath, 1);
+    assert.deepEqual(store.records.map((entry) => entry.messageID), ["main"]);
+    assert.deepEqual(await readdir(dirname(resolved.historyPath)), entries);
+    assert.equal(await readFile(resolved.historyPath, "utf8"), mainBytes);
+    assert.equal(await readFile(orphan, "utf8"), orphanBytes);
+  } finally { store.disposeSignals(); }
+});
+
+test("server recovers complete orphan history and reconciles totals before window-one pruning", async (context) => {
+  const base = await project(context);
+  const resolved = paths(base);
+  await mkdir(dirname(resolved.historyPath), { recursive: true });
+  await writeFile(resolved.historyPath, `${JSON.stringify(record("main", 1))}\n`);
+  const orphan = join(dirname(resolved.historyPath), ".history.jsonl.2147483647.1.test.tmp");
+  await writeFile(orphan, `${JSON.stringify(record("orphan-A", 2))}\n${JSON.stringify(record("orphan-B", 3))}\n`);
+  await startServer(context, input(base), { maxRecords: 1 });
+  await absent(orphan);
+  assert.equal((await readFile(resolved.historyPath, "utf8")).trim().split("\n").length, 1);
+  let ledger = JSON.parse(await readFile(resolved.totalsPath, "utf8"));
+  assert.equal(ledger.sessions.s.responseCount, 3);
+  assert.equal(ledger.sessions.s.tokens.output, 6);
+  assert.equal(ledger.sessions.s.cost, 6);
+  await startServer(context, input(base), { maxRecords: 1 });
+  ledger = JSON.parse(await readFile(resolved.totalsPath, "utf8"));
+  assert.equal(ledger.sessions.s.responseCount, 3);
+  assert.equal(ledger.sessions.s.tokens.output, 6);
+});
+
 test("new default plugin writes all ledgers in .tokpulse and TUI reads the same history without creating .opencode", async (context) => {
   const base = await project(context);
-  const hooks = await server(input(base));
+  const hooks = await startServer(context, input(base));
   await complete(hooks, "new", 7);
   await hooks.event!({ event: { type: "session.idle", timestamp: 200, properties: { sessionID: "s" } } as never });
   const resolved = paths(base);
@@ -107,7 +169,7 @@ test("new default plugin writes all ledgers in .tokpulse and TUI reads the same 
 
 test("controllable old-path baseline migrates before plugin initialization and keeps original data and OpenCode files", async (context) => {
   const base = await project(context);
-  const old = await server(input(base), { historyPath: legacyRelative });
+  const old = await startServer(context, input(base), { historyPath: legacyRelative });
   await complete(old, "old", 4);
   await old.event!({ event: { type: "session.idle", timestamp: 200, properties: { sessionID: "s" } } as never });
   const legacy = dirname(join(base, legacyRelative));
@@ -115,7 +177,7 @@ test("controllable old-path baseline migrates before plugin initialization and k
   await writeFile(join(base, ".opencode", "opencode.json"), "config sentinel");
   await mkdir(join(base, ".opencode", "node_modules"));
   await writeFile(join(base, ".opencode", "node_modules", "dependency"), "dependency sentinel");
-  const current = await server(input(base));
+  const current = await startServer(context, input(base));
   await complete(current, "new", 6);
   const ledger = JSON.parse(await readFile(paths(base).totalsPath, "utf8"));
   assert.equal(ledger.sessions.s.tokens.output, 10);
@@ -124,7 +186,7 @@ test("controllable old-path baseline migrates before plugin initialization and k
   for (const [index, filename] of filenames.entries()) assert.deepEqual(await readFile(join(legacy, filename)), before[index]);
   assert.equal(await readFile(join(base, ".opencode", "opencode.json"), "utf8"), "config sentinel");
   assert.equal(await readFile(join(base, ".opencode", "node_modules", "dependency"), "utf8"), "dependency sentinel");
-  await server(input(base));
+  await startServer(context, input(base));
   const restarted = JSON.parse(await readFile(paths(base).totalsPath, "utf8"));
   assert.equal(restarted.sessions.s.tokens.output, 10);
   assert.equal(restarted.sessions.s.responseCount, 2);
@@ -199,22 +261,22 @@ test("startup preserves cumulative totals, names, and scope beyond the short mig
     "history.jsonl": `${JSON.stringify(record())}\n`, "totals.json": JSON.stringify(ledger), "runs.jsonl": "",
   });
   const originalTotals = await readFile(join(legacy, "totals.json"));
-  await server(input(base));
+  await startServer(context, input(base));
   const migrated = JSON.parse(await readFile(paths(base).totalsPath, "utf8"));
   assert.deepEqual(migrated.sessions, ledger.sessions);
   assert.deepEqual(migrated.sessionAgents, ledger.sessionAgents);
   assert.deepEqual(migrated.sessionScopes, ledger.sessionScopes);
-  await server(input(base));
+  await startServer(context, input(base));
   assert.deepEqual(JSON.parse(await readFile(paths(base).totalsPath, "utf8")).sessions, ledger.sessions);
   assert.deepEqual(await readFile(join(legacy, "totals.json")), originalTotals);
 });
 
 test("existing new ledger initialization never imports legacy history or cumulative usage", async (context) => {
   const base = await project(context);
-  const hooks = await server(input(base));
+  const hooks = await startServer(context, input(base));
   await complete(hooks, "authoritative", 7);
   await legacyFiles(base, { "history.jsonl": `${JSON.stringify(record("poison", 999))}\n`, "totals.json": "invalid poison" });
-  await server(input(base));
+  await startServer(context, input(base));
   const current = JSON.parse(await readFile(paths(base).totalsPath, "utf8"));
   assert.equal(current.sessions.s.tokens.output, 7);
   assert.equal(current.sessions.s.cost, 3);
@@ -249,7 +311,7 @@ for (const option of ["relative-history", "absolute-history", "relative-totals",
     const resolved = paths(base, options);
     assert.equal(await migrateDefaultLedgers(base, resolved), false);
     await absent(join(base, ".tokpulse"));
-    const hooks = await server(input(base), { ...options });
+    const hooks = await startServer(context, input(base), { ...options });
     await complete(hooks, "custom", 7);
     await hooks.event!({ event: { type: "session.idle", timestamp: 200, properties: { sessionID: "s" } } as never });
     const ledger = JSON.parse(await readFile(resolved.totalsPath, "utf8"));
@@ -265,12 +327,12 @@ test("copy failure removes only the private stage and blocks server seed rather 
   const base = await project(context);
   const legacy = await legacyFiles(base, { "history.jsonl": `${JSON.stringify(record())}\n` });
   await mkdir(join(legacy, "totals.json"));
-  await assert.rejects(server(input(base)), /Not a regular legacy ledger/);
+  await assert.rejects(startServer(context, input(base)), /Not a regular legacy ledger/);
   await absent(join(base, ".tokpulse"));
   assert.equal((await readdir(base)).some((name) => name.startsWith(".tokpulse-migrate-")), false);
   assert.equal(await readFile(join(legacy, "history.jsonl"), "utf8"), `${JSON.stringify(record())}\n`);
   await rm(join(legacy, "totals.json"), { recursive: true });
-  await server(input(base));
+  await startServer(context, input(base));
   assert.equal(JSON.parse(await readFile(paths(base).totalsPath, "utf8")).sessions.s.tokens.output, 4);
 });
 
@@ -290,7 +352,7 @@ for (const unsafe of ["legacy-parent", "legacy-directory", "legacy-file", "targe
       await legacyFiles(base, { "history.jsonl": "do not follow" });
       await symlink(outside, join(base, ".tokpulse"));
     }
-    await assert.rejects(server(input(base)));
+    await assert.rejects(startServer(context, input(base)));
     assert.deepEqual(await readdir(outside), ["sentinel"]);
     assert.equal(await readFile(join(outside, "sentinel"), "utf8"), "unchanged");
     assert.equal((await readdir(base)).some((name) => name.startsWith(".tokpulse-migrate-")), false);
@@ -315,7 +377,7 @@ test("migration checks do not run again on plugin events or delta", async (conte
   assert.equal(source.match(/await migrateDefaultLedgers\(/g)?.length, 1);
   assert.ok(source.indexOf("await migrateDefaultLedgers(") < source.indexOf("let eventQueue:"));
   const base = await project(context);
-  const hooks = await server(input(base));
+  const hooks = await startServer(context, input(base));
   const legacy = await legacyFiles(base, { "history.jsonl": "unsafe if checked again" });
   await mkdir(join(legacy, "totals.json"));
   await hooks.event!({ event: { type: "message.part.delta", timestamp: 20, properties: {

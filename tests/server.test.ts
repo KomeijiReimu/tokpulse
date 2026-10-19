@@ -15,14 +15,18 @@ async function backend(run: (ctx: { path: string; send: (event: any) => Promise<
   const directory = await mkdtemp(join(cache, "thinking-server-"));
   const path = join(directory, "history.jsonl");
   if (initial) await writeFile(path, initial.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  let currentHooks: any;
+  let currentSend: (event: any) => Promise<void>;
   const restart = async (observedSince = 0) => {
+    await currentHooks?.dispose?.();
     const startupNow = Date.now;
     let hooks: Awaited<ReturnType<typeof server>>;
     try {
       Date.now = () => observedSince;
       hooks = await server({ directory, worktree: directory } as PluginInput, { historyPath: path, maxRecords });
+      currentHooks = hooks;
     } finally { Date.now = startupNow; }
-    return async (event: any) => {
+    currentSend = async (event: any) => {
       const wall = event.receiveWall ?? event.timestamp ?? Date.now();
       const mono = event.receiveMono ?? wall;
       const dateNow = Date.now;
@@ -39,9 +43,10 @@ async function backend(run: (ctx: { path: string; send: (event: any) => Promise<
       }
       await pending!;
     };
+    return currentSend;
   };
-  try { await run({ path, send: await restart(), restart }); }
-  finally { await rm(directory, { recursive: true, force: true }); }
+  try { await restart(); await run({ path, send: (event) => currentSend(event), restart }); }
+  finally { await currentHooks?.dispose?.(); await rm(directory, { recursive: true, force: true }); }
 }
 const started = (id = "m", created = 0, timestamp = created, extra = {}) => ({ type: "message.updated", timestamp, ...extra,
   properties: { info: { id, sessionID: "s", role: "assistant", time: { created } } } });
@@ -69,48 +74,48 @@ const completed = (id = "m", output = 0, reasoning = 10, end = 1000) => {
 };
 async function records(path: string) { return parseHistoryJsonl(await readFile(path, "utf8")); }
 
-test("metadata-only Thinking precedes content, keeps earliest provenance and adds no samples", async () => {
+test("R08 content snapshots and deltas cannot create backend timing signals or samples", async () => {
   await backend(async ({ path, send }) => {
     await send(started());
     await send(thinking());
     await send(thinking("m", 150, 250));
     await send(completed("m", 0, 0));
     const [record] = await records(path);
-    assert.equal(record.time.firstResponse, 100);
-    assert.equal(record.time.firstResponseSource, "thinking");
-    assert.equal(record.time.firstResponseTimeSource, "part-start");
-    assert.equal(record.time.firstResponseEstimated, false);
+    assert.equal(record.time.firstResponse, undefined);
+    assert.equal(record.time.firstResponseSource, undefined);
+    assert.equal(record.time.firstResponseTimeSource, undefined);
+    assert.equal(record.time.firstResponseEstimated, undefined);
     assert.equal(record.time.firstContent, undefined);
     assert.equal(record.time.firstToken, undefined);
     assert.equal(record.samples.length, 0);
-    assert.equal(calculateTTFT(record), 100);
+    assert.equal(calculateTTFT(record), undefined);
   });
   await backend(async ({ path, send }) => {
     await send(started()); await send(thinking()); await send(delta()); await send(completed());
     const [record] = await records(path);
-    assert.equal(record.time.firstResponse, 100);
-    assert.equal(record.time.firstContent, 500);
-    assert.equal(record.time.firstToken, 500);
+    assert.equal(record.time.firstResponse, undefined);
+    assert.equal(record.time.firstContent, undefined);
+    assert.equal(record.time.firstToken, undefined);
     assert.equal(record.tokens.reasoning, 10);
     assert.equal(record.samples.length, 0);
     assert.equal(record.speed, undefined);
   });
 });
 
-test("Thinking range validation uses estimated arrival and earlier valid content wins", async () => {
+test("R08 invalid or valid part times do not bypass the content ingress gate", async () => {
   await backend(async ({ path, send }) => {
     await send(started()); await send(thinking("m", -10, 200)); await send(delta("m", 150)); await send(completed());
     const [record] = await records(path);
-    assert.equal(record.time.firstResponse, 150);
-    assert.equal(record.time.firstResponseSource, "content");
-    assert.equal(record.time.firstResponseEstimated, true);
+    assert.equal(record.time.firstResponse, undefined);
+    assert.equal(record.time.firstResponseSource, undefined);
+    assert.equal(record.time.firstResponseEstimated, undefined);
   });
   await backend(async ({ path, send }) => {
     await send(started()); await send(thinking("m", 9999, 200)); await send(completed("m", 0, 0));
     const [record] = await records(path);
-    assert.equal(record.time.firstResponse, 200);
-    assert.equal(record.time.firstResponseTimeSource, "arrival");
-    assert.equal(record.time.firstResponseEstimated, true);
+    assert.equal(record.time.firstResponse, undefined);
+    assert.equal(record.time.firstResponseTimeSource, undefined);
+    assert.equal(record.time.firstResponseEstimated, undefined);
   });
 });
 
@@ -184,7 +189,7 @@ test("metadata for superseded assistants cannot claim the current response signa
     await send(completed("old", 0, 0)); await send(completed("current", 0, 0));
     const stored = await records(path);
     assert.equal(stored.find((record) => record.messageID === "old")?.time.firstResponse, undefined);
-    assert.equal(stored.find((record) => record.messageID === "current")?.time.firstResponse, 150);
+    assert.equal(stored.find((record) => record.messageID === "current")?.time.firstResponse, undefined);
   });
 });
 
@@ -285,7 +290,7 @@ test("official pending snapshots before corresponding deltas resolve without inv
     await textSnapshot(send, "m", "helloworld", 1300, true);
     await officialTextComplete(send, "m", 10, 0, 1500);
     const [record] = await records(path);
-    assert.equal(record.time.firstContent, 100);
+    assert.equal(record.time.firstContent, undefined);
     assert.equal(record.tokens.output, 10);
     assert.equal(record.samples.length, 0);
     assert.equal(record.speed, undefined);
@@ -436,8 +441,8 @@ test("v3 uses paired ingress clocks, excluding precontent wait and cleanup/tool 
     await send({ type: "session.next.step.ended", timestamp: 18000, properties: { sessionID: "s", messageID: "m", stepID: "m-step" } });
     await send(completed("m", 10, 0, 20000));
     const [record] = await records(path);
-    assert.equal(record.time.firstResponse, 100);
-    assert.equal(record.time.firstContent, 5000);
+    assert.equal(record.time.firstResponse, undefined);
+    assert.equal(record.time.firstContent, undefined);
     assert.equal(record.tokens.output, 10);
     assert.equal(record.samples.length, 0);
     assert.equal(record.speed, undefined);

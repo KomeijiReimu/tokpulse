@@ -20,13 +20,16 @@ import {
 } from "./activity.js";
 import { ActivityLedger, createActivityLedger } from "./runs-storage.js";
 import { type CompletionUpdate, type ContentMetadataCache, type ContentProgress, type MeasuredHistoryRecord, cachedContentProgress, coerceCompletionUpdate, createContentMetadataCache, createContentProgress, earliestFirstOutput, isNewerCompletionUpdate, mergeContentProgress, noteStepIdentity, taintContentProgress } from './statistics.js';
-import { createHistoryStorage, HistoryStorage, readHistoryFile } from "./storage.js";
+import { createHistoryStorage, HistoryStorage } from "./storage.js";
 import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSignal } from "./statistics.js";
-import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage } from "./totals-storage.js";
+import { completeContentMetadata, retireContentMetadata, disposeContentMetadata } from "./statistics.js";
+import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage, type SessionMetadataUpdate } from "./totals-storage.js";
 import { normalizeAgentName } from "./agent-names.js";
 import { DEFAULT_HISTORY_PATH, migrateDefaultLedgers } from "./storage-paths.js";
-import { createScopeRegistry, coerceScopeEvidence, type ScopeRegistry, type CompactScopeEvidence } from "./scope.js";
-import { createV2EventAdapter, readV2Idle, type V2ServerContext } from "./v2-server.js";
+import { createScopeRegistry, coerceScopeEvidence, mergeScopeEvidence, type ScopeRegistry, type CompactScopeEvidence } from "./scope.js";
+import { createV2EventAdapter, isContentOnlyEvent, isV2ControlEvent, readV2Idle, type V2ServerContext } from "./v2-server.js";
+import { prepareLedgerPaths, acquireWriterLease, recoverHistoryFile, createReliableActivityWriter, createUsageCommitter,
+  type ReliableActivityWriter, type UsageCommitter } from "./persistence.js";
 
 export interface ServerOptions {
   historyPath?: string;
@@ -63,11 +66,15 @@ interface AnyRecord {
 
 interface ActivityRuntime {
   ledger: ActivityLedger;
+  writer: ReliableActivityWriter;
   instanceID: string;
   nextSeq: number;
   assignments: Map<string, ActivityEvent>;
   writtenFacts: Set<string>;
   rawTimestamps: Map<string, number>;
+  sessionEpochs: Map<string, string>;
+  observations: Map<string, ActivityEvent>;
+  invalidExecutions: Set<string>;
 }
 
 interface PreparedActivityEvent<T extends ActivityEvent> {
@@ -80,57 +87,158 @@ const PARENT_LOOKUP_TIMEOUT_MS = 200;
 const QUERY_CONCURRENCY = 4;
 const QUERY_RETRY_MS = 30_000;
 const QUERY_CACHE_LIMIT = 2048;
+/** Shared by directory, ancestry and idle queries; slots follow actual RPCs. */
+function createQueryBudget(shutdown: AbortSignal) {
+  let running = 0;
+  const jobs: Array<() => void> = [];
+  const pump = () => { while (!shutdown.aborted && running < QUERY_CONCURRENCY && jobs.length) jobs.shift()!(); };
+  shutdown.addEventListener("abort", () => { for (const job of jobs.splice(0)) job(); }, { once: true });
+  return {
+    run<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        if (jobs.length >= QUERY_CACHE_LIMIT) { reject(new Error("metadata query budget exhausted")); return; }
+        jobs.push(() => {
+          if (signal.aborted || shutdown.aborted) { reject(new Error("metadata query aborted")); return; }
+          running++;
+          void Promise.resolve().then(operation).then(resolve, reject).finally(() => { running--; pump(); });
+        });
+        pump();
+      });
+    },
+  };
+}
+
+function compactSessionMetadata(session: AnyRecord): AnyRecord {
+  const metadata = asRecord(session.metadata);
+  return { id: session.id,
+    ...(Object.prototype.hasOwnProperty.call(session, "parentID") || Object.prototype.hasOwnProperty.call(session, "parentSessionID")
+      ? { parentID: session.parentID ?? session.parentSessionID } : {}),
+    agent: session.agent, title: session.title, location: { directory: session.location?.directory },
+    metadata: { magic_context: metadata?.magic_context, role: metadata?.role },
+    time: { idle: session.time?.idle }, outcome: session.outcome };
+}
 const PENDING_PERSISTENCE_LIMIT = 128;
 const PENDING_PERSISTENCE_BYTES = 4 * 1024 * 1024;
-const PERSISTENCE_RETRY_BATCH = 4;
-const PERSISTENCE_RETRY_LIMIT = 3;
 interface PendingPersistence {
   record: HistoryRecord;
   bytes: number;
-  retries: number;
 }
 interface SourceRuntime {
+  signal: AbortSignal;
+  background: Set<Promise<void>>;
+  lastControlID?: string;
   scopes: ScopeRegistry;
   persistedScopes: Map<string, string>;
+  scopeDirty: Set<string>;
+  persistedAgents: Map<string, Set<string>>;
+  pendingSessionMetadata: Map<string, SessionMetadataUpdate>;
+  metadataPaused: boolean;
+  metadataProjection: { peakPending: number; batches: number; maxBatch: number; failures: number };
+  flushMetadata?: () => Promise<void>;
   messageScopes: Map<string, CompactScopeEvidence>;
+  pendingMessageScopes: Set<string>;
   metadataGeneration: Map<string, number>;
   queried: Map<string, number>;
   outstanding: Set<string>;
   jobs: Array<() => Promise<void>>;
   workers: number;
+  refillMetadata?: () => void;
+  queryStats: { admitted: number; settled: number; validResponses: number; unknownResponses: number;
+    skipped: number; rejected: number; peakQueued: number;
+    bootstrapTotal: number; bootstrapVisited: number; bootstrapAdmitted: number; bootstrapSkipped: number };
   epochs: Map<string, number>;
   responses: Map<string, string>;
+  responseExecutions: Map<string, { sessionID: string; executionID: string }>;
   pendingPersistence: Map<string, PendingPersistence>;
   pendingBytes: number;
   states: Map<string, LifecycleState>;
-  tools: Map<string, { sessionID: string; pending: boolean }>;
+  tools: Map<string, { sessionID: string; executionID?: string; pending: boolean }>;
   reconciled: Set<string>;
   enqueue: (job: () => Promise<void>) => Promise<void>;
-  requestMetadata: (sessionID: string, prioritize?: boolean) => void;
+  requestMetadata: (sessionID: string, prioritize?: boolean, ancestry?: boolean) => "scheduled" | "skipped" | "deferred";
   retryPersistence: (sessionID: string) => Promise<void>;
 }
 const sourcesByRuntime = new WeakMap<Map<string, ActiveState>, SourceRuntime>();
+const committersByStorage = new WeakMap<HistoryStorage, UsageCommitter>();
+// Reports, not a guessed SID-local cache: successful upsert/retry can prove
+// there is no global backlog. Unknown recovery/admission outcomes still retry.
+const pendingUsageByStorage = new WeakMap<HistoryStorage, number>();
+const acceptedUsageByStorage = new WeakMap<HistoryStorage, HistoryRecord>();
 
-function runDeferred(runtime: SourceRuntime, job: () => Promise<void>, prioritize = false): void {
+function runDeferred(runtime: SourceRuntime, job: () => Promise<void>, prioritize = false): boolean {
+  if (runtime.signal.aborted || runtime.jobs.length >= QUERY_CACHE_LIMIT) return false;
   if (prioritize) runtime.jobs.unshift(job);
   else runtime.jobs.push(job);
+  runtime.queryStats.peakQueued = Math.max(runtime.queryStats.peakQueued, runtime.jobs.length);
   const pump = () => {
-    while (runtime.workers < QUERY_CONCURRENCY && runtime.jobs.length) {
+    while (!runtime.signal.aborted && runtime.workers < QUERY_CONCURRENCY && runtime.jobs.length) {
       runtime.workers++;
       const next = runtime.jobs.shift()!;
-      void Promise.resolve().then(next).catch((error) => warn("background reconciliation failed", error))
-        .finally(() => { runtime.workers--; pump(); });
+      const task = Promise.resolve().then(next).catch((error) => warn("background reconciliation failed", error));
+      runtime.background.add(task);
+      void task.finally(() => {
+        runtime.background.delete(task); runtime.workers--; pump();
+        runtime.refillMetadata?.();
+        if (!runtime.workers && !runtime.jobs.length && !runtime.refillMetadata) void runtime.flushMetadata?.();
+      });
     }
   };
   pump();
+  return true;
 }
 
-async function persistScopeRegistry(runtime: SourceRuntime, totals: TotalsStorage): Promise<void> {
-  for (const [id, proof] of Object.entries(runtime.scopes.serialize())) {
-    const key = JSON.stringify(proof);
-    if (runtime.persistedScopes.get(id) === key) continue;
-    await totals.setSessionScope(id, proof);
-    runtime.persistedScopes.set(id, key);
+const METADATA_BATCH_SIZE = 128;
+const METADATA_PENDING_LIMIT = 256;
+function queueSessionMetadata(runtime: SourceRuntime, sessionID: string, agents: readonly string[] = []): boolean {
+  const proof = runtime.scopes.getPersistentEvidence(sessionID);
+  const pending = runtime.pendingSessionMetadata.get(sessionID);
+  const scope = proof && JSON.stringify(proof) !== runtime.persistedScopes.get(sessionID) ? proof : pending?.scope;
+  const known = runtime.persistedAgents.get(sessionID);
+  const added = [...new Set([...(pending?.agents ?? []), ...agents])].filter((agent) => !known?.has(agent));
+  if (!scope && !added.length) return true;
+  if (!pending && runtime.pendingSessionMetadata.size >= METADATA_PENDING_LIMIT) {
+    runtime.metadataPaused = true; runtime.queried.delete(sessionID);
+    runtime.scopeDirty.add(sessionID);
+    warn("metadata projection admission exhausted; observation remains unconfirmed"); return false;
+  }
+  runtime.pendingSessionMetadata.set(sessionID, { sessionID, ...(scope ? { scope: pending?.scope ? mergeScopeEvidence(pending.scope, scope) : scope } : {}),
+    ...(added.length ? { agents: added } : {}) });
+  runtime.metadataProjection.peakPending = Math.max(runtime.metadataProjection.peakPending, runtime.pendingSessionMetadata.size);
+  return true;
+}
+async function flushSessionMetadata(runtime: SourceRuntime, totals: TotalsStorage): Promise<void> {
+  const batch = [...runtime.pendingSessionMetadata.values()].slice(0, METADATA_BATCH_SIZE);
+  if (!batch.length) return;
+  runtime.metadataProjection.batches++;
+  runtime.metadataProjection.maxBatch = Math.max(runtime.metadataProjection.maxBatch, batch.length);
+  try {
+    const canonical = await totals.setSessionMetadataMany(batch);
+    for (const update of batch) {
+      const id = update.sessionID;
+      if (canonical.sessionScopes && Object.prototype.hasOwnProperty.call(canonical.sessionScopes, id)) {
+        runtime.persistedScopes.set(id, JSON.stringify(canonical.sessionScopes[id]));
+      }
+      if (canonical.sessionAgents && Object.prototype.hasOwnProperty.call(canonical.sessionAgents, id)) {
+        runtime.persistedAgents.set(id, new Set(canonical.sessionAgents[id]));
+      }
+      // A newer correction can have arrived while this batch was in flight.
+      if (runtime.pendingSessionMetadata.get(id) === update) runtime.pendingSessionMetadata.delete(id);
+    }
+    runtime.metadataPaused = false; runtime.refillMetadata?.();
+  } catch (error) { runtime.metadataPaused = true; runtime.metadataProjection.failures++; warn("metadata batch remains pending", error); }
+}
+async function persistScopeRegistry(runtime: SourceRuntime, totals: TotalsStorage, flush = true): Promise<void> {
+  for (const id of runtime.scopeDirty) if (queueSessionMetadata(runtime, id)) runtime.scopeDirty.delete(id);
+  const batches = flush ? Math.ceil(METADATA_PENDING_LIMIT / METADATA_BATCH_SIZE) : runtime.pendingSessionMetadata.size >= METADATA_BATCH_SIZE ? 1 : 0;
+  for (let index = 0; index < batches && runtime.pendingSessionMetadata.size; index++) {
+    await flushSessionMetadata(runtime, totals);
+    if (runtime.metadataPaused) break;
+  }
+  for (const id of [...runtime.pendingMessageScopes].slice(0, 32)) {
+    const proof = runtime.messageScopes.get(id);
+    if (!proof) { runtime.pendingMessageScopes.delete(id); continue; }
+    try { await totals.excludeMessage(id, proof); runtime.pendingMessageScopes.delete(id); }
+    catch (error) { warn("message scope projection remains pending", error); break; }
   }
 }
 
@@ -143,7 +251,9 @@ function retireResponse(active: Map<string, ActiveState>, messageID: string, ses
     runtime.closed.add(sessionID);
     runtime.pendingTaints.delete(sessionID);
   }
-  runtimeContentMetadata(active).completed.add(messageID);
+  const metadata = runtimeContentMetadata(active);
+  completeContentMetadata(metadata, messageID);
+  runtime.tainted.delete(messageID);
 }
 
 function eligibleSession(runtime: SourceRuntime, sessionID: string): boolean {
@@ -161,7 +271,11 @@ function discardExcludedPersistence(source: SourceRuntime): void {
   for (const [id, pending] of source.pendingPersistence) {
     if (!eligibleSession(source, pending.record.sessionID) || source.messageScopes.has(id)
       || ["magic-message", "magic-session"].includes(pending.record.scope?.sourceScope ?? "")) {
-      forgetPendingPersistence(source, id);
+      const scope = source.messageScopes.get(id) ?? { version: 1 as const, sourceScope: "magic-session" as const, reasons: ["parent-link" as const] };
+      // The committer may already own a not-yet-durable snapshot. Keep an
+      // exclusion repair obligation instead of forgetting it and later letting
+      // a healthy global retry resurrect hidden usage.
+      pending.record = { ...pending.record, scope };
     }
   }
 }
@@ -176,10 +290,8 @@ function retainPendingPersistence(source: SourceRuntime, record: HistoryRecord):
     warn(`pending completion capacity exceeded; unpersisted message ${record.messageID}`);
     return;
   }
-  const sameUpdate = (prior?.record as MeasuredHistoryRecord | undefined)?.update?.fingerprint
-    === (record as MeasuredHistoryRecord).update?.fingerprint;
   forgetPendingPersistence(source, record.messageID);
-  source.pendingPersistence.set(record.messageID, { record, bytes, retries: sameUpdate ? prior?.retries ?? 0 : 0 });
+  source.pendingPersistence.set(record.messageID, { record, bytes });
   source.pendingBytes += bytes;
 }
 
@@ -188,24 +300,39 @@ async function persistCompletedRecord(
 ): Promise<boolean> {
   const wrote = await safeUpsert(storage, totals, record);
   if (wrote) forgetPendingPersistence(source, record.messageID);
-  else retainPendingPersistence(source, record);
+  else {
+    const accepted = acceptedUsageByStorage.get(storage) === record;
+    // Durable accepted facts belong to the committer's protected recovery set;
+    // reserve this separate finite budget for unadmitted/history-failure facts.
+    const fingerprint = (record as MeasuredHistoryRecord).update?.fingerprint;
+    const durable = accepted && (await storage.readAll().catch(() => [])).some((item) => item.messageID === record.messageID
+      && (fingerprint ? (item as MeasuredHistoryRecord).update?.fingerprint === fingerprint
+        && JSON.stringify(item.scope) === JSON.stringify(record.scope) : stableSerialize(item) === stableSerialize(record)));
+    if (durable) forgetPendingPersistence(source, record.messageID);
+    else retainPendingPersistence(source, record);
+  }
   return wrote;
 }
 
 async function retryPendingPersistence(
-  source: SourceRuntime, storage: HistoryStorage, totals: TotalsStorage, sessionID: string | undefined,
+  source: SourceRuntime, storage: HistoryStorage, _totals: TotalsStorage, _sessionID: string | undefined,
 ): Promise<void> {
-  discardExcludedPersistence(source);
-  let attempted = 0;
-  for (const [id, pending] of source.pendingPersistence) {
-    if (pending.record.sessionID !== sessionID || pending.retries >= PERSISTENCE_RETRY_LIMIT) continue;
-    if (attempted++ >= PERSISTENCE_RETRY_BATCH) break;
-    pending.retries++;
-    if (await safeUpsert(storage, totals, pending.record)) forgetPendingPersistence(source, id);
-    else if (pending.retries === PERSISTENCE_RETRY_LIMIT) {
-      warn(`completion retry budget exhausted; retaining non-LIVE message ${id}`);
+  const committer = committersByStorage.get(storage);
+  if (committer) {
+    if (pendingUsageByStorage.get(storage) === 0 && source.pendingPersistence.size === 0) return;
+    discardExcludedPersistence(source);
+    const report = await committer.retryPending();
+    pendingUsageByStorage.set(storage, report.pendingCount);
+    if (!report.pendingCount) acceptedUsageByStorage.delete(storage);
+    for (const [id, pending] of [...source.pendingPersistence].slice(0, 32)) {
+      await persistCompletedRecord(source, storage, _totals, pending.record);
+      if (source.pendingPersistence.get(id) === pending) {
+        source.pendingPersistence.delete(id); source.pendingPersistence.set(id, pending);
+      }
     }
+    return;
   }
+  throw new Error("Backend usage committer is not initialized");
 }
 
 function scheduleIdleReconciliation(
@@ -223,23 +350,27 @@ function scheduleIdleReconciliation(
   // own activity intervals; they never suppress an authoritative parent idle.
   const activeOwn = () => [...active.values()].some((state) => state.sessionID === sessionID)
     || [...source.tools.values()].some((tool) => tool.pending && tool.sessionID === sessionID);
+  const ownership = source.responseExecutions.get(messageID);
+  const executionID = ownership?.sessionID === sessionID ? ownership.executionID : undefined;
   const fresh = () => (source.epochs.get(sessionID) ?? 0) === epoch
-    && !(input as AnyRecord).v2Signal?.aborted
+    && (!executionID || activity.observations.get(sessionID)?.executionID === executionID)
+    && !source.signal.aborted
     && source.responses.get(sessionID) === messageID && eligibleSession(source, sessionID) && !activeOwn();
   if (!fresh()) return;
   source.reconciled.add(messageID);
   runDeferred(source, async () => {
     if (!fresh()) return;
     const controller = new AbortController();
+    const signal = AbortSignal.any([source.signal, controller.signal]);
     try {
       if (typeof v2Idle === "function") {
-        const terminal = await withTimeout(v2Idle(sessionID, controller.signal), PARENT_LOOKUP_TIMEOUT_MS) as { state: LifecycleState; timestamp: number } | undefined;
+        const terminal = await withTimeout(v2Idle(sessionID, signal), PARENT_LOOKUP_TIMEOUT_MS) as { state: LifecycleState; timestamp: number } | undefined;
         // Older idle watermarks belong to a previous execution, not this step.
         if (!terminal || controller.signal.aborted || !fresh() || terminal.timestamp < (info.time?.completed ?? Infinity)) return;
         await source.enqueue(async () => {
           if (!fresh()) return;
           source.states.set(sessionID, terminal.state);
-          await captureActivityForEvent(activity, "session.status", { sessionID, status: { type: terminal.state } }, {}, terminal.timestamp);
+          await captureActivityForEvent(activity, "session.status", { sessionID, status: { type: terminal.state } }, { executionID }, terminal.timestamp);
           await source.retryPersistence(sessionID);
         });
         return;
@@ -250,8 +381,8 @@ function scheduleIdleReconciliation(
       const confirmed = await withTimeout((async () => {
         const v2 = status.length >= 2;
         const response = await (v2
-          ? status.call(sessionClient, { directory }, { signal: controller.signal })
-          : status.call(sessionClient, { query: { directory }, signal: controller.signal }));
+          ? status.call(sessionClient, { directory }, { signal })
+          : status.call(sessionClient, { query: { directory }, signal }));
         const receivedAt = Date.now();
         const receivedMono = performance.now();
         if (controller.signal.aborted || !fresh() || !isRecord(response) || response.error !== undefined) return;
@@ -272,8 +403,8 @@ function scheduleIdleReconciliation(
           const get = sessionClient?.get;
           if (typeof get !== "function" || controller.signal.aborted || !fresh()) return;
           const sessionResponse = await (get.length >= 2
-            ? get.call(sessionClient, { sessionID, directory }, { signal: controller.signal })
-            : get.call(sessionClient, { path: { id: sessionID }, query: { directory }, signal: controller.signal }));
+            ? get.call(sessionClient, { sessionID, directory }, { signal })
+            : get.call(sessionClient, { path: { id: sessionID }, query: { directory }, signal }));
           if (controller.signal.aborted || !fresh() || !isRecord(sessionResponse)
             || sessionResponse.error !== undefined || sessionResponse.response?.status !== 200) return;
           const session = plainSDKRecord(sessionResponse.data);
@@ -294,7 +425,7 @@ function scheduleIdleReconciliation(
         // not a force-close of the root's independently active descendants.
         source.states.set(sessionID, "idle");
         await captureActivityForEvent(activity, "session.status", { sessionID, status: { type: "idle" },
-          observedAt: receivedAt, lastObservedAt: receivedAt }, {}, receivedAt);
+          observedAt: receivedAt, lastObservedAt: receivedAt }, { executionID }, receivedAt);
         await source.retryPersistence(sessionID);
         void receivedMono;
       });
@@ -420,34 +551,41 @@ export function recordPartMetadata(active: Map<string, ActiveState>, properties:
 }
 
 export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginOptions) => {
-  const shutdownSignal = (input as AnyRecord).v2Signal as AbortSignal | undefined;
+  const shutdown = new AbortController();
+  const externalSignal = (input as AnyRecord).v2Signal as AbortSignal | undefined;
+  const shutdownSignal = externalSignal ? AbortSignal.any([shutdown.signal, externalSignal]) : shutdown.signal;
   const options = resolveOptions(pluginOptions ?? (input as AnyRecord).options ?? (input as AnyRecord).config);
   const baseDirectory = resolveProjectDirectory(input);
-  const historyPath = resolveHistoryPath(baseDirectory, options.historyPath);
+  const paths = await prepareLedgerPaths(baseDirectory, options);
+  const lease = await acquireWriterLease(paths);
+  try {
+  const historyPath = paths.historyPath;
   const storage = createHistoryStorage(historyPath, {
-    maxRecords: options.maxRecords,
+    maxRecords: options.maxRecords, lease,
   });
   const totals = createTotalsStorage({
-    historyPath,
-    totalsPath: options.totalsPath,
+    historyPath, totalsPath: paths.totalsPath, lease,
   });
+  const ledger = createActivityLedger({ historyPath, runsPath: paths.runsPath, lease });
   const activity: ActivityRuntime = {
-    ledger: createActivityLedger({ historyPath, runsPath: options.runsPath }),
+    ledger, writer: createReliableActivityWriter(ledger, { lease }),
     instanceID: randomUUID(),
     nextSeq: 1,
     assignments: new Map(),
     writtenFacts: new Set(),
     rawTimestamps: new Map(),
+    sessionEpochs: new Map(), observations: new Map(), invalidExecutions: new Set(),
   };
+  const usage = createUsageCommitter(storage, totals);
+  committersByStorage.set(storage, usage);
   await migrateDefaultLedgers(baseDirectory, { historyPath, totalsPath: totals.path, runsPath: activity.ledger.path });
-  let eventQueue: Promise<void> = Promise.all([
-    initializeActivityRuntime(activity).catch((error: unknown) => {
-      warn("activity ledger initialization failed", error);
-    }),
-    initializeTotals(storage, totals, historyPath).catch((error: unknown) => {
-      warn("totals ledger initialization failed", error);
-    }),
-  ]).then(() => undefined);
+  await recoverHistoryFile(historyPath, lease);
+  try { await usage.recover(); }
+  catch (error) {
+    if (!isCorruptTotalsError(error)) throw error;
+    await totals.quarantine(); await usage.recover();
+  }
+  let eventQueue: Promise<void> = initializeActivityRuntime(activity);
   await eventQueue;
   const active = new Map<string, ActiveState>();
   const completedMessageIDs = new Set<string>();
@@ -459,43 +597,56 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
   for (const id of Object.keys(persisted?.settled ?? {})) { completedMessageIDs.add(id); metadata.completed.add(id); }
   const parentSessionCache = new Map<string, string | undefined>();
   const source: SourceRuntime = {
+    signal: shutdownSignal, background: new Set(),
     scopes: createScopeRegistry(persisted?.sessionScopes),
     persistedScopes: new Map(Object.entries(persisted?.sessionScopes ?? {}).map(([id, proof]) => [id, JSON.stringify(proof)])),
-    messageScopes: new Map(), metadataGeneration: new Map(), queried: new Map(), outstanding: new Set(),
-    jobs: [], workers: 0, epochs: new Map(), responses: new Map(), pendingPersistence: new Map(), pendingBytes: 0,
+    scopeDirty: new Set(), persistedAgents: new Map(Object.entries(persisted?.sessionAgents ?? {}).map(([id, agents]) => [id, new Set(agents)])),
+    pendingSessionMetadata: new Map(), metadataPaused: false,
+    metadataProjection: { peakPending: 0, batches: 0, maxBatch: 0, failures: 0 },
+    messageScopes: new Map(), pendingMessageScopes: new Set(), metadataGeneration: new Map(), queried: new Map(), outstanding: new Set(),
+    jobs: [], workers: 0, epochs: new Map(), responses: new Map(), responseExecutions: new Map(), pendingPersistence: new Map(), pendingBytes: 0,
+    queryStats: { admitted: 0, settled: 0, validResponses: 0, unknownResponses: 0, skipped: 0, rejected: 0, peakQueued: 0,
+      bootstrapTotal: 0, bootstrapVisited: 0, bootstrapAdmitted: 0, bootstrapSkipped: 0 },
     states: new Map(), tools: new Map(), reconciled: new Set(),
     retryPersistence: (sessionID) => retryPendingPersistence(source, storage, totals, sessionID),
+    flushMetadata: () => source.enqueue(() => persistScopeRegistry(source, totals)),
     enqueue: (job) => {
       const next = eventQueue.then(() => shutdownSignal?.aborted ? undefined : job())
         .catch((error) => warn("reconciliation apply failed", error));
       eventQueue = next;
       return next;
     },
-    requestMetadata: (sessionID, prioritize = true) => {
+    requestMetadata: (sessionID, prioritize = true, ancestry = false) => {
       const sessionClient = (input as AnyRecord).client?.session;
       const get = sessionClient?.get;
-      if (shutdownSignal?.aborted || typeof get !== "function" || source.scopes.isExcluded(sessionID) || source.outstanding.has(sessionID)) return;
+      if (shutdownSignal?.aborted || typeof get !== "function" || source.scopes.isExcluded(sessionID) || source.outstanding.has(sessionID)) {
+        source.queryStats.skipped++; return "skipped";
+      }
       const now = performance.now();
-      if (now - (source.queried.get(sessionID) ?? -Infinity) < QUERY_RETRY_MS) return;
+      if (now - (source.queried.get(sessionID) ?? -Infinity) < QUERY_RETRY_MS) {
+        source.queryStats.skipped++; return "skipped";
+      }
       source.queried.delete(sessionID); source.queried.set(sessionID, now);
       while (source.queried.size > QUERY_CACHE_LIMIT) source.queried.delete(source.queried.keys().next().value!);
       source.outstanding.add(sessionID);
       const generation = source.metadataGeneration.get(sessionID) ?? 0;
-      runDeferred(source, async () => {
+      const queued = runDeferred(source, async () => {
         if (shutdownSignal?.aborted) { source.outstanding.delete(sessionID); return; }
         const controller = new AbortController();
+        let validResponse = false;
         try {
           // SDK v1's generated get(options) takes path.id. SDK v2's generated
           // get(parameters, options) takes sessionID; raw fields remain intact.
           const v2 = get.length >= 2;
           const response = await withTimeout(Promise.resolve().then(() => v2
-            ? get.call(sessionClient, { sessionID }, { signal: controller.signal })
-            : get.call(sessionClient, { path: { id: sessionID }, signal: controller.signal })), PARENT_LOOKUP_TIMEOUT_MS);
+            ? get.call(sessionClient, { sessionID, ...(ancestry ? { classificationOnly: true } : {}) }, { signal: AbortSignal.any([shutdownSignal, controller.signal]) })
+            : get.call(sessionClient, { path: { id: sessionID }, signal: AbortSignal.any([shutdownSignal, controller.signal]) })), PARENT_LOOKUP_TIMEOUT_MS);
           const arrivedAt = Date.now();
           if (shutdownSignal?.aborted || !response || response.error) return;
           const raw = asRecord(response.data) ?? asRecord(response);
           const session = asRecord(raw?.session) ?? raw;
           if (!session || session.id !== sessionID) return;
+          validResponse = true;
           const sessionAgent = normalizeAgentName(session.agent);
           await source.enqueue(async () => {
             if ((source.metadataGeneration.get(sessionID) ?? 0) !== generation) return;
@@ -505,16 +656,25 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
             if (parent) {
               parentSessionCache.set(sessionID, parent);
               await safeRecordParentFact(activity, "session.metadata.resolved", sessionID, parent, arrivedAt, {}, {});
-              source.requestMetadata(parent);
+              source.requestMetadata(parent, true, true);
               // Late ancestry is a separate canonical fact in sessionScopes
               // and runs. Do not forge a newer completion to rewrite history.
             }
-            await persistScopeRegistry(source, totals);
-            if (sessionAgent) await totals.setSessionAgent(sessionID, sessionAgent);
+            queueSessionMetadata(source, sessionID, sessionAgent ? [sessionAgent] : []);
+            await persistScopeRegistry(source, totals, source.states.has(sessionID) || source.responses.has(sessionID));
           });
         } catch { /* SDK failure/404 is unknown, never negative source proof. */ }
-        finally { controller.abort(); source.outstanding.delete(sessionID); }
+        finally {
+          controller.abort(); source.outstanding.delete(sessionID); source.queryStats.settled++;
+          if (validResponse) source.queryStats.validResponses++;
+          else source.queryStats.unknownResponses++;
+        }
       }, prioritize);
+      if (!queued) {
+        source.outstanding.delete(sessionID); source.queried.delete(sessionID);
+        source.queryStats.rejected++; return "deferred";
+      }
+      source.queryStats.admitted++; return "scheduled";
     },
   };
   sourcesByRuntime.set(active, source);
@@ -529,17 +689,41 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
   for (const [id, proof] of Object.entries(source.scopes.serialize())) {
     if (proof.parentSessionID) parentSessionCache.set(id, proof.parentSessionID);
   }
-  // Bootstrap old retained identities with the same bounded background workers;
-  // startup and the serial event queue never wait for a thousand SDK requests.
-  for (const id of Object.keys(persisted?.sessions ?? {})) source.requestMetadata(id, false);
+  // The restored SID list is durable business work, not an LRU query cache.
+  // Keep only compact IDs behind a cursor and admit a small look-ahead when
+  // workers free slots. Submitting the whole list used to silently drop every
+  // identity beyond 4 active + 2048 queued, including fresh foreground work.
+  const bootstrapIDs = Object.keys(persisted?.sessions ?? {});
+  source.queryStats.bootstrapTotal = bootstrapIDs.length;
+  let bootstrapIndex = 0;
+  let refilling = false;
+  source.refillMetadata = () => {
+    if (shutdownSignal.aborted) { bootstrapIDs.length = 0; source.refillMetadata = undefined; return; }
+    if (refilling) return;
+    refilling = true;
+    try {
+      while (!source.metadataPaused && bootstrapIndex < bootstrapIDs.length && source.jobs.length < QUERY_CONCURRENCY) {
+        const result = source.requestMetadata(bootstrapIDs[bootstrapIndex]!, false);
+        if (result === "deferred") break; // leave this obligation at the cursor
+        bootstrapIndex++;
+        source.queryStats.bootstrapVisited++;
+        if (result === "scheduled") source.queryStats.bootstrapAdmitted++;
+        else source.queryStats.bootstrapSkipped++;
+      }
+      if (bootstrapIndex === bootstrapIDs.length) { bootstrapIDs.length = 0; source.refillMetadata = undefined; }
+    } finally { refilling = false; }
+  };
+  source.refillMetadata();
   // Establish the epoch when ingress is ready, not before asynchronous startup.
   responseRuntime(active).observedSince = Date.now();
 
   const event = (payload: { event?: unknown }): Promise<void> => {
     if (shutdownSignal?.aborted) return Promise.resolve();
     const rawEvent = payload?.event;
-    const receivedAt = Date.now();
     const incoming = unwrapIncomingEvent(rawEvent);
+    if (isContentOnlyEvent(incoming?.type)) return Promise.resolve();
+    if (incoming?.type === "server.instance.disposed") return dispose();
+    const receivedAt = Date.now();
     let ingressEpoch = 0;
     if (incoming) {
       const properties = asRecord(incoming.properties) ?? asRecord(incoming.data) ?? {};
@@ -552,7 +736,11 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
         const deltaWork = live && (incoming.type.endsWith(".delta") || incoming.type.startsWith("session.next.step."))
           && (id ? !metadata.completed.has(id) : responseRuntime(active).current.has(sid));
         const toolWork = live && properties.part?.type === "tool" && !["completed", "error"].includes(properties.part.state?.status);
-        if (assistantWork) source.responses.set(sid, id);
+        if (assistantWork) {
+          source.responses.set(sid, id);
+          const executionID = incoming.executionID ?? properties.executionID;
+          if (typeof executionID === "string") source.responseExecutions.set(id, { sessionID: sid, executionID });
+        }
         if (assistantWork || deltaWork || toolWork || lifecycleStateForEvent(incoming.type, properties, incoming)) {
           source.epochs.set(sid, (source.epochs.get(sid) ?? 0) + 1);
         }
@@ -560,7 +748,30 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
       }
     }
     const next = eventQueue
-      .then(() => handleEvent(
+      .then(async () => {
+        if (incoming?.type === "pulse.observation.gap") {
+          await isolateObservation(activity, active, incoming.sessionID);
+          return;
+        }
+        const controlID = typeof incoming?.sourceEventID === "string" ? incoming.sourceEventID : incoming?.id;
+        if (!controlID || controlID !== source.lastControlID) {
+          const report = await activity.writer.flush();
+          for (const committed of report.committed) activity.writtenFacts.add(activityFactKey(committed));
+          if (report.degraded && report.pendingCount === 0) {
+            // A budget rejection permanently poisons that writer's admission.
+            // Drain the accepted prefix, then replace BOTH writer and epoch.
+            await activity.writer.close();
+            activity.writer = createReliableActivityWriter(activity.ledger, { lease });
+            await isolateObservation(activity, active);
+            (input as AnyRecord).onActivityGap?.();
+            warn("activity collection resumed in a new observation epoch");
+          }
+          await persistScopeRegistry(source, totals);
+          try { await retryPendingPersistence(source, storage, totals, undefined); }
+          catch (error) { warn("usage retry remains degraded", error); }
+          source.lastControlID = controlID;
+        }
+        await handleEvent(
         rawEvent,
         input,
         storage,
@@ -571,7 +782,15 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
         parentSessionCache,
         receivedAt,
         ingressEpoch,
-      ))
+        );
+        if (incoming?.type === "message.updated" || lifecycleStateForEvent(incoming?.type ?? "", incoming?.properties ?? {}, incoming ?? {})) {
+          // Completed history already owns compact canonical contributions;
+          // it cannot own live progress. Retiring that transient state needs
+          // only current active/pending IDs, never another full history read.
+          const retained = new Set([...active.keys(), ...source.pendingPersistence.keys()]);
+          retireContentMetadata(metadata, retained);
+        }
+      })
       .catch((error) => {
         warn("event handling failed", error);
       });
@@ -579,8 +798,42 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
     return next;
   };
 
-  (input as AnyRecord).registerV2Drain?.(() => eventQueue);
-  return { event };
+  let disposed: Promise<void> | undefined;
+  const dispose = () => disposed ??= (async () => {
+    shutdown.abort();
+    source.refillMetadata?.();
+    source.jobs.length = 0;
+    await Promise.allSettled(source.background);
+    await eventQueue;
+    try {
+      for (let index = 0; index < Math.ceil(METADATA_PENDING_LIMIT / METADATA_BATCH_SIZE); index++) await persistScopeRegistry(source, totals);
+      for (let index = 0; index < Math.ceil(PENDING_PERSISTENCE_LIMIT / 32); index++) await retryPendingPersistence(source, storage, totals, undefined);
+    }
+    catch (error) { warn("shutdown projection retry remains degraded", error); }
+    await isolateObservation(activity, active);
+    const reports = await Promise.allSettled([activity.writer.close(), usage.close()]);
+    for (const report of reports) {
+      if (report.status === "rejected") warn("shutdown flush failed; facts remain uncommitted", report.reason);
+      else if (report.value.pendingCount) warn("shutdown has uncommitted facts", { pendingCount: report.value.pendingCount });
+    }
+    if (source.pendingPersistence.size || source.pendingSessionMetadata.size || source.scopeDirty.size || source.pendingMessageScopes.size) {
+      warn("shutdown retains unconfirmed observations", { usage: source.pendingPersistence.size,
+        metadata: source.pendingSessionMetadata.size, scopes: source.scopeDirty.size, messages: source.pendingMessageScopes.size });
+    }
+    disposeContentMetadata(metadata);
+    await lease.release();
+  })();
+  (input as AnyRecord).registerV2Drain?.(dispose);
+  return { event, dispose, runtimeStats: () => ({ activeResponses: active.size,
+    retainedProgress: metadata.progress.size, retainedRoles: metadata.roles.size,
+    durablePending: source.pendingPersistence.size + (pendingUsageByStorage.get(storage) ?? 0), sourcePending: source.pendingPersistence.size,
+    compactCompleted: completedMessageIDs.size,
+    pendingSessionMetadata: source.pendingSessionMetadata.size,
+    metadataProjection: { ...source.metadataProjection },
+    pendingTools: source.tools.size,
+    compactActivityIdentities: activity.writtenFacts.size, pendingMetadata: source.jobs.length + source.workers,
+    metadata: { ...source.queryStats, queued: source.jobs.length, workers: source.workers } }) };
+  } catch (error) { shutdown.abort(); await lease.release(); throw error; }
 };
 
 export function resolveProjectDirectory(input: Pick<PluginInput, "directory" | "worktree">): string {
@@ -604,32 +857,8 @@ function initializeActivityRuntime(runtime: ActivityRuntime): Promise<void> {
   const result = previous.then(() => initializeActivityRuntimeNow(runtime));
   const settled = result.then(() => undefined, () => undefined);
   activityInitializationQueues.set(key, settled);
+  void settled.then(() => { if (activityInitializationQueues.get(key) === settled) activityInitializationQueues.delete(key); });
   return result;
-}
-
-async function initializeTotals(storage: HistoryStorage, totals: TotalsStorage, historyPath: string): Promise<void> {
-  const retained = await storage.read();
-  const recoverable = await readHistoryFile(historyPath);
-  try {
-    await seedRetainedTotals(totals, retained, recoverable);
-  } catch (error) {
-    if (!isCorruptTotalsError(error)) throw error;
-    warn("totals ledger is corrupt", error);
-    await totals.quarantine();
-    await seedRetainedTotals(totals, retained, recoverable);
-  }
-}
-
-async function seedRetainedTotals(
-  totals: TotalsStorage,
-  retained: readonly HistoryRecord[],
-  recoverable: readonly HistoryRecord[] = retained,
-): Promise<void> {
-  await totals.seed(recoverable);
-  await totals.backfillSpeed(recoverable);
-  await totals.applyMany(retained, {
-    retainedMessageIDs: retained.map((record) => record.messageID),
-  });
 }
 
 async function initializeActivityRuntimeNow(runtime: ActivityRuntime): Promise<void> {
@@ -688,7 +917,7 @@ async function initializeActivityRuntimeNow(runtime: ActivityRuntime): Promise<v
 
   if (recovery.length === 0) return;
   try {
-    const appended = await runtime.ledger.appendMany(recovery);
+    const appended = (await runtime.writer.enqueue(recovery)).committed;
     for (const event of appended) runtime.writtenFacts.add(activityFactKey(event));
   } catch (error) {
     warn("activity recovery write failed", error);
@@ -769,7 +998,11 @@ function reliableInstanceBoundary(
 }
 
 function rawEventKey(type: string, event: AnyRecord): string {
-  return stableSerialize([type, event]);
+  const properties = asRecord(event.properties) ?? {};
+  const info = eventInfo(properties, event);
+  return stableSerialize([type, event.id, event.revision, properties.sessionID, properties.messageID,
+    properties.status, properties.state, properties.parentID, properties.parentSessionID,
+    info?.id, info?.sessionID, info?.role, info?.time, info?.tokens, info?.cost]);
 }
 
 function needsActivityIdentity(type: string, properties: AnyRecord, event: AnyRecord): boolean {
@@ -810,6 +1043,7 @@ function prepareLifecycleActivityEvent(
   const observedAt = activityObservedAt(properties, event, timestamp);
   const sourceID = sourceEventID(type, properties, event);
   const assignmentKey = stableSerialize([
+    runtime.sessionEpochs.get(sessionID) ?? runtime.instanceID,
     "lifecycle",
     type,
     sourceID ?? null,
@@ -831,7 +1065,11 @@ function prepareLifecycleActivityEvent(
     sessionID,
     timestamp,
     observedAt,
-    instanceID: runtime.instanceID,
+    instanceID: runtime.sessionEpochs.get(sessionID) ?? runtime.instanceID,
+    ...(readStringFrom([event, properties], ["executionID"]) ? { executionID: readStringFrom([event, properties], ["executionID"]) } : {}),
+    ...(sourceID ? { sourceEventID: readStringFrom([event, properties], ["sourceEventID"]) ?? sourceID } : {}),
+    ...(numberOrUndefined(event.sourceSequence ?? event.durable?.seq) === undefined ? {}
+      : { sourceSequence: numberOrUndefined(event.sourceSequence ?? event.durable?.seq) }),
     ...(parentSessionID ? { parentSessionID } : {}),
     ...boundary,
   } as const;
@@ -863,6 +1101,7 @@ function prepareParentActivityEvent(
   const observedAt = activityObservedAt(properties, event, timestamp);
   const sourceID = sourceEventID(type, properties, event);
   const assignmentKey = stableSerialize([
+    runtime.sessionEpochs.get(sessionID) ?? runtime.instanceID,
     "parent",
     type,
     sourceID ?? null,
@@ -884,6 +1123,9 @@ function prepareParentActivityEvent(
     timestamp,
     observedAt,
     instanceID: runtime.instanceID,
+    ...(sourceID ? { sourceEventID: readStringFrom([event, properties], ["sourceEventID"]) ?? sourceID } : {}),
+    ...(numberOrUndefined(event.sourceSequence ?? event.durable?.seq) === undefined ? {}
+      : { sourceSequence: numberOrUndefined(event.sourceSequence ?? event.durable?.seq) }),
     ...boundary,
   } as const;
   const eventID = sourceID
@@ -908,9 +1150,18 @@ async function safeAppendLifecycle(
   const factKey = activityFactKey(event);
   if (runtime.writtenFacts.has(factKey)) return;
   try {
-    const appended = await runtime.ledger.appendLifecycle(event);
-    runtime.writtenFacts.add(activityFactKey(appended));
+    const report = await runtime.writer.enqueue([event]);
+    for (const appended of report.committed) runtime.writtenFacts.add(activityFactKey(appended));
+    const last = runtime.observations.get(event.sessionID);
+    if (!last || (event.timestamp >= last.timestamp && ((event as AnyRecord).sourceSequence === undefined
+      || (last as AnyRecord).sourceSequence === undefined || (event as AnyRecord).sourceSequence >= (last as AnyRecord).sourceSequence))) {
+      if (isActiveState(event.state)) runtime.observations.set(event.sessionID, event);
+      else runtime.observations.delete(event.sessionID);
+    }
+    if (report.degraded) warn("activity persistence degraded", { pendingCount: report.pendingCount });
   } catch (error) {
+    runtime.sessionEpochs.set(event.sessionID, randomUUID()); runtime.observations.delete(event.sessionID);
+    if (event.executionID) runtime.invalidExecutions.add(event.executionID);
     warn("activity lifecycle write failed", error);
   }
 }
@@ -922,8 +1173,9 @@ async function safeAppendParent(
   const factKey = activityFactKey(event);
   if (runtime.writtenFacts.has(factKey)) return;
   try {
-    const appended = await runtime.ledger.appendParent(event);
-    runtime.writtenFacts.add(activityFactKey(appended));
+    const report = await runtime.writer.enqueue([event]);
+    for (const appended of report.committed) runtime.writtenFacts.add(activityFactKey(appended));
+    if (report.degraded) warn("activity persistence degraded", { pendingCount: report.pendingCount });
   } catch (error) {
     warn("activity parent write failed", error);
   }
@@ -990,6 +1242,43 @@ function namespacedSourceEventID(
   kind: "lifecycle" | "parent",
 ): string {
   return `${ACTIVITY_EVENT_NAMESPACE}:source:${kind}:${encodeURIComponent(type)}:${encodeURIComponent(sourceID)}`;
+}
+
+/** Freeze only observed time, never the wall clock on reconnect/overflow. */
+async function isolateObservation(runtime: ActivityRuntime, active: Map<string, ActiveState>, sessionID?: string): Promise<void> {
+  for (const [id, last] of runtime.observations) {
+    if (sessionID && id !== sessionID) continue;
+    if (last.executionID) runtime.invalidExecutions.add(last.executionID);
+    if (last.kind === "lifecycle" && isActiveState(last.state)) {
+      const terminal = normalizeActivityEvent({ ...last, state: "stopped", sourceEventID: undefined, sourceSequence: undefined, seq: runtime.nextSeq++,
+        eventID: `${ACTIVITY_EVENT_NAMESPACE}:gap:${randomUUID()}`, instanceEndedAt: last.timestamp, lastObservedAt: last.timestamp });
+      if (terminal?.kind === "lifecycle") await safeAppendLifecycle(runtime, terminal);
+    }
+    runtime.observations.delete(id);
+    runtime.sessionEpochs.set(id, randomUUID());
+  }
+  if (!sessionID) { runtime.instanceID = randomUUID(); runtime.nextSeq = 1; runtime.sessionEpochs.clear(); }
+  for (const [id, state] of active) if (!sessionID || state.sessionID === sessionID) active.delete(id);
+  const responses = responseRuntime(active);
+  if (sessionID) { responses.current.delete(sessionID); responses.closed.add(sessionID); }
+  else { responses.current.clear(); responses.closed.clear(); }
+  responses.observedSince = Date.now();
+  const metadata = runtimeContentMetadata(active);
+  metadata.progress.clear(); metadata.roles.clear();
+  const source = sourcesByRuntime.get(active);
+  if (source) {
+    if (sessionID) source.queried.delete(sessionID); else source.queried.clear();
+    for (const id of source.outstanding) source.metadataGeneration.set(id, (source.metadataGeneration.get(id) ?? 0) + 1);
+    for (const [id, owner] of source.responseExecutions) if (!sessionID || owner.sessionID === sessionID) source.responseExecutions.delete(id);
+    for (const [id, tool] of source.tools) if (!sessionID || tool.sessionID === sessionID) source.tools.delete(id);
+    if (sessionID) {
+      source.states.delete(sessionID); source.responses.delete(sessionID);
+      source.epochs.set(sessionID, (source.epochs.get(sessionID) ?? 0) + 1);
+    } else {
+      source.states.clear(); source.responses.clear();
+      for (const [id, epoch] of source.epochs) source.epochs.set(id, epoch + 1);
+    }
+  }
 }
 
 function activityObservedAt(properties: AnyRecord, event: AnyRecord, timestamp: number): number {
@@ -1275,6 +1564,39 @@ async function handleEvent(
     const type = typeof event.type === "string" ? event.type : "";
     const properties = asRecord(event.properties) ?? asRecord(event.data) ?? {};
     const source = sourcesByRuntime.get(active)!;
+    if (type === "pulse.activity") {
+      const fact = asRecord(properties.fact);
+      if (!fact || typeof fact.sessionID !== "string") return;
+      if (fact.kind === "execution-scope" && activity.invalidExecutions.has(fact.executionID)) return;
+      const instanceID = activity.sessionEpochs.get(fact.sessionID) ?? activity.instanceID;
+      const assignmentKey = stableSerialize([instanceID, fact]);
+      const normalized = activity.assignments.get(assignmentKey) ?? normalizeActivityEvent({ ...fact, version: ACTIVITY_VERSION,
+        instanceID, seq: activity.nextSeq++, observedAt: fact.timestamp });
+      if (!normalized) return;
+      activity.assignments.set(assignmentKey, normalized);
+      if (activity.writtenFacts.has(activityFactKey(normalized))) return;
+      try {
+        const report = await activity.writer.enqueue([normalized]);
+        for (const committed of report.committed) activity.writtenFacts.add(activityFactKey(committed));
+        const last = activity.observations.get(fact.sessionID);
+        if (last?.kind === "lifecycle" && isActiveState(last.state) && last.executionID === normalized.executionID && normalized.timestamp > last.timestamp) {
+          activity.observations.set(fact.sessionID, { ...last, timestamp: normalized.timestamp });
+        }
+      } catch (error) {
+        activity.invalidExecutions.add(fact.executionID);
+        activity.sessionEpochs.set(fact.sessionID, randomUUID()); activity.observations.delete(fact.sessionID);
+        warn("work activity persistence degraded", error);
+      }
+      return;
+    }
+    if (type === "pulse.tool") {
+      if (typeof properties.toolID === "string" && typeof properties.sessionID === "string") {
+        const key = JSON.stringify([properties.sessionID, properties.executionID ?? null, properties.stepID ?? properties.messageID ?? null, properties.toolID]);
+        if (properties.pending) source.tools.set(key, { sessionID: properties.sessionID, executionID: properties.executionID, pending: true });
+        else source.tools.delete(key);
+      }
+      return;
+    }
     const sessionID = readSessionIDFromEvent(type, properties, event);
     const info = eventInfo(properties, event);
     let messageProof: CompactScopeEvidence | undefined;
@@ -1299,25 +1621,32 @@ async function handleEvent(
           asRecord(properties.session), asRecord(event.session), properties, event,
           asRecord(properties.info), asRecord(event.info), info,
         ]);
-        if (sessionAgent) await totals.setSessionAgent(sessionID, sessionAgent);
+        if (sessionAgent) {
+          queueSessionMetadata(source, sessionID, [sessionAgent]);
+          await persistScopeRegistry(source, totals);
+        }
       }
       if (info?.role === "assistant") {
         messageProof = source.scopes.observeMessageMetadata(sessionID, info);
         const id = readMessageID(properties, info);
         if (id && messageProof.sourceScope === "magic-message") {
           source.messageScopes.set(id, messageProof);
-          await totals.excludeMessage(id, messageProof);
+          source.pendingMessageScopes.add(id);
+          await persistScopeRegistry(source, totals);
           const old = (await storage.read()).find((record) => record.messageID === id);
-          if (old) { const annotated = { ...old, scope: messageProof }; await storage.upsert(annotated); }
+          if (old) { const annotated = { ...old, scope: messageProof }; await persistCompletedRecord(source, storage, totals, annotated); }
           retireResponse(active, id, sessionID);
           completedMessageIDs.add(id);
         }
       }
       scopeChanged = source.scopes.revision !== before;
-      if (scopeChanged) source.metadataGeneration.set(sessionID, (source.metadataGeneration.get(sessionID) ?? 0) + 1);
+      if (scopeChanged) {
+        source.metadataGeneration.set(sessionID, (source.metadataGeneration.get(sessionID) ?? 0) + 1);
+        source.scopeDirty.add(sessionID);
+      }
       discardExcludedPersistence(source);
       source.requestMetadata(sessionID);
-      if (parent) source.requestMetadata(parent);
+      if (parent) source.requestMetadata(parent, true, true);
     }
     const messageID = readMessageID(properties, info ?? {});
     const excluded = sessionID && (!eligibleSession(source, sessionID)
@@ -1335,12 +1664,21 @@ async function handleEvent(
     }
     if (scopeChanged) await persistScopeRegistry(source, totals);
     const lifecycle = lifecycleStateForEvent(type, properties, event);
-    if (sessionID && lifecycle) source.states.set(sessionID, lifecycle);
+    const eventExecutionID = event.executionID ?? properties.executionID;
+    const observedExecutionID = sessionID ? activity.observations.get(sessionID)?.executionID : undefined;
+    const staleTerminal = lifecycle && !isActiveState(lifecycle) && eventExecutionID && observedExecutionID && eventExecutionID !== observedExecutionID;
+    if (sessionID && lifecycle && !staleTerminal) {
+      source.states.set(sessionID, lifecycle);
+      if (!isActiveState(lifecycle)) for (const [key, tool] of source.tools) {
+        if (tool.sessionID === sessionID && tool.executionID === (event.executionID ?? properties.executionID)) source.tools.delete(key);
+      }
+    }
     const part = asRecord(properties.part);
     if (part?.type === "tool" && typeof part.id === "string" && sessionID) {
-      source.tools.set(part.id, { sessionID, pending: !["completed", "error"].includes(part.state?.status) });
+      source.tools.set(JSON.stringify([sessionID, eventExecutionID ?? null, part.messageID ?? properties.messageID ?? null, part.id]),
+        { sessionID, executionID: eventExecutionID, pending: !["completed", "error"].includes(part.state?.status) });
     }
-    recordResponseLifecycle(active, type, properties, event, receivedAt);
+    if (!staleTerminal) recordResponseLifecycle(active, type, properties, event, receivedAt);
     const explicitTimestamp = explicitEventTimestamp(event, properties);
     const rawKey = explicitTimestamp === undefined && needsActivityIdentity(type, properties, event)
       ? rawEventKey(type, event)
@@ -1389,7 +1727,7 @@ async function handleEvent(
       recordStepFallback(active, completedMessageIDs, properties, event, timestamp);
       return;
     }
-    if (isIdleEvent(type, properties, event)) {
+    if (isIdleEvent(type, properties, event) && !staleTerminal) {
       await flushIdleStates(
         input,
         storage,
@@ -1404,7 +1742,8 @@ async function handleEvent(
       );
       // An authoritative terminal event retires only this session's tool
       // ownership. A still-busy legitimate child remains independently active.
-      for (const [id, tool] of source.tools) if (tool.sessionID === sessionID) source.tools.delete(id);
+      for (const [id, tool] of source.tools) if (tool.sessionID === sessionID
+        && (eventExecutionID === undefined || tool.executionID === eventExecutionID)) source.tools.delete(id);
       await retryPendingPersistence(source, storage, totals, sessionID);
     }
   } catch (error) {
@@ -1569,7 +1908,8 @@ async function handleMessageUpdated(
   const retained = await storage.read().catch((error) => { warn("history read failed", error); return []; });
   const previous = source.pendingPersistence.get(messageID)?.record ?? retained.find((record) => record.messageID === messageID);
   const ledger = await totals.read().catch(() => undefined);
-  const snapshot = ledger?.open[messageID] ?? ledger?.settled[messageID];
+  const snapshot = (ledger && Object.prototype.hasOwnProperty.call(ledger.open, messageID) ? ledger.open[messageID] : undefined)
+    ?? (ledger && Object.prototype.hasOwnProperty.call(ledger.settled, messageID) ? ledger.settled[messageID] : undefined);
   if (snapshot === true) {
     // No reversible contribution survives. Do not reconstruct a history slot
     // or manufacture speed coverage from an already-accounted old response.
@@ -1588,7 +1928,10 @@ async function handleMessageUpdated(
     return;
   }
   const priorUpdate = coerceCompletionUpdate((prior as MeasuredHistoryRecord | undefined)?.update);
-  const fingerprint = createHash("sha256").update(stableSerialize(properties.v2Completion ?? info)).digest("hex");
+  const fingerprint = createHash("sha256").update(stableSerialize(properties.v2Completion ?? {
+    id: info.id, sessionID: info.sessionID, role: info.role, agent: info.agent, model: info.model,
+    tokens: info.tokens, cost: info.cost, finish: info.finish, time: info.time,
+  })).digest("hex");
   const update: CompletionUpdate = { source: "live", instanceID: activity.instanceID, sequence: metadata.nextSequence++, receivedAt,
     ...(numberOrUndefined(event.revision ?? properties.revision) !== undefined ? { revision: numberOrUndefined(event.revision ?? properties.revision) } : {}),
     fingerprint, seenFingerprints: [...new Set([...(priorUpdate?.seenFingerprints ?? []), ...(priorUpdate ? [priorUpdate.fingerprint] : []), fingerprint])] };
@@ -1608,8 +1951,8 @@ async function handleMessageUpdated(
     input: exactOrFallback(exactTokens.input, fallback.input, 0),
     output: exactOrFallback(exactTokens.output, fallback.output, 0),
     reasoning: exactOrFallback(exactTokens.reasoning, fallback.reasoning, 0),
-    cacheRead: cacheOrFallback(exactTokens.cacheRead, fallback.cacheRead),
-    cacheWrite: cacheOrFallback(exactTokens.cacheWrite, fallback.cacheWrite),
+    cacheRead: exactOrFallback(exactTokens.cacheRead, fallback.cacheRead, prior?.tokens.cacheRead ?? 0),
+    cacheWrite: exactOrFallback(exactTokens.cacheWrite, fallback.cacheWrite, prior?.tokens.cacheWrite ?? 0),
   };
   const quality: HistoryRecordQuality = exactTokens.output !== undefined && exactTokens.input !== undefined && (exactTokens.reasoning !== undefined || tokens.reasoning === 0) ? "exact" : "provisional";
   if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") {
@@ -1640,7 +1983,7 @@ async function handleMessageUpdated(
     sessionID,
     parentSessionID,
     model: modelName(info) ?? state?.model ?? previous?.model,
-    cost: numberOrUndefined(info.cost) ?? state?.cost ?? 0,
+    cost: numberOrUndefined(info.cost) ?? state?.cost ?? prior?.cost ?? 0,
     tokens,
     samples: [],
     state,
@@ -1686,6 +2029,7 @@ async function flushIdleStates(
   responseRuntime(active).closed.add(sessionID);
   const entries = [...active.entries()].filter(([, state]) => state.sessionID === sessionID);
   for (const [key, state] of entries) {
+    retireResponse(active, state.messageID, sessionID);
     active.delete(key);
     if (!state.legacy.hasData && !state.v2.hasData && Object.keys(state.fallbackTokens).length === 0) continue;
     if (state.messageID.startsWith("__pending__:")) continue;
@@ -1727,8 +2071,9 @@ async function flushIdleStates(
       completedAt: timestamp,
       quality: "provisional",
     });
-    const wrote = await safeUpsert(storage, totals, record);
-    if (!wrote) active.set(key, state);
+    // Failed provisional persistence belongs to the committer, not a LIVE
+    // response object kept forever after an authoritative terminal.
+    await persistCompletedRecord(sourcesByRuntime.get(active)!, storage, totals, record);
   }
 }
 
@@ -1978,48 +2323,23 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 
 async function safeUpsert(
   storage: HistoryStorage,
-  totals: TotalsStorage,
+  _totals: TotalsStorage,
   record: HistoryRecord,
 ): Promise<boolean> {
-  try {
-    await storage.upsert(record);
-  } catch (error) {
-    warn("history write failed", error);
-    return false;
-  }
-
-  let retained: readonly HistoryRecord[];
-  try {
-    retained = await storage.read();
-  } catch (error) {
-    warn("totals write failed", error);
-    return false;
-  }
-
-  try {
-    const retainedMessageIDs = retained.map((entry) => entry.messageID);
-    const stored = retained.find((entry) => entry.messageID === record.messageID);
-    if (stored) {
-      await totals.apply(stored, { retainedMessageIDs });
-    } else {
-      await totals.apply(record, { retainedMessageIDs });
-    }
-    return true;
-  } catch (error) {
-    if (!isCorruptTotalsError(error)) {
-      warn("totals write failed", error);
-      return false;
-    }
-    warn("totals ledger is corrupt", error);
+  const committer = committersByStorage.get(storage);
+  if (committer) {
     try {
-      await totals.quarantine();
-      await seedRetainedTotals(totals, retained);
-      return true;
-    } catch (recoveryError) {
-      warn("totals write failed", recoveryError);
-      return false;
+      const report = await committer.upsert(record);
+      pendingUsageByStorage.set(storage, report.pendingCount);
+      if (report.committed) acceptedUsageByStorage.delete(storage);
+      else acceptedUsageByStorage.set(storage, record);
+      return report.committed;
+    } catch (error) {
+      acceptedUsageByStorage.delete(storage); pendingUsageByStorage.delete(storage);
+      warn("usage commit failed", error); return false;
     }
   }
+  throw new Error("Backend usage committer is not initialized");
 }
 
 function resolveOptions(candidate: unknown): ServerOptions {
@@ -2142,49 +2462,245 @@ function isRecord(value: unknown): value is AnyRecord {
 /** V1 hooks are retained explicitly; V2 loads setup, never returned hooks. */
 export async function setup(ctx: V2ServerContext): Promise<() => Promise<void>> {
   const controller = new AbortController();
+  const backendController = new AbortController();
+  const budget = createQueryBudget(controller.signal);
+  const metadataCache = new Map<string, { session: AnyRecord; at: number }>();
+  let metadataEpoch = 0;
+  const getSession = async (sessionID: string, signal: AbortSignal, fresh = false) => {
+    const cached = metadataCache.get(sessionID);
+    if (!fresh && cached && performance.now() - cached.at < QUERY_RETRY_MS) return cached.session;
+    const epoch = metadataEpoch;
+    const response = await budget.run(signal, () => ctx.session.get({ sessionID }, { signal }));
+    signal.throwIfAborted();
+    if (epoch !== metadataEpoch) throw new Error("metadata belongs to a disconnected observation epoch");
+    if (response.id !== sessionID) throw new Error("V2 metadata response belongs to another session");
+    const session = compactSessionMetadata(response);
+    metadataCache.delete(sessionID); metadataCache.set(sessionID, { session, at: performance.now() });
+    while (metadataCache.size > QUERY_CACHE_LIMIT) metadataCache.delete(metadataCache.keys().next().value!);
+    return session;
+  };
   const adapter = createV2EventAdapter();
   let drainBackend = () => Promise.resolve();
   const input = {
     directory: ctx.location.directory, worktree: ctx.location.directory,
     project: ctx.location.project,
-    v2Signal: controller.signal,
+    v2Signal: backendController.signal,
+    onActivityGap: () => adapter.invalidate(),
     registerV2Drain: (drain: () => Promise<void>) => { drainBackend = drain; },
-    client: { session: { get: async (parameters: { sessionID: string }, options: { signal: AbortSignal }) => {
+    client: { session: { get: async (parameters: { sessionID: string; classificationOnly?: boolean }, options: { signal: AbortSignal }) => {
       const signal = AbortSignal.any([controller.signal, options.signal]);
-      const session = await ctx.session.get(parameters, { signal });
+      const session = await getSession(parameters.sessionID, signal);
       signal.throwIfAborted();
-      if (session.id !== parameters.sessionID || session.location.directory !== ctx.location.directory) {
-        throw new Error("V2 metadata response belongs to another session or directory");
+      if (!parameters.classificationOnly && session.location.directory !== ctx.location.directory) {
+        throw new Error("V2 current-session metadata has contradictory directory evidence");
       }
+      // A matching foreign ancestor is classification evidence, never proof
+      // that its lifecycle belongs to this writer's directory.
       return session;
     } } },
-    readV2Idle: (sessionID: string, signal: AbortSignal) => readV2Idle(ctx, sessionID, AbortSignal.any([controller.signal, signal])),
+    readV2Idle: (sessionID: string, signal: AbortSignal) => {
+      const combined = AbortSignal.any([controller.signal, signal]);
+      return readV2Idle({ ...ctx, session: { get: ({ sessionID }: { sessionID: string }) => getSession(sessionID, combined, true) } } as V2ServerContext, sessionID, combined);
+    },
   } as unknown as PluginInput;
-  const hooks = await server(input, ctx.options);
-  const subscription = (async () => {
-    try {
-      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        if (controller.signal.aborted) break;
-        // The public stream is server-wide. One location instance is the sole
-        // writer for its own events; never attribute another directory to ctx.
-        const data = asRecord(event.data);
-        const dataLocation = asRecord(data?.location);
-        const location = event.location ?? dataLocation;
-        if ((event.location && event.location.directory !== ctx.location.directory)
-          || (dataLocation && dataLocation.directory !== ctx.location.directory)) continue;
-        // Location is optional in the public envelope, but unscoped session
-        // events from a server-wide subscription are not same-directory proof.
-        if (event.type.startsWith("session.") && !location) continue;
-        for (const adapted of adapter.events(event)) {
-          if (controller.signal.aborted) break;
-          await hooks.event?.({ event: adapted } as any);
+  let hooks: Awaited<ReturnType<typeof server>>;
+  try { hooks = await server(input, ctx.options); }
+  catch (error) { controller.abort(); backendController.abort(); adapter.clear(); throw error; }
+  // Execution transitions in the public stream can omit location even though
+  // adjacent model-step events are scoped. Never discard their original time,
+  // and never infer ownership from the frontend or the currently open route.
+  const directories = new Map<string, string>();
+  const activeDirectories = new Map<string, { timestamp: number; sequence?: number }>();
+  type PendingLocation = { events: AnyRecord[]; queued: boolean; controller?: AbortController };
+  const pending = new Map<string, PendingLocation>();
+  const lookups: Array<{ sessionID: string; entry: PendingLocation }> = [];
+  const requests = new Set<Promise<void>>();
+  let delivery = Promise.resolve();
+  let workers = 0;
+  let connected = false;
+  const enqueue = (job: () => Promise<void>) => {
+    // Admission is stopped by the subscription signal. Once admitted, a
+    // delivery owns its place and must drain even if disposal arrives now.
+    const result = delivery.then(job);
+    delivery = result.catch((error) => warn("V2 event delivery failed", error));
+    return delivery;
+  };
+  const rememberDirectory = (sessionID: string, directory: string) => {
+    directories.delete(sessionID); directories.set(sessionID, directory);
+    while (directories.size > 2048) {
+      const candidate = [...directories.keys()].find((id) => !activeDirectories.has(id));
+      if (!candidate) break;
+      directories.delete(candidate);
+    }
+  };
+  const sever = async (sessionID?: string) => {
+    await hooks.event?.({ event: { type: "pulse.observation.gap", sessionID } } as any);
+    adapter.invalidate(sessionID);
+    if (sessionID) activeDirectories.delete(sessionID); else activeDirectories.clear();
+  };
+  const apply = async (event: AnyRecord, session?: AnyRecord) => {
+    for (const adapted of adapter.events(event)) {
+      const sid = adapted.properties?.sessionID;
+      const state = lifecycleStateForEvent(adapted.type, adapted.properties ?? {}, adapted);
+      if (typeof sid === "string" && state) {
+        const previous = activeDirectories.get(sid);
+        const timestamp = numberOrUndefined(adapted.timestamp) ?? 0;
+        const sequence = numberOrUndefined(adapted.sourceSequence);
+        if (!previous || (timestamp >= previous.timestamp && (previous.sequence === undefined || sequence === undefined || sequence >= previous.sequence))) {
+          if (isActiveState(state)) {
+            activeDirectories.set(sid, { timestamp, sequence }); rememberDirectory(sid, ctx.location.directory);
+          } else activeDirectories.delete(sid);
         }
       }
-    } catch (error) {
-      if (!controller.signal.aborted) warn("V2 event subscription failed", error);
+      // Reuse the verified session entity in the normal scope/ancestry guards
+      // before applying its queued lifecycle; known MC proof is not discarded
+      // merely because this lookup was initially needed for location.
+      await hooks.event?.({ event: session
+        ? { ...adapted, properties: { ...adapted.properties, session } } : adapted } as any);
+    }
+  };
+  const flush = async (sessionID: string, directory: string, session?: AnyRecord) => {
+    const entry = pending.get(sessionID);
+    if (!entry) return;
+    pending.delete(sessionID); entry.controller?.abort();
+    if (directory !== ctx.location.directory) return;
+    for (const [index, event] of entry.events.entries()) await apply(event, index === 0 ? session : undefined);
+  };
+  const pump = () => {
+    while (!controller.signal.aborted && workers < 4 && lookups.length) {
+      const { sessionID, entry } = lookups.shift()!;
+      if (pending.get(sessionID) !== entry) continue;
+      entry.queued = false;
+      workers++;
+      const requestController = new AbortController();
+      entry.controller = requestController;
+      const signal = AbortSignal.any([controller.signal, requestController.signal]);
+      const request = (async () => {
+        try {
+          const session = await withTimeout(Promise.resolve().then(() => {
+            signal.throwIfAborted();
+            return getSession(sessionID, signal);
+          }), PARENT_LOOKUP_TIMEOUT_MS);
+          if (signal.aborted || session?.id !== sessionID || typeof session.location?.directory !== "string") return;
+          await enqueue(async () => {
+            // A scoped event may already have resolved or contradicted this
+            // lookup. Its newer evidence wins over a delayed metadata result.
+            if (pending.get(sessionID) !== entry) return;
+            rememberDirectory(sessionID, session.location.directory);
+            await flush(sessionID, session.location.directory, session);
+          });
+        } catch { /* Timeout/failure is unknown, never same-directory proof. */ }
+        finally { requestController.abort(); entry.controller = undefined; workers--; }
+      })();
+      requests.add(request);
+      void request.finally(() => { requests.delete(request); pump(); });
+    }
+  };
+  const receive = (event: AnyRecord) => {
+    if (!isV2ControlEvent(event.type)) return Promise.resolve();
+    return enqueue(async () => {
+    if (event.type === "server.connected") {
+      if (connected) {
+        for (const entry of pending.values()) entry.controller?.abort();
+        pending.clear(); lookups.length = 0; metadataCache.clear(); directories.clear(); metadataEpoch++;
+        await sever();
+      }
+      connected = true;
+      await apply(event); return;
+    }
+    const data = asRecord(event.data);
+    const dataLocation = asRecord(data?.location);
+    const location = event.location ?? dataLocation;
+    const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
+    if ((event.location && event.location.directory !== ctx.location.directory)
+      || (dataLocation && dataLocation.directory !== ctx.location.directory)) {
+      if (sessionID) {
+        // Contradictory envelopes are not ownership proof for either location.
+        const foreign = event.location?.directory !== ctx.location.directory
+          ? event.location?.directory : dataLocation?.directory;
+        directories.delete(sessionID);
+        await sever(sessionID);
+        await flush(sessionID, typeof foreign === "string" ? foreign : "");
+      }
+      return;
+    }
+    if (location) {
+      if (sessionID) {
+        rememberDirectory(sessionID, ctx.location.directory);
+        await flush(sessionID, ctx.location.directory);
+      }
+      await apply(event);
+      return;
+    }
+    if (!event.type.startsWith("session.")) { await apply(event); return; }
+    // Only lifecycle facts need deferred location proof. Never buffer content
+    // or make streaming deltas trigger metadata requests or ledger writes.
+    if (!sessionID || !["session.execution.started", "session.execution.succeeded", "session.execution.failed",
+      "session.execution.interrupted", "session.retry.scheduled", "session.status", "session.idle"].includes(event.type)) return;
+    const directory = directories.get(sessionID);
+    if (directory !== undefined) {
+      if (directory === ctx.location.directory) await apply(event);
+      return;
+    }
+    let entry = pending.get(sessionID);
+    if (!entry) {
+      if (pending.size >= 256) {
+        const oldest = pending.keys().next().value!;
+        const evicted = pending.get(oldest)!;
+        await sever(oldest);
+        evicted.controller?.abort(); pending.delete(oldest);
+        const queued = lookups.findIndex((item) => item.entry === evicted);
+        if (queued >= 0) lookups.splice(queued, 1);
+      }
+      entry = { events: [], queued: true }; pending.set(sessionID, entry);
+      lookups.push({ sessionID, entry });
+    } else if (!entry.queued && !entry.controller) {
+      // Retry only on a new lifecycle event, never on a timer or ledger poll.
+      entry.queued = true; lookups.push({ sessionID, entry });
+    }
+    // If proof stays unavailable under a flood, discard the unproven prefix
+    // rather than dropping just an idle/terminal and bridging an unknown gap.
+    if (entry.events.length >= 64) { await sever(sessionID); entry.events.length = 0; }
+    entry.events.push(event);
+    pump();
+    });
+  };
+  const subscription = (async () => {
+    let failures = 0;
+    while (!controller.signal.aborted) {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted) break;
+          await receive(event);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) warn("V2 event subscription interrupted", error);
+      }
+      if (controller.signal.aborted) break;
+      await enqueue(async () => {
+        for (const entry of pending.values()) entry.controller?.abort();
+        pending.clear(); lookups.length = 0; metadataCache.clear(); directories.clear(); metadataEpoch++; connected = false;
+        await sever();
+      });
+      // Recover on throw AND EOF; this is subscription backoff, not ledger or
+      // model polling. A new observation epoch never bridges the unknown gap.
+      await new Promise<void>((resolve) => {
+        const finish = () => { clearTimeout(timer); controller.signal.removeEventListener("abort", finish); resolve(); };
+        const timer = setTimeout(finish, Math.min(1000, 25 * 2 ** Math.min(failures++, 6)));
+        controller.signal.addEventListener("abort", finish, { once: true });
+      });
     }
   })();
-  return async () => { controller.abort(); await subscription; await drainBackend(); adapter.clear(); };
+  return async () => {
+    controller.abort();
+    for (const entry of pending.values()) entry.controller?.abort();
+    await subscription; await delivery;
+    // Known/scoped admitted events have now released any provable prefix.
+    // Remaining unknown-directory observations cannot safely be written.
+    pending.clear(); lookups.length = 0;
+    await Promise.allSettled(requests);
+    backendController.abort(); await drainBackend(); adapter.clear();
+  };
 }
 
 const plugin: PluginModule & { setup: typeof setup } = { id: "oc-tps", server, setup };

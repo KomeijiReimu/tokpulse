@@ -1,15 +1,36 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm as removeFiles, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { recordPartMetadata, server } from "../src/server.js";
+import { recordPartMetadata, server as createServer } from "../src/server.js";
 import { ActivityLedger } from "../src/runs-storage.js";
 import { getSessionAverageSummary } from "../src/statistics.js";
 import { createTotalsStorage, getExcludedMessageIDs, projectTotalsMeasurementScope } from "../src/totals-storage.js";
 import { filterHistoryRecords } from "../src/storage.js";
 import { replayActivity } from "../src/activity.js";
+import * as fixtureFS from "node:fs/promises";
+const { spyOn } = require("bun:test");
+
+const fixtureBackends = new Map<string, any[]>();
+async function server(...args: Parameters<typeof createServer>): ReturnType<typeof createServer> {
+  const hooks = await createServer(...args);
+  const directory = args[0].directory;
+  const backends = fixtureBackends.get(directory) ?? [];
+  backends.push(hooks); fixtureBackends.set(directory, backends);
+  return hooks;
+}
+async function closeFixture(directory: string) {
+  for (const hooks of fixtureBackends.get(directory) ?? []) await hooks.dispose?.();
+  fixtureBackends.delete(directory);
+}
+// Dispose ownership before removing the fixture root, not individual files
+// used by fault injection while the backend is intentionally still running.
+async function rm(...args: Parameters<typeof removeFiles>): ReturnType<typeof removeFiles> {
+  if (typeof args[0] === "string" && fixtureBackends.has(args[0])) await closeFixture(args[0]);
+  return removeFiles(...args);
+}
 
 async function eventually(check: () => Promise<boolean>): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -28,6 +49,96 @@ async function readTotals(historyPath: string): Promise<any> {
   return JSON.parse(await readFile(join(dirname(historyPath), "totals.json"), "utf8"));
 }
 
+test("R08 shared backend drops poisoned content before properties, metadata or persistence", async () => {
+  let queries = 0;
+  await backendCase(async ({ path, send, stats }) => {
+    const before = await readTotals(path);
+    let reads = 0;
+    for (const type of ["message.part.delta", "message.part.updated", "session.next.text.delta", "session.next.reasoning.delta", "session.next.tool.input.delta"]) {
+      await send({ type, get properties() { reads++; throw new Error("content properties are forbidden"); },
+        get data() { reads++; throw new Error("content data is forbidden"); } });
+    }
+    assert.equal(reads, 0);
+    assert.equal(queries, 0);
+    assert.deepEqual(await readTotals(path), before);
+    assert.equal(stats().compactActivityIdentities, 0);
+    assert.equal(stats().retainedProgress, 0);
+  }, 1, { get: async () => { queries++; return undefined; } });
+});
+
+test("R17 backend retires completed response/progress objects beyond the history window", async () => {
+  await backendCase(async ({ send, stats, path, restart }) => {
+    for (let index = 0; index < 40; index++) {
+      await send({ type: "message.updated", timestamp: index * 10,
+        properties: { info: { id: `memory_${index}`, sessionID: "s", role: "assistant", time: { created: index * 10 } } } });
+      await send(completionFact(`memory_${index}`, 1, 0, index * 10, index * 10 + 5));
+    }
+    assert.equal((await readRecords(path)).length, 1);
+    assert.equal(stats().activeResponses, 0);
+    assert.equal(stats().retainedProgress, 0);
+    assert.equal(stats().retainedRoles, 0);
+    assert.equal(stats().durablePending, 0);
+    assert.equal(stats().compactCompleted, 40);
+    await restart();
+    await send(completionFact("memory_0", 2, 0, 0, 5));
+    assert.equal((await readTotals(path)).sessions.s.tokens.output, 41, "compact canonical contributions retain late correction authority");
+  }, 1);
+});
+
+test("G1-04 ending one namespaced tool cannot delete another session, execution or step", async () => {
+  await backendCase(async ({ send, stats }) => {
+    const owners = [["a", "e1", "m1"], ["b", "e1", "m1"], ["a", "e2", "m1"], ["a", "e1", "m2"]];
+    for (const [sessionID, executionID, stepID] of owners) await send({ type: "pulse.tool", properties: {
+      sessionID, executionID, stepID, toolID: "shared", pending: true,
+    } });
+    assert.equal(stats().pendingTools, 4);
+    await send({ type: "pulse.tool", properties: { sessionID: "a", executionID: "e1", stepID: "m1", toolID: "shared", pending: false } });
+    assert.equal(stats().pendingTools, 3);
+  });
+});
+
+test("G1-05 late old terminal cannot flush the new execution LIVE response or tool", async () => {
+  await backendCase(async ({ send, stats }) => {
+    await send({ type: "session.status", timestamp: 0, executionID: "old", properties: { sessionID: "s", status: "busy" } });
+    await send({ type: "session.status", timestamp: 1000, executionID: "new", properties: { sessionID: "s", status: "busy" } });
+    await send({ type: "message.updated", timestamp: 1001, executionID: "new", properties: { info: {
+      id: "fresh", sessionID: "s", role: "assistant", time: { created: 1001 },
+    } } });
+    await send({ type: "pulse.tool", properties: { sessionID: "s", executionID: "new", stepID: "fresh", toolID: "same", pending: true } });
+    await send({ type: "session.error", timestamp: 10, executionID: "old", properties: { sessionID: "s" } });
+    assert.equal(stats().activeResponses, 1);
+    assert.equal(stats().pendingTools, 1);
+    await send({ type: "session.completed", timestamp: 1100, executionID: "new", properties: { sessionID: "s" } });
+    assert.equal(stats().activeResponses, 0);
+    assert.equal(stats().pendingTools, 0);
+  });
+});
+
+test("G1-07 failed metadata publication keeps old and newer agent/scope facts for healthy retry", async () => {
+  const rename = fixtureFS.rename;
+  let blocked = false;
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  const failure = spyOn(fixtureFS, "rename").mockImplementation(async (from: any, to: any) => {
+    if (blocked && String(to).endsWith("totals.json")) throw Object.assign(new Error("metadata EIO"), { code: "EIO" });
+    return rename(from, to);
+  });
+  try {
+    await backendCase(async ({ send, stats, path }) => {
+      blocked = true;
+      await send({ type: "session.updated", properties: { info: { id: "s", agent: "fixer" } } });
+      await send({ type: "session.updated", properties: { info: { id: "s", agent: "oracle", metadata: { magic_context: "hidden-run", role: "historian" } } } });
+      assert.equal(stats().pendingSessionMetadata, 1);
+      assert.equal((await readTotals(path)).sessionAgents, undefined, "failed publication cannot advance canonical confirmed metadata");
+      blocked = false;
+      await send({ type: "session.updated", properties: { info: { id: "healthy", agent: "build" } } });
+      const ledger = await readTotals(path);
+      assert.deepEqual(ledger.sessionAgents.s, ["fixer", "oracle"]);
+      assert.equal(ledger.sessionScopes.s.sourceScope, "magic-session");
+      assert.equal(stats().pendingSessionMetadata, 0);
+    });
+  } finally { failure.mockRestore(); warning.mockRestore(); }
+});
+
 async function receive(hooks: Awaited<ReturnType<typeof server>>, event: any): Promise<void> {
   const wall = event.receiveWall ?? event.timestamp ?? Date.now();
   const dateNow = Date.now;
@@ -45,21 +156,24 @@ async function receive(hooks: Awaited<ReturnType<typeof server>>, event: any): P
   await pending!;
 }
 
-async function backendCase(run: (context: { path: string; send: (event: any) => Promise<void>; restart: () => Promise<(event: any) => Promise<void>> }) => Promise<void>, maxRecords = 1000, sessionClient?: any, directoryPrefix = "oc-tps-backend-p1-"): Promise<void> {
+async function backendCase(run: (context: { path: string; send: (event: any) => Promise<void>; restart: () => Promise<(event: any) => Promise<void>>; stats: () => any }) => Promise<void>, maxRecords = 1000, sessionClient?: any, directoryPrefix = "oc-tps-backend-p1-"): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), directoryPrefix));
   const path = join(directory, "history.jsonl");
   const input = { directory, worktree: directory, ...(sessionClient ? { client: { session: sessionClient } } : {}) } as unknown as PluginInput;
+  let currentHooks: any;
   const restart = async () => {
+    await currentHooks?.dispose?.();
     const startupNow = Date.now;
     let hooks: Awaited<ReturnType<typeof server>>;
     try {
       Date.now = () => 0;
       hooks = await server(input, { historyPath: path, maxRecords });
+      currentHooks = hooks;
     } finally { Date.now = startupNow; }
     return (event: any) => receive(hooks, event);
   };
-  try { await run({ path, send: await restart(), restart }); }
-  finally { await rm(directory, { recursive: true, force: true }); }
+  try { await restart(); await run({ path, send: (event) => receive(currentHooks, event), restart, stats: () => currentHooks.runtimeStats() }); }
+  finally { await currentHooks?.dispose?.(); await rm(directory, { recursive: true, force: true }); }
 }
 function completionFact(id: string, output: number, reasoning: number, start: number, end: number) {
   const info: {
@@ -561,7 +675,8 @@ test("target pending tools prevent final-answer SDK reconciliation", async () =>
     let queries = 0;
     await backendCase(async ({ send }) => {
       await send({ type: "message.updated", timestamp: 0, properties: { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 0 } } } });
-      await send({ type: "message.part.updated", timestamp: 50, properties: { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running" } } } });
+      // Shared normalized low-frequency tool boundary (V2 adapter emits it).
+      await send({ type: "pulse.tool", timestamp: 50, properties: { toolID: "tool", messageID: "m", sessionID: "s", pending: true } });
       const fact = completionFact("m", 9, 0, 0, 100);
       fact.properties.info = { ...fact.properties.info, finish: "stop" } as any;
       await send(fact);
@@ -709,19 +824,20 @@ for (const failure of ["history", "totals"] as const) {
   });
 }
 
-test("late positive session scope discards failed persistence instead of upserting the hidden candidate", async () => {
+test("late positive session scope retracts recovered candidate from public projections", async () => {
   await backendCase(async ({ path, send }) => {
     await textGeneration(send, "hidden-failed", async () => { await rm(path, { force: true }); await mkdir(path); });
     await rm(path, { recursive: true, force: true });
     await writeFile(path, "");
     await send({ type: "session.updated", properties: { info: { id: "s", agent: "historian" } } });
     await send({ type: "session.idle", timestamp: 5000, properties: { sessionID: "s" } });
-    assert.deepEqual(await readRecords(path), []);
-    assert.equal((await readTotals(path)).sessions.s, undefined);
+    const ledger = await readTotals(path);
+    assert.deepEqual(filterHistoryRecords(await readRecords(path), ledger.sessionScopes), []);
+    assert.equal(projectTotalsMeasurementScope(ledger).sessions.s, undefined);
   });
 });
 
-test("permanent history failure parks exact evidence after three bounded lifecycle retries", async () => {
+test("persistent history failure retains non-LIVE exact evidence until healthy global control retry", async () => {
   const messages: string[] = [];
   const oldWarn = console.warn;
   console.warn = (message) => { messages.push(String(message)); };
@@ -729,12 +845,11 @@ test("permanent history failure parks exact evidence after three bounded lifecyc
     await backendCase(async ({ path, send }) => {
       await textGeneration(send, "parked", async () => { await rm(path, { force: true }); await mkdir(path); });
       for (let i = 0; i < 7; i++) await send({ type: "session.idle", timestamp: 2000 + i, properties: { sessionID: "s" } });
-      assert.equal(messages.filter((message) => message.includes("history write failed")).length, 4);
-      assert.equal(messages.filter((message) => message.includes("retry budget exhausted")).length, 1);
+      assert.ok(messages.some((message) => message.includes("degraded")), "failed retry is explicit, not silently committed");
       await rm(path, { recursive: true, force: true });
       await writeFile(path, "");
-      await send({ type: "session.idle", timestamp: 4000, properties: { sessionID: "s" } });
       assert.deepEqual(await readRecords(path), []); // no automatic polling/retry loop
+      await send({ type: "session.idle", timestamp: 4000, properties: { sessionID: "another" } });
       await send(completionFact("parked", 10, 0, 0, 1500)); // explicit repair opportunity
       const [record] = await readRecords(path);
       assert.equal(record.quality, "exact");
@@ -805,6 +920,28 @@ test("a rejected completion against externally persisted exact usage retires a g
 });
 
 test("a thousand restored sessions hydrate through four background workers, not the serial event queue", async () => {
+  // Optional isolated benchmark size; normal regression remains 1000.
+  const count = Number(process.env.TOKPULSE_BOOTSTRAP_TEST_COUNT ?? 1000);
+  assert.ok(Number.isInteger(count) && count >= 1 && count <= 4000);
+  await verifyRestoredHydration(count, false, process.env.TOKPULSE_BOOTSTRAP_METADATA ?? "unknown");
+});
+
+test("four thousand restored SIDs use lazy bounded admission without losing late or current-session metadata", async () => {
+  await verifyRestoredHydration(4000, true);
+});
+
+for (const mode of ["known", "success", "scope"]) test(`G1-07 successful ${mode} metadata bootstrap batches full-ledger operations`, async () => {
+  await verifyRestoredHydration(1000, false, mode);
+});
+
+test("G1-07 metadata batch failure pauses lazy admission and healthy traffic resumes every restored SID", async () => {
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  try { await verifyRestoredHydration(1000, false, "success", true); }
+  finally { warning.mockRestore(); }
+});
+
+async function verifyRestoredHydration(count: number, classifyLast = false, mode = "unknown", fault = false): Promise<void> {
+  assert.ok(["unknown", "known", "success", "scope"].includes(mode));
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-bootstrap-"));
   const historyPath = join(directory, "history.jsonl");
   let release!: () => void;
@@ -812,36 +949,157 @@ test("a thousand restored sessions hydrate through four background workers, not 
   let calls = 0;
   let inFlight = 0;
   let peak = 0;
+  const requested = new Map<string, number>();
+  const order: string[] = [];
+  const open = fixtureFS.open;
+  const rename = fixtureFS.rename;
+  const io = { historyReads: 0, totalsReads: 0, historyWrites: 0, totalsWrites: 0, totalsSerializations: 0 };
+  const snapshot = () => ({ ...io });
+  let failMetadata = false;
+  const opened = spyOn(fixtureFS, "open").mockImplementation((path: Parameters<typeof open>[0], flags: Parameters<typeof open>[1], mode?: Parameters<typeof open>[2]) => {
+    if (String(path) === historyPath) io.historyReads++;
+    if (String(path) === join(directory, "totals.json")) io.totalsReads++;
+    return open(path, flags, mode);
+  });
+  const renamed = spyOn(fixtureFS, "rename").mockImplementation(async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+    if (failMetadata && String(to) === join(directory, "totals.json")) throw Object.assign(new Error("metadata publish EIO"), { code: "EIO" });
+    await rename(from, to);
+    if (String(to) === historyPath) io.historyWrites++;
+    if (String(to) === join(directory, "totals.json")) io.totalsWrites++;
+  });
+  const stringify = JSON.stringify;
+  const serialized = spyOn(JSON, "stringify").mockImplementation((value: any, replacer?: any, space?: any) => {
+    if (value && Object.prototype.hasOwnProperty.call(value, "sessions") && Object.prototype.hasOwnProperty.call(value, "open")
+      && Object.prototype.hasOwnProperty.call(value, "settled")) io.totalsSerializations++;
+    return stringify(value, replacer, space);
+  });
+  const schedule = globalThis.setTimeout;
+  // Pause only metadata deadlines. Completion must finish while all four RPCs
+  // AND their 200ms timeout fallback remain blocked. This is a dependency
+  // barrier, not a relaxed wall-clock performance threshold on loaded disks.
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  const deadlines = spyOn(globalThis, "setTimeout").mockImplementation((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    if (delay !== 200) return schedule(callback, delay, ...args);
+    const handle = schedule(() => {}, 2_147_483_647);
+    timers.add(handle); return handle;
+  });
+  let completion: Promise<void> | undefined;
+  let backend: any;
+  const begin = performance.now();
   try {
-    const old = Array.from({ length: 1000 }, (_, index) => ({
+    const old = Array.from({ length: count }, (_, index) => ({
       version: 1, messageID: `old-${index}`, sessionID: `old-session-${index}`,
       tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
       cost: 0, quality: "exact", time: { start: 0, completed: 100, duration: 100 }, samples: [],
+      ...(mode === "known" ? { agent: "build" } : {}),
     }));
     await writeFile(historyPath, old.map((record) => JSON.stringify(record)).join("\n") + "\n");
     const hooks = await server({ directory, worktree: directory, client: { session: {
-      get: async () => {
+      get: async (request: { path: { id: string } }) => {
         calls++; inFlight++; peak = Math.max(peak, inFlight);
+        const id = request.path.id;
+        requested.set(id, (requested.get(id) ?? 0) + 1);
+        order.push(id);
         await gate;
         inFlight--;
+        if (classifyLast && id === `old-session-${count - 1}`) return {
+          data: { id, metadata: { magic_context: "hidden-run", role: "historian" } },
+        };
+        if (mode !== "unknown") return { data: { id, agent: "build", ...(mode === "scope" && id !== "s"
+          ? { metadata: { magic_context: "hidden-run", role: "historian" } } : {}) } };
         return { error: "metadata unavailable" }; // not negative user proof
       },
     } } } as unknown as PluginInput, { historyPath });
+    backend = hooks;
+    const metadata = () => backend.runtimeStats().metadata;
+    console.log(`[server bootstrap ${count}] startup`, performance.now() - begin, snapshot());
     await eventually(async () => calls === 4);
     assert.equal(peak, 4);
-    const completion = hooks.event!({ event: completionFact("new", 2, 0, 0, 200) as never });
-    assert.equal(await Promise.race([completion.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 100))]), true);
+    assert.equal(metadata().bootstrapVisited, Math.min(count, 8), "only 4 active + 4 compact look-ahead jobs are materialized");
+    assert.ok(metadata().queued <= 4);
+    const beforeCompletion = snapshot();
+    completion = hooks.event!({ event: completionFact("new", 2, 0, 0, 200) as never });
+    const completionStart = performance.now();
+    await completion;
+    assert.equal(calls, 4, "completion cannot wait for metadata RPCs or their timeout fallback");
+    assert.equal(inFlight, 4, "the metadata gate is still closed when completion is durable");
+    console.log(`[server bootstrap ${count}] completion`, performance.now() - completionStart,
+      Object.fromEntries(Object.entries(io).map(([key, value]) => [key, value - beforeCompletion[key as keyof typeof io]])));
     assert.equal((await readTotals(historyPath)).sessions.s.tokens.output, 2);
+    const beforeHydration = snapshot();
+    failMetadata = fault;
     release();
-    await eventually(async () => calls === 1001 && inFlight === 0);
+    if (fault) {
+      await eventually(async () => backend.runtimeStats().metadataProjection.failures > 0 && metadata().workers === 0 && metadata().queued === 0);
+      assert.ok(metadata().bootstrapVisited < count, "unadmitted compact SID suffix must remain at the lazy cursor while publication is degraded");
+      assert.ok(backend.runtimeStats().pendingSessionMetadata <= 256);
+      failMetadata = false;
+      await hooks.event!({ event: { type: "unrelated" } as never });
+    }
+    await eventually(async () => calls === count + 1 && inFlight === 0
+      && metadata().settled === count + 1 && metadata().queued === 0 && metadata().workers === 0
+      && backend.runtimeStats().pendingSessionMetadata === 0);
+    for (let index = 0; index < count; index++) assert.equal(requested.get(`old-session-${index}`), 1,
+      `restored SID ${index} must hydrate exactly once, including IDs beyond the cache/queue limit`);
+    assert.equal(requested.get("s"), 1);
+    assert.equal(order.indexOf("s"), 4, "current completion query overtakes lazy restoration after the four in-flight calls");
+    assert.equal(metadata().bootstrapTotal, count);
+    assert.equal(metadata().bootstrapVisited, count);
+    assert.equal(metadata().bootstrapAdmitted, count);
+    assert.equal(metadata().bootstrapSkipped, 0);
+    assert.equal(metadata().admitted, count + 1);
+    assert.equal(metadata().validResponses, mode === "unknown" ? (classifyLast ? 1 : 0) : count + 1);
+    assert.equal(metadata().unknownResponses, mode === "unknown" ? count + 1 - (classifyLast ? 1 : 0) : 0,
+      "unavailable SDK metadata remains explicitly unknown, never negative user proof");
+    assert.equal(metadata().rejected, 0);
+    assert.ok(metadata().peakQueued <= 5, "historical corpus size must not expand the eager query queue");
+    const beforeHealthy = snapshot();
     await hooks.event!({ event: { type: "unrelated" } as never });
-    assert.equal((await readTotals(historyPath)).sessionScopes, undefined);
+    assert.deepEqual(snapshot(), beforeHealthy, "confirmed empty retry state must perform zero ledger I/O");
+    const scopes = (await readTotals(historyPath)).sessionScopes;
+    if (classifyLast) {
+      assert.deepEqual(Object.keys(scopes ?? {}), [`old-session-${count - 1}`]);
+      assert.equal(scopes?.[`old-session-${count - 1}`].sourceScope, "magic-session",
+        "the last restored SID must apply its actual classification, not only increment a visit counter");
+    } else if (mode === "scope") {
+      assert.equal(Object.keys(scopes ?? {}).length, count);
+      assert.equal(scopes?.[`old-session-${count - 1}`].sourceScope, "magic-session");
+    } else assert.equal(scopes, undefined);
+    if (mode !== "unknown") {
+      const batchLimit = Math.ceil(count / 128) + 2;
+      const metadataIO = { loads: beforeHealthy.totalsReads - beforeHydration.totalsReads,
+        serializations: beforeHealthy.totalsSerializations - beforeHydration.totalsSerializations,
+        publishes: beforeHealthy.totalsWrites - beforeHydration.totalsWrites };
+      assert.ok(metadataIO.publishes <= batchLimit, "metadata publishes must be bounded batches, not N SID writes");
+      assert.ok(metadataIO.loads <= batchLimit + (fault ? 8 : 0), "successful metadata must not reload the whole totals ledger per SID");
+      assert.ok(metadataIO.serializations <= batchLimit + (fault ? 8 : 0));
+      if (mode === "known") assert.deepEqual(metadataIO, { loads: 1, serializations: 1, publishes: 1 },
+        "only current SID s changes metadata; all restored build agents are known no-ops");
+      assert.ok(backend.runtimeStats().metadataProjection.peakPending <= 128);
+      assert.ok(backend.runtimeStats().metadataProjection.maxBatch <= 128);
+      if (fault) assert.ok(backend.runtimeStats().metadataProjection.failures > 0);
+      else assert.equal(backend.runtimeStats().metadataProjection.failures, 0);
+      console.log(`[server metadata ${mode} ${count}] full-ledger I/O`, metadataIO);
+      console.log(`[server metadata ${mode} ${count}] bounded projection`, backend.runtimeStats().metadataProjection);
+    }
     assert.ok(peak <= 4);
+    console.log(`[server bootstrap ${count}] hydrated`, performance.now() - begin, snapshot());
+    console.log(`[server bootstrap ${count}] scheduling`, metadata());
   } finally {
+    failMetadata = false;
     release?.();
+    await completion?.catch(() => {});
+    console.log(`[server bootstrap ${count}] visits`, { calls, distinct: requested.size,
+      first: requested.get("old-session-0") ?? 0, last: requested.get(`old-session-${count - 1}`) ?? 0,
+      current: requested.get("s") ?? 0, inFlight, peak });
+    await backend?.dispose?.();
     await rm(directory, { recursive: true, force: true });
+    for (const timer of timers) clearTimeout(timer);
+    deadlines.mockRestore();
+    opened.mockRestore(); renamed.mockRestore();
+    serialized.mockRestore();
   }
-});
+}
 
 test("authoritative corrections accept zero, smaller usage and shorter duration; known replay cannot revert", async () => {
   await backendCase(async ({ path, send, restart }) => {
@@ -956,7 +1214,7 @@ test("real legacy reasoning metadata classifies field:text without kind and cali
     const [record] = await readRecords(path);
     assert.equal(record.samples.length, 0);
     assert.equal(record.tokens.reasoning, 100);
-    assert.equal(record.time.firstToken, 100);
+    assert.equal(record.time.firstToken, undefined);
     assert.equal(record.speed, undefined);
   });
 });
@@ -1064,15 +1322,15 @@ test("known snapshot gap and uncertain tool input downgrade generation without s
     const info = { id: "m", sessionID: "s", role: "assistant", tokens: { input: 10, output: 20, reasoning: 5 }, time: { created: 0, firstToken: 300, completed: 1000 } };
     await send("message.updated", 1000, { info });
     let records = await readRecords(historyPath);
-    assert.equal(records[0].time.firstToken, 100);
-    assert.equal(records[0].time.ttft, 100);
+    assert.equal(records[0].time.firstToken, 300);
+    assert.equal(records[0].time.ttft, 300);
     assert.equal(records[0].tokens.output, 20);
     assert.equal(records[0].tokens.reasoning, 5);
     assert.equal(records[0].samples.length, 0);
     assert.equal(records[0].speed, undefined);
     await send("message.updated", 1200, { info: { ...info, time: { created: 0, firstToken: 300, completed: 1200 } } });
     records = await readRecords(historyPath);
-    assert.equal(records[0].time.firstToken, 100);
+    assert.equal(records[0].time.firstToken, 300);
     assert.equal(records[0].tokens.output, 20);
     assert.equal(records[0].speed, undefined);
     const totals = await readTotals(historyPath);
@@ -1318,9 +1576,9 @@ test("idle flush persists a provisional quality marker", async () => {
     const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     assert.ok(hooks.event);
     await hooks.event({ event: {
-      type: "message.part.delta",
+      type: "session.next.step.ended",
       timestamp: 100,
-      properties: { sessionID: "session", messageID: "idle-fallback", delta: "hello" },
+      properties: { sessionID: "session", messageID: "idle-fallback", stepID: "fallback", tokens: { output: 0 } },
     } as never });
     await hooks.event({ event: {
       type: "session.idle",
@@ -1444,6 +1702,7 @@ test("initializing a new instance recovers old open activity at its last event",
       properties: { sessionID: "session", status: "retry" },
     } as never });
 
+    await closeFixture(directory);
     await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     const afterRecovery = await readRunEvents(runsPath);
     assert.equal(afterRecovery.length, 3);
@@ -1452,6 +1711,7 @@ test("initializing a new instance recovers old open activity at its last event",
     assert.equal(afterRecovery[2]?.instanceEndedAt, 1500);
     assert.equal((await new ActivityLedger(runsPath).replay()).rootActiveMilliseconds.session, 266);
 
+    await closeFixture(directory);
     await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     assert.equal((await readRunEvents(runsPath)).length, 3);
   } finally {
@@ -1467,9 +1727,9 @@ test("canonical v2 retry and step failure lifecycle events are recorded", async 
     const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     assert.ok(hooks.event);
     await hooks.event({ event: {
-      type: "message.part.delta",
+      type: "session.next.step.ended",
       timestamp: 100,
-      properties: { sessionID: "session", messageID: "message", delta: "hello" },
+      properties: { sessionID: "session", messageID: "message", stepID: "fallback", tokens: { output: 0 } },
     } as never });
     await hooks.event({ event: {
       type: "session.next.retried",
@@ -1747,6 +2007,8 @@ test("opening another server on the same directory does not change totals", asyn
     await hooks.event({ event: assistantCompleted("message", { input: 4, output: 5 }, 200, 3) as never });
     const before = await readTotals(historyPath);
 
+    await assert.rejects(server({ directory, worktree: directory } as unknown as PluginInput, { historyPath }), /ownership/);
+    await closeFixture(directory);
     await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     const after = await readTotals(historyPath);
     assert.deepEqual(after.sessions, before.sessions);
@@ -1764,9 +2026,9 @@ test("an idle provisional replaced by a smaller exact is not added twice", async
     const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     assert.ok(hooks.event);
     await hooks.event({ event: {
-      type: "message.part.delta",
+      type: "session.next.step.ended",
       timestamp: 100,
-      properties: { sessionID: "session", messageID: "idle-fallback", delta: "x".repeat(55) },
+      properties: { sessionID: "session", messageID: "idle-fallback", stepID: "fallback", tokens: { output: 0 } },
     } as never });
     await hooks.event({ event: {
       type: "session.idle",
@@ -1823,6 +2085,7 @@ test("a corrupt totals file is quarantined and rebuilt from the history window",
     const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
     assert.ok(hooks.event);
     await hooks.event({ event: assistantCompleted("message", { input: 4, output: 5 }, 200, 3) as never });
+    await closeFixture(directory);
     await writeFile(join(directory, "totals.json"), "{not-json", "utf8");
 
     await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
@@ -1852,9 +2115,9 @@ test("an idle totals write failure keeps the active state for a later retry", as
     await mkdir(totalsPath);
 
     await hooks.event({ event: {
-      type: "message.part.delta",
+      type: "session.next.step.ended",
       timestamp: 100,
-      properties: { sessionID: "session", messageID: "idle-retry", delta: "x".repeat(55) },
+      properties: { sessionID: "session", messageID: "idle-retry", stepID: "fallback", tokens: { output: 0 } },
     } as never });
     await hooks.event({ event: {
       type: "session.idle",
