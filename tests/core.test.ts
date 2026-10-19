@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeAgentName, normalizeAgentNames } from "../src/agent-names.js";
+import { rollupSessionTotals } from "../src/totals-aggregate.js";
 import {
   HistoryRecord,
   type SpeedSample,
@@ -24,6 +25,23 @@ import {
   timeToFirstToken,
   utf8ByteLength,
 } from "../src/core.js";
+
+test("core and totals aggregation preserve special session/message keys without prototype lookup", () => {
+  const records: HistoryRecord[] = ["__proto__", "constructor", "toString"].map((sessionID, i) => ({
+    version: 1, messageID: sessionID, sessionID, ...(i ? { parentSessionID: "__proto__" } : {}),
+    tokens: { input: 1, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 1,
+    time: { start: 0, completed: 10 }, samples: [],
+  }));
+  const tree = aggregateSessionTree(records);
+  assert.equal(tree.length, 1);
+  assert.equal(tree[0].sessionID, "__proto__");
+  assert.equal(tree[0].responseCount, 3);
+  const sessions = Object.fromEntries(records.map((record) => [record.sessionID, { tokens: record.tokens, cost: record.cost, responseCount: 1 }]));
+  const totals = rollupSessionTotals(sessions, new Map([["constructor", "__proto__"], ["toString", "__proto__"]]), "__proto__");
+  assert.equal(totals.including.responseCount, 3);
+  assert.equal(rollupSessionTotals({}, {}, "constructor").including.responseCount, 0);
+  assert.deepEqual(normalizeAgentNames(["constructor", "__proto__", "toString"]), ["__proto__", "constructor", "toString"]);
+});
 
 /** Frozen pre-optimization implementation: independent truth oracle in tests only. */
 function referenceRollingRate(samples: readonly SpeedSample[], now?: number, windowMs = 10_000): RollingRateMeasurement {
