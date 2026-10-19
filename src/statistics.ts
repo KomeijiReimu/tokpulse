@@ -484,7 +484,27 @@ export interface ContentMetadataCache {
 export function createContentMetadataCache(): ContentMetadataCache {
   return { progress: new Map(), roles: new Map(), completed: new Set(), nextSequence: 1 };
 }
+/** Retire large observation state after durable confirmation. Compact completed
+ * identities intentionally survive: deleting them would admit duplicate work. */
+export function completeContentMetadata(cache: ContentMetadataCache, messageID: string): void {
+  cache.completed.add(messageID);
+  cache.progress.delete(messageID);
+  cache.roles.delete(messageID);
+}
+/** Explicit retention policy supplied by the runtime, not an identity LRU.
+ * Call on lifecycle/hydration, never on a content event. Unknown/unconfirmed
+ * IDs are retired without pretending they were durably completed. */
+export function retireContentMetadata(cache: ContentMetadataCache, retainedMessageIDs: ReadonlySet<string>): void {
+  for (const id of cache.progress.keys()) if (!retainedMessageIDs.has(id) || cache.completed.has(id)) cache.progress.delete(id);
+  for (const id of cache.roles.keys()) if (!retainedMessageIDs.has(id) || cache.completed.has(id)) cache.roles.delete(id);
+}
+/** Disposal only; the owner must not reuse the cache after releasing identities. */
+export function disposeContentMetadata(cache: ContentMetadataCache): void {
+  cache.progress.clear(); cache.roles.clear(); cache.completed.clear(); cache.nextSequence = 1;
+}
 export function cachedContentProgress(cache: ContentMetadataCache, messageID: string): ContentProgress {
+  // A late snapshot must not resurrect retained progress for a confirmed ID.
+  if (cache.completed.has(messageID)) return createContentProgress();
   let progress = cache.progress.get(messageID);
   if (!progress) { progress = createContentProgress(); cache.progress.set(messageID, progress); }
   return progress;
@@ -493,6 +513,7 @@ export function cachedContentProgress(cache: ContentMetadataCache, messageID: st
 export function cachePartSnapshot(cache: ContentMetadataCache, properties: Record<string, any>): void {
   const part = properties.part;
   if (!object(part) || typeof part.messageID !== "string") return;
+  if (cache.completed.has(part.messageID)) return;
   if (typeof part.role === "string") cache.roles.set(part.messageID, part.role);
   notePartSnapshot(cachedContentProgress(cache, part.messageID), properties);
 }

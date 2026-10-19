@@ -43,10 +43,10 @@ export function classifySessionMetadata(value) {
 export function classifyMessageMetadata(value) {
   const raw = object(value);
   if (raw.role !== undefined && raw.role !== "assistant") return evidence("pending");
-  // Exact hidden assistant identity is whole-session authority even when a
-  // message also carries a synthetic model/compaction marker.
-  if (MAGIC_CONTEXT_AGENTS.has(raw.agent)) return evidence("magic-session", "message-agent");
-  if (MAGIC_CONTEXT_AGENTS.has(raw.mode)) return evidence("magic-session", "message-mode");
+  // An assistant identity proves only this message/work item is maintenance.
+  // Whole-session authority requires a separately verified session entity.
+  if (MAGIC_CONTEXT_AGENTS.has(raw.agent)) return evidence("magic-message", "message-agent");
+  if (MAGIC_CONTEXT_AGENTS.has(raw.mode)) return evidence("magic-message", "message-mode");
   if (raw.providerID === "magic-context" || raw.modelID === "magic-context" || object(raw.model).providerID === "magic-context" || object(raw.model).modelID === "magic-context") return evidence("magic-message", "magic-model");
   if (raw.summary === true && raw.mode === "compaction") return evidence("magic-message", "compaction-summary");
   if (raw.agent === "compaction") return evidence("magic-message", "compaction-agent");
@@ -70,10 +70,11 @@ export function isSessionScopeExcluded(sessionID, scopes = {}, parents) {
   let current = sessionID;
   while (current && !seen.has(current)) {
     seen.add(current);
-    if (scopes[current]?.sourceScope === "magic-session") return true;
+    const proof = Object.prototype.hasOwnProperty.call(scopes, current) ? scopes[current] : undefined;
+    if (proof?.sourceScope === "magic-session") return true;
     const explicit = parents instanceof Map ? parents.get(current) : parents?.[current];
     const hasExplicit = parents instanceof Map ? parents.has(current) : !!parents && Object.prototype.hasOwnProperty.call(parents, current);
-    current = hasExplicit ? explicit : scopes[current]?.parentSessionID;
+    current = hasExplicit ? explicit : proof?.parentSessionID;
   }
   return false;
 }
@@ -88,10 +89,9 @@ export function collectSessionScopeEvidence(records, scopes = {}) {
   let collected;
   for (const record of records) {
     if (record.scope?.sourceScope !== "magic-session") continue;
-    collected ??= {
-      ...scopes
-    };
-    collected[record.sessionID] = mergeScopeEvidence(collected[record.sessionID], record.scope);
+    const target = collected ?? Object.assign(Object.create(null), scopes);
+    target[record.sessionID] = mergeScopeEvidence(target[record.sessionID], record.scope);
+    collected = target;
   }
   return collected ?? scopes;
 }
@@ -123,8 +123,15 @@ export class ScopeRegistry {
   }
   observeMessageMetadata(sessionID, metadata) {
     const proof = classifyMessageMetadata(metadata);
-    // A compaction message cannot poison the enclosing user session.
-    return proof.sourceScope === "magic-message" ? proof : this.observe(sessionID, proof);
+    // Assistant identity is local work proof. Only a verified session entity
+    // (including an ancestor) may exclude the entire enclosing session.
+    if (proof.sourceScope === "magic-message" || proof.sourceScope === "magic-session") {
+      return {
+        ...proof,
+        sourceScope: "magic-message"
+      };
+    }
+    return this.observe(sessionID, proof);
   }
   getScope(sessionID) {
     return this.isExcluded(sessionID) ? "magic-session" : this.direct(sessionID)?.sourceScope ?? "pending";
@@ -137,6 +144,14 @@ export class ScopeRegistry {
     return proof ? coerceScopeEvidence(proof) : undefined;
   }
   /** Compact positive identities plus parent edges needed to recover ancestry. */
+  getPersistentEvidence(sessionID) {
+    const proof = this.positive[sessionID];
+    const parent = this.parents.get(sessionID);
+    return parent ? {
+      ...(proof ? coerceScopeEvidence(proof) : evidence("pending", "parent-link")),
+      parentSessionID: parent
+    } : proof ? coerceScopeEvidence(proof) : undefined;
+  }
   serialize() {
     const result = Object.create(null);
     for (const [id, proof] of Object.entries(this.positive)) result[id] = coerceScopeEvidence(proof);

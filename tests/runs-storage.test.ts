@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import test from "node:test";
 import {
   ActivityLedger,
@@ -9,10 +9,10 @@ import {
   parseActivityJsonl,
   serializeActivityJsonl,
 } from "../src/runs-storage.js";
-import { classifyMessageMetadata } from "../src/scope.js";
+import { classifyMessageMetadata, classifySessionMetadata, createScopeRegistry } from "../src/scope.js";
 
 test("scoped ledger read/replay retracts late identity but preserves original runs and boundaries", async (context) => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-runs-scope-"));
+  const directory = await testDirectory("oc-tps-runs-scope-");
   context.after(() => rm(directory, { recursive: true, force: true }));
   const ledger = new ActivityLedger(join(directory, "runs.jsonl"));
   await ledger.appendMany([
@@ -24,12 +24,45 @@ test("scoped ledger read/replay retracts late identity but preserves original ru
   ]);
   const raw = await readFile(ledger.path, "utf8");
   assert.equal((await ledger.replay()).rootActiveMilliseconds.root, 2000);
-  const sessionScopes = { mc: classifyMessageMetadata({ mode: "dreamer" }) };
+  const sessionScopes = { mc: classifySessionMetadata({ id: "mc", parentID: "root", agent: "dreamer" }) };
   assert.equal((await ledger.replay({ sessionScopes, replayCutoff: 100_000 })).rootActiveMilliseconds.root, 100);
   assert.deepEqual((await ledger.read({ sessionScopes })).map((event) => event.sessionID), ["root", "root"]);
   assert.equal((await ledger.read()).length, 7);
   assert.equal(await readFile(ledger.path, "utf8"), raw);
   assert.equal((await new ActivityLedger(ledger.path).read()).find((event) => event.sessionID === "mc")?.lastObservedAt, 1000);
+});
+
+test("maintenance message proof does not hide ordinary session lifecycle or its child", async (context) => {
+  const directory = await testDirectory("oc-tps-runs-message-scope-");
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const ledger = new ActivityLedger(join(directory, "runs.jsonl"));
+  await ledger.appendMany([
+    lifecycle("root-start", 0, "root", 1), lifecycle("root-stop", 100, "root", 2),
+    { kind: "parent", sessionID: "child", parentSessionID: "root", timestamp: 0 },
+    lifecycle("child-start", 0, "child", 1), lifecycle("child-stop", 2000, "child", 2),
+  ]);
+  const raw = await readFile(ledger.path, "utf8");
+  const registry = createScopeRegistry();
+  registry.observeSessionMetadata("root", { id: "root", agent: "build" });
+  registry.observeSessionMetadata("child", { id: "child", parentID: "root", agent: "fixer" });
+  const messageProof = registry.observeMessageMetadata("root", { agent: "historian-editor" });
+  assert.equal(messageProof.sourceScope, "magic-message");
+  assert.equal(classifyMessageMetadata({ mode: "dreamer" }).sourceScope, "magic-message");
+  assert.equal(registry.isExcluded("root"), false);
+  assert.equal(registry.isExcluded("child"), false);
+  const all = await ledger.read();
+  const originalReplay = await ledger.replay();
+  for (const sessionScopes of [registry.serialize(), { ...registry.serialize(), root: messageProof }]) {
+    assert.deepEqual(await ledger.read({ sessionScopes }), all);
+    const replay = await ledger.replay({ sessionScopes, replayCutoff: 100_000 });
+    assert.equal(replay.rootActiveMilliseconds.root, 2000);
+    assert.deepEqual(replay.events, originalReplay.events);
+    assert.equal((await new ActivityLedger(ledger.path).replay({ sessionScopes, replayCutoff: 3_600_000 })).rootActiveMilliseconds.root, 2000);
+  }
+  // Message classification is not a session-wide or lifecycle-wide boundary.
+  // No work spans are supplied here: their local subtraction is tested by the
+  // activity schema owner, not inferred by hiding these session facts.
+  assert.equal(await readFile(ledger.path, "utf8"), raw);
 });
 
 test("history path derives a sibling runs.jsonl and explicit absolute path wins", () => {
@@ -49,7 +82,7 @@ test("activity JSONL round-trips and tolerates bad or truncated lines", () => {
 });
 
 test("append order is serialized and runs are independent of history maxRecords", async (context) => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-runs-"));
+  const directory = await testDirectory("oc-tps-runs-");
   context.after(() => rm(directory, { recursive: true, force: true }));
   const runsPath = join(directory, "runs.jsonl");
   const ledger = new ActivityLedger(runsPath);
@@ -65,7 +98,7 @@ test("append order is serialized and runs are independent of history maxRecords"
 });
 
 test("append separates an existing file without reading its full contents", async (context) => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-runs-separator-"));
+  const directory = await testDirectory("oc-tps-runs-separator-");
   context.after(() => rm(directory, { recursive: true, force: true }));
   const runsPath = join(directory, "runs.jsonl");
   await writeFile(runsPath, "", "utf8");
@@ -81,7 +114,7 @@ test("append separates an existing file without reading its full contents", asyn
 });
 
 test("read does not rewrite a corrupt runs file", async (context) => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-runs-read-"));
+  const directory = await testDirectory("oc-tps-runs-read-");
   context.after(() => rm(directory, { recursive: true, force: true }));
   const runsPath = join(directory, "runs.jsonl");
   const content = `${JSON.stringify(lifecycle("valid", 1, "session", 1))}\n{truncated`;
@@ -93,7 +126,7 @@ test("read does not rewrite a corrupt runs file", async (context) => {
 });
 
 test("multiple roots are replayed independently", async (context) => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-runs-replay-"));
+  const directory = await testDirectory("oc-tps-runs-replay-");
   context.after(() => rm(directory, { recursive: true, force: true }));
   const ledger = new ActivityLedger({ historyPath: join(directory, "history.jsonl") });
   await ledger.appendMany([
@@ -109,6 +142,12 @@ test("multiple roots are replayed independently", async (context) => {
     ["root-b", 20],
   ]);
 });
+
+async function testDirectory(prefix: string): Promise<string> {
+  const cache = join(homedir(), ".cache", "tokpulse-tests");
+  await mkdir(cache, { recursive: true });
+  return mkdtemp(join(cache, prefix));
+}
 
 function lifecycle(
   eventID: string,

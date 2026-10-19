@@ -391,8 +391,9 @@ async function textGeneration(send: (event: any) => Promise<void>, messageID: st
   await send(completionFact(messageID, 10, 0, 0, 1500));
 }
 
-test("v1 historian mode excludes renamed sessions and inherited children before new bookkeeping", async () => {
+test("verified historian session metadata excludes renamed sessions and inherited children", async () => {
   await backendCase(async ({ path, send, restart }) => {
+    await send({ type: "session.updated", properties: { info: { id: "s", agent: "historian" } } });
     await send({ type: "session.updated", properties: { info: { id: "s", title: "Renamed user-looking session" } } });
     const hidden = completionFact("hidden", 20, 0, 0, 100);
     hidden.properties.info = { ...hidden.properties.info, mode: "historian" } as any;

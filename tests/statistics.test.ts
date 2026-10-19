@@ -4,6 +4,30 @@ import type { HistoryRecord } from "../src/core.js";
 import { utf8ByteLength } from "../src/core.js";
 import { GENERATION_BASIS_VERSION, MIN_COMPLETED_OBSERVATION_MS, RECEIVE_CLOCK_RESOLUTION_MS, type ReceiveClockContext } from "../src/statistics.js";
 import { acceptModelDelta, addSpeedTotals, applyFirstResponseSignal, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentProgress, deriveSafeResponseMeasurement, earliestFirstOutput, getSessionAverageSummary, isQualifiedGenerationContribution, measureRecordSpeed, mergeContentProgress, mergeRecordSpeed, noteContentArrival, notePartSnapshot, noteStepIdentity, parseModelDelta, recordContentArrival, selectResponseMeasurement, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal, updateSpeedTotals } from "../src/statistics.js";
+import { cachePartSnapshot, cachedContentProgress, completeContentMetadata, createContentMetadataCache, disposeContentMetadata, retireContentMetadata } from "../src/statistics.js";
+
+test("completed observation state retires while compact identity remains deduplicated", () => {
+  const cache = createContentMetadataCache();
+  for (let i = 0; i < 4000; i++) {
+    const id = `m-${i}`;
+    cachedContentProgress(cache, id).eventIDs.add("observed");
+    cache.roles.set(id, "assistant");
+    completeContentMetadata(cache, id);
+  }
+  assert.equal(cache.progress.size, 0);
+  assert.equal(cache.roles.size, 0);
+  assert.equal(cache.completed.size, 4000); // necessary compact identities, not response objects
+  cachePartSnapshot(cache, { part: { messageID: "m-0", get text() { throw new Error("retired snapshot body accessed"); } } });
+  cachedContentProgress(cache, "m-0");
+  assert.equal(cache.progress.size, 0);
+  for (const id of ["active", "window", "pending", "evicted"]) { cachedContentProgress(cache, id); cache.roles.set(id, "assistant"); }
+  retireContentMetadata(cache, new Set(["active", "window", "pending"]));
+  assert.equal(cache.progress.size, 3);
+  assert.equal(cache.roles.size, 3);
+  assert.equal(cache.completed.has("evicted"), false); // retirement never invents a commit
+  disposeContentMetadata(cache);
+  assert.equal(cache.progress.size + cache.roles.size + cache.completed.size, 0);
+});
 
 function record(output = 100, reasoning = 0): HistoryRecord {
   return { version: 1, messageID: "m", sessionID: "s", tokens: { input: 0, output, reasoning, cacheRead: 0, cacheWrite: 0 }, cost: 0,

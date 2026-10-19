@@ -3,7 +3,7 @@ import test from "node:test";
 import type { SessionDirectTotals } from "../src/totals-storage.js";
 import { rollupSessionTotals } from "../src/totals-aggregate.js";
 import { getSessionAverageSummary, updateSpeedTotals } from "../src/statistics.js";
-import { classifyMessageMetadata } from "../src/scope.js";
+import { classifySessionMetadata } from "../src/scope.js";
 
 test("every direct and including rollup filters MC descendants without changing exact user sums", () => {
   const root = usage(1);
@@ -11,7 +11,7 @@ test("every direct and including rollup filters MC descendants without changing 
   real.speed = updateSpeedTotals(undefined, { response: { generatedTokens: 5, durationMs: 100, estimated: false } }, 1);
   const sessions = { root, real, mc: usage(100), grand: usage(1000) };
   const parents = { real: "root", mc: "root", grand: "mc" };
-  const scopes = { mc: classifyMessageMetadata({ mode: "dreamer" }) };
+  const scopes = { mc: classifySessionMetadata({ agent: "dreamer" }) };
   const actual = rollupSessionTotals(sessions, parents, "root", scopes);
   assert.deepEqual(actual, rollupSessionTotals({ root, real }, { real: "root" }, "root"));
   assert.deepEqual(rollupSessionTotals(sessions, parents, "mc", scopes), { direct: zero(), including: zero(), children: [] });
@@ -21,7 +21,7 @@ test("every direct and including rollup filters MC descendants without changing 
 });
 
 test("scope inheritance through a cycle safely filters every rollup entry", () => {
-  const result = rollupSessionTotals({ a: usage(1), b: usage(10) }, { a: "b", b: "a" }, "a", { b: classifyMessageMetadata({ agent: "historian" }) });
+  const result = rollupSessionTotals({ a: usage(1), b: usage(10) }, { a: "b", b: "a" }, "a", { b: classifySessionMetadata({ agent: "historian" }) });
   assert.deepEqual(result, { direct: zero(), including: zero(), children: [] });
 });
 
@@ -36,7 +36,7 @@ test("shared speed merge preserves shortResponseCount in direct/including and sc
   };
   const sessions = { root: makeShortTotals(1), real: makeShortTotals(2), mc: makeShortTotals(10), grand: makeShortTotals(20) };
   const parents = { real: "root", mc: "root", grand: "mc" };
-  const actual = rollupSessionTotals(sessions, parents, "root", { mc: classifyMessageMetadata({ mode: "dreamer" }) });
+  const actual = rollupSessionTotals(sessions, parents, "root", { mc: classifySessionMetadata({ agent: "dreamer" }) });
   assert.equal(actual.direct.speed?.generation.shortResponseCount, 1);
   assert.equal(actual.including.speed?.generation.shortResponseCount, 3);
   assert.equal(actual.children[0].direct.speed?.generation.shortResponseCount, 2);

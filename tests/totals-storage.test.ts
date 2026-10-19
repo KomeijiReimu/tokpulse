@@ -20,7 +20,7 @@ test("late MC identity projects all usage/speed and descendants while preserving
   const registry = createScopeRegistry();
   registry.observeSessionMetadata("mc", { parentID: "root" });
   registry.observeSessionMetadata("grand", { parentID: "mc" });
-  registry.observeMessageMetadata("mc", { mode: "dreamer" });
+  registry.observeSessionMetadata("mc", { id: "mc", parentID: "root", agent: "dreamer" });
   for (const [sid, proof] of Object.entries(registry.serialize())) await storage.setSessionScope(sid, proof);
   const after = await storage.read();
   assert.deepEqual(after.sessions, before.sessions);
@@ -860,7 +860,7 @@ test("short generation quality survives usage corrections, +/- message exclusion
   assert.equal(excluded.sessions.session.speed?.generation.shortResponseCount, 1);
   assert.deepEqual((await createTotalsStorage(storage.path).read()).sessions, baseline.sessions);
   await storage.apply(historyRecord("mc-short", { sessionID: "mc", tokens: tokens(2, 20, 4), speed: shortV3Speed(tokens(2, 20, 4)) }));
-  await storage.setSessionScope("mc", classifyMessageMetadata({ mode: "dreamer" }));
+  await storage.setSessionScope("mc", classifySessionMetadata({ id: "mc", agent: "dreamer" }));
   const projected = projectTotalsMeasurementScope(await storage.read());
   assert.deepEqual(projected.sessions, baseline.sessions);
   assert.equal(projected.sessions.session.speed?.generation.shortResponseCount, 1);
