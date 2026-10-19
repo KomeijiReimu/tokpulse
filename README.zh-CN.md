@@ -67,10 +67,11 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 
 任务耗时取用户任务及其有效子 agent 活跃区间的并集，并行工作只计一次。
 所有有效工作结束后，耗时停止增长；维护任务不会延长它。
+纯维护任务的耗时为零。混合任务只扣除可确认的维护活动区间，重叠的正常工作仍计时。
 
 用 `/tps-details`、命令面板中的 **Token Pulse details** 或默认的 `Ctrl+Shift+Y`
 打开详情。窗口包含打开时的当前会话及已识别的全部子孙 agent，可选择各 agent
-查看其自身用量、缓存和任务时间，并查看整棵会话树的独立汇总。按 `Esc` 或 `Ctrl+C` 关闭。
+查看其自身用量和缓存，并查看整棵会话树的独立汇总。按 `Esc` 或 `Ctrl+C` 关闭。
 `/tps` 和 `Ctrl+Shift+T` 仍用于打开历史视图。
 
 在包的插件配置选项中自定义详情快捷键：
@@ -105,6 +106,14 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 活动时间和累计总量分别记在同目录的 `runs.jsonl` 和 `totals.json`。如果覆盖
 `historyPath`，server 和 TUI 要用同一个路径。历史是 JSONL，每条完成的响应对应
 一条记录，默认保留最近 **1000 条**。
+
+账本恢复和写入仅由 server 执行，打开 TUI 只会读取数据。排他锁防止两个后台同时
+写入同一账本；锁元数据位于账本目录旁的 `.tokpulse-writer-locks/`，后台运行时
+不要删除它。
+
+已成功写入的事实会保留到前台关闭、进程重启之后。未能写入的事实无法在原进程
+退出后恢复；突然断电和不可靠的网络文件系统不在此恢复保证内。历史缺失的开始
+时间不会凭猜测补写。
 
 使用默认路径启动时，Token Pulse 会将 `.opencode/oc-tps/` 中的旧 `history.jsonl`、
 `runs.jsonl` 和 `totals.json` 复制到 `.tokpulse/`，保留原文件，且不覆盖目标位置

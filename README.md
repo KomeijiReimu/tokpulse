@@ -73,11 +73,13 @@ retained rather than deducted by guesswork.
 Task time is the union of active intervals for the user task and its eligible
 child agents, so parallel work is counted once. It stops increasing when all
 eligible work has ended; maintenance work cannot extend it.
+Maintenance-only runs add no time. In mixed runs, only identified maintenance
+intervals are excluded; overlapping user work remains counted.
 
 Open details with `/tps-details`, **Token Pulse details** in the command palette,
 or the default `Ctrl+Shift+Y`. The view covers the session where it was opened and
-its known descendant agents. Select an agent to inspect its own usage, cache, and
-task time; a separate summary covers the entire tree. Press `Esc` or `Ctrl+C` to close.
+its known descendant agents. Select an agent to inspect its own usage and cache;
+a separate summary covers the entire tree. Press `Esc` or `Ctrl+C` to close.
 `/tps` and `Ctrl+Shift+T` open history.
 
 Customize the details shortcut in the package's plugin options:
@@ -114,6 +116,16 @@ Activity timing and cumulative totals are stored beside it as `runs.jsonl` and
 `totals.json`. Separate server and TUI entries must use the same `historyPath`.
 History is JSONL, one record per completed response, kept to the most recent
 **1,000 records** by default.
+
+The server owns ledger recovery and writes; opening the TUI only reads them.
+Exclusive writer locks prevent two backends from writing the same ledger. Lock
+metadata lives in `.tokpulse-writer-locks/` beside the ledger directory; do not
+remove it while the server is running.
+
+Successfully written facts survive closing the frontend and restarting the
+process. Facts that could not be written cannot be recovered after that process
+exits. Sudden power loss and unreliable network filesystems are outside this
+recovery guarantee. Missing historical start times are not guessed or filled in.
 
 On startup with the default path, Token Pulse copies the old `history.jsonl`,
 `runs.jsonl`, and `totals.json` from `.opencode/oc-tps/` into `.tokpulse/`, keeping
