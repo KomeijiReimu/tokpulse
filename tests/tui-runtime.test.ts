@@ -40,6 +40,7 @@ import {
   noteTaskRunRecord,
   noteTaskRecord,
   recordDelta,
+  recordTuiActivityFact,
   rememberVisibleSession,
   selectedSamples,
   takeActiveState,
@@ -93,8 +94,7 @@ function activityLifecycle(
 }
 
 function hydrateActivity(store: ReturnType<typeof createRuntimeStore>, events: readonly ActivityEventInput[]): void {
-  store.activityReplay = replayActivity(events);
-  store.activityEvents = store.activityReplay.events;
+  store.activityEvents = replayActivity(events).events;
 }
 
 function record(
@@ -465,14 +465,14 @@ test("compact metrics preserve every whole value/unit field at actual sidebar wi
   const elapsed = (123 * 3600 + 45 * 60 + 56) * 1000;
   for (const width of [16, 20, 24, 28]) {
     const text = formatPulseMetrics(counts, width, elapsed);
-    for (const field of ["16.3M total", "cache 61%", "time 123h45m56s"]) {
+    for (const field of ["16,300,000 total", "cache 61%", "time 123h45m56s"]) {
       assert.ok(text.split("\n").some((line) => line.includes(field)), `${width}: ${field} must remain whole`);
     }
     assert.ok(text.split("\n").every((line) => line.length <= width));
-    assert.doesNotMatch(text, /\.\.\.|…|tok\/s|TPS/i);
+    assert.doesNotMatch(text, /\.\.\.|…|tok\/s|TPS|\d[kMB]\b/i);
     assert.ok(text.split("\n").length <= 3);
   }
-  assert.equal(formatPulseMetrics(counts, 0, undefined), "16.3M total\ncache 61%\ntime --");
+  assert.equal(formatPulseMetrics(counts, 0, undefined), "16,300,000 total\ncache 61%\ntime --");
   assert.match(formatPulseMetrics(counts, 28, 0), /time 0ms/);
   assert.match(formatPulseMetrics(counts, 28, Number.NaN), /time --/);
 });
@@ -500,7 +500,7 @@ test("history row keeps usage and cost without speed columns", () => {
   const response = record("usage", "s", 1000, 5, { cost: 0.25, model: "gpt-5.4",
     time: { start: 0, completed: 5000 } });
   const row = formatHistoryRow(response);
-  assert.match(row, /1k\/5/);
+  assert.match(row, /1,000\/5/);
   assert.match(row, /\$0\.25/);
   assert.doesNotMatch(row, /tok\/s|TPS|TTFT|generation|~/i);
 });
@@ -563,6 +563,16 @@ test("token pulse starts collapsed and toggles independently", () => {
   assert.equal(togglePulse(store), false);
   assert.equal(store.pulseExpanded, false);
   store.disposeSignals();
+});
+
+test("legacy task helper respects observed order for same-millisecond stop and fresh busy", () => {
+  const run = createTaskWallRun("root");
+  transitionTaskWallRun(run, "root", "busy", 1000);
+  const stopped = transitionTaskWallRun(run, "root", "idle", 1000);
+  assert.equal(stopped?.wallTime, 0); assert.equal(run.phase, "idle");
+  transitionTaskWallRun(run, "root", "busy", 1000);
+  assert.equal(run.phase, "active");
+  assert.equal(transitionTaskWallRun(run, "root", "idle", 1010)?.wallTime, 10);
 });
 
 test("task wall time spans root and children without summing parallel work", () => {
@@ -1042,6 +1052,8 @@ test("persisted intervals and live task overlay are merged without double counti
   store.taskRuns.set("root", run);
   transitionTaskWallRun(run, "root", "busy", 500);
   transitionTaskWallRun(run, "root", "idle", 1_500);
+  recordTuiActivityFact(store, { kind: "lifecycle", sessionID: "root", timestamp: 500, state: "busy", executionID: "observed-live" });
+  recordTuiActivityFact(store, { kind: "lifecycle", sessionID: "root", timestamp: 1500, state: "idle", executionID: "observed-live" });
   assert.equal(taskWallTimeForSession(store, "root", 2_000), 1_500);
   store.disposeSignals();
 });
@@ -1235,7 +1247,7 @@ test("activity reload uses the sidecar path and only reads it", async () => {
     "/tmp/project/activity/runs.jsonl",
   );
   const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8");
-  assert.match(source, /readActivityFile/);
+  assert.match(source, /readActivityDelta/);
   assert.match(source, /resolveRunsPath\(historyPath, options\.runsPath\)/);
   assert.doesNotMatch(source, /activity\.(append|rewrite|compact)\(/);
 });
@@ -1261,7 +1273,8 @@ test("child agent rows use cumulative direct generation, not bounded response hi
     ]);
     assert.equal(rows[0].model, "kept-model");
     assert.deepEqual(childRows([], "root", store).map((row) => [row.sessionID, row.responseCount, row.generated]), rows.map((row) => [row.sessionID, row.responseCount, row.generated]));
-    store.totalsLedger.sessions.child = { tokens: tokens(0), cost: 0, responseCount: 0, speed: emptySpeedTotals() };
+    store.totalsLedger = { ...store.totalsLedger, sessions: { ...store.totalsLedger.sessions,
+      child: { tokens: tokens(0), cost: 0, responseCount: 0, speed: emptySpeedTotals() } } };
     const wrapper = childRows([], "root", store).find((row) => row.sessionID === "child")!;
     assert.deepEqual([wrapper.responseCount, wrapper.generated], [0, 0]);
   } finally { store.disposeSignals(); }

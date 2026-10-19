@@ -9,20 +9,22 @@ import { setProp as _$setProp } from "@opentui/solid";
 import { createElement as _$createElement } from "@opentui/solid";
 /** @jsxImportSource @opentui/solid */
 
-import { readFile } from "node:fs/promises";
+import { readLedgerText } from "./persistence-files.js";
 import { watch, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import { Plugin } from "@opencode/plugin/tui";
 import { createV2TuiBridge } from "./tui-v2.js";
+import { tuiReadModel, parentProofPort, RevisionMap, TuiActivitySelection, activitySemanticIdentity } from "./tui-read-model.js";
 import { DEFAULT_BYTES_PER_TOKEN, HISTORY_VERSION, addTokenCounts, aggregateSession, aggregateSessionTree, calibrateResponseSamples, bytesToTokens, emptyTokenCounts, formatDuration, formatNumber, normalizeTokenCounts, timeToFirstToken } from "./core.js";
-import { replayActivity, resolveRootSessionID } from "./activity.js";
+import { normalizeActivityEvent, resolveRootSessionID } from "./activity.js";
 import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteStepIdentity, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
-import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, isSessionScopeExcluded, mergeScopeEvidence } from "./scope.js";
+import { completeContentMetadata, retireContentMetadata, disposeContentMetadata } from "./statistics.js";
+import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, mergeScopeEvidence } from "./scope.js";
 import { DEFAULT_MAX_RECORDS, readHistoryFile, filterHistoryRecords } from "./storage.js";
-import { readActivityFile, resolveRunsPath } from "./runs-storage.js";
+import { readActivityDelta, resolveRunsPath } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
 import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
@@ -31,7 +33,160 @@ const HISTORY_ROUTE = "oc-tps-history";
 const HISTORY_MODE = "oc-tps.history";
 const COMMAND_NAME = "oc-tps.history";
 export const DETAILS_COMMAND_NAME = "oc-tps.details";
+function ownValue(dictionary, key) {
+  return dictionary && Object.prototype.hasOwnProperty.call(dictionary, key) ? dictionary[key] : undefined;
+}
 const recordQualityByObject = new WeakMap();
+// Observation facts are compact control metadata only. Shared activity owns all
+// interval mathematics; canonical reload replaces matching optimistic facts.
+
+const tuiActivities = new WeakMap();
+function tuiActivity(store) {
+  let value = tuiActivities.get(store);
+  if (!value) {
+    const selection = new TuiActivitySelection(store);
+    value = {
+      selection,
+      get projector() {
+        return selection.projector;
+      },
+      canonical: store.activityEvents,
+      overlay: selection.overlay,
+      instanceID: randomUUID(),
+      sequence: 0,
+      known: selection.known,
+      candidates: new Set(),
+      runtimeEpochs: new Map(),
+      partialSessions: new Set(),
+      executions: new Map(),
+      currentExecutions: new Map(),
+      scopes: Object.create(null),
+      scopeKey: ""
+    };
+    tuiActivities.set(store, value);
+    if (store.activityEvents.length) replaceActivityProjection(store, value);
+  }
+  if (value.canonical !== store.activityEvents) replaceActivityProjection(store, value);
+  value.selection.patch();
+  return value;
+}
+function replaceActivityProjection(store, value) {
+  value.canonical = store.activityEvents;
+  tuiReadModel(store).canonicalParents(store.activityEvents, true);
+  value.selection.reset(store.activityEvents);
+  for (const fact of store.activityEvents) value.known.add(fact.sessionID);
+}
+export function recordTuiActivityFact(store, input, event = {}) {
+  if (store.disposed) return false;
+  const value = tuiActivity(store);
+  const executionID = readString(input.executionID ?? event.executionID);
+  const sequence = readNumber(input.sourceSequence ?? event.sourceSequence ?? event.revision);
+  const timestamp = readNumber(input.timestamp) ?? Date.now();
+  let execution = executionID ? value.executions.get(executionID) : undefined;
+  if (execution?.frozen) return false;
+  const resume = input.kind === "lifecycle" && (input.state === "busy" || input.state === "retry") && timestamp >= observationRuntime(store).observedSince;
+  // A post-gap positive control can resume the same execution in a fresh
+  // observation. A late terminal from its old prefix cannot close that tail.
+  if (execution && execution.instanceID !== value.instanceID && !resume) return false;
+  if (!execution || execution.instanceID !== value.instanceID) execution = {
+    instanceID: value.instanceID,
+    boundarySequence: sequence,
+    boundaryTime: timestamp
+  };else if (sequence !== undefined && execution.boundarySequence !== undefined ? sequence < execution.boundarySequence : timestamp < execution.boundaryTime) return false;
+  const instanceID = execution.instanceID;
+  // Adapter partial executions have no observed lifecycle start and cannot
+  // manufacture busy time. Keep their proof in the adapter/canonical ledger,
+  // not an ever-repaired live stream with no activity to project.
+  if (input.kind !== "lifecycle" && executionID?.startsWith("partial:")) return false;
+  if (input.kind === "lifecycle" && input.state === "busy" && executionID && !executionID.startsWith("partial:") && typeof input.sessionID === "string" && value.partialSessions.has(input.sessionID)) {
+    const ends = new Map();
+    for (const fact of value.overlay.values()) if (fact.sessionID === input.sessionID && fact.instanceID === value.instanceID && fact.executionID?.startsWith("partial:")) {
+      ends.set(fact.executionID, Math.max(ends.get(fact.executionID) ?? fact.timestamp, fact.timestamp));
+    }
+    for (const [id, fact] of value.overlay) if (fact.sessionID === input.sessionID && fact.instanceID === value.instanceID && fact.executionID && ends.has(fact.executionID)) {
+      value.overlay.set(id, {
+        ...fact,
+        instanceEndedAt: ends.get(fact.executionID)
+      });
+      const partial = value.executions.get(fact.executionID);
+      if (partial) partial.frozen = true;
+    }
+    value.partialSessions.delete(input.sessionID);
+    // Refine a placeholder observation; never invent an idle or a span from
+    // its last known prefix to the newly identified execution.
+    for (const id of ends.keys()) value.selection.freeze(value.instanceID, undefined, id);
+  }
+  const sourceEventID = readString(input.sourceEventID) ?? readString(event.sourceEventID) ?? readString(event.id);
+  const providedEventID = readString(input.eventID);
+  const semantic = sourceEventID || providedEventID ? activitySemanticIdentity({
+    ...input,
+    eventID: providedEventID,
+    executionID,
+    sourceEventID,
+    timestamp: readNumber(input.timestamp ?? event.timestamp)
+  }) : undefined;
+  if (semantic && value.selection.hasLiveSemantic(semantic)) return false;
+  const seq = value.sequence + 1;
+  const fact = normalizeActivityEvent({
+    ...input,
+    version: 2,
+    instanceID,
+    seq,
+    observedAt: Date.now(),
+    eventID: providedEventID ?? `tui:${instanceID}:${seq}`,
+    sourceEventID: input.sourceEventID ?? event.sourceEventID ?? event.id,
+    sourceSequence: input.sourceSequence ?? event.sourceSequence ?? event.revision
+  });
+  if (!fact) return false;
+  if (executionID) value.executions.set(executionID, execution);
+  if (fact.kind === "parent") tuiReadModel(store).observeParent(fact.sessionID, {
+    parent: fact.parentSessionID || null,
+    origin: "live",
+    identity: fact.sourceEventID ?? fact.eventID,
+    sourceEpoch: readString(event.sourceEpoch),
+    sourceSequence: sequence
+  });
+  value.selection.patch();
+  if (!value.selection.addLive(fact, semantic)) return false;
+  value.sequence = seq;
+  if (fact.kind === "lifecycle") {
+    if (executionID?.startsWith("partial:") && (fact.state === "busy" || fact.state === "retry")) value.partialSessions.add(fact.sessionID);
+    if (fact.state === "busy" || fact.state === "retry") value.candidates.add(fact.sessionID);else if (!value.projector.totals(fact.sessionID, {
+      liveNow: Date.now(),
+      trustedCurrentInstanceID: value.instanceID
+    }).active) value.candidates.delete(fact.sessionID);
+  }
+  return true;
+}
+function disconnectTuiActivity(store) {
+  const value = tuiActivity(store);
+  value.selection.freeze(value.instanceID);
+  value.instanceID = randomUUID();
+  value.sequence = 0;
+  value.currentExecutions.clear();
+  value.candidates.clear();
+  tuiReadModel(store).bindProof();
+}
+export function tuiActivityTimes(store, sessionID, now = Date.now()) {
+  const value = tuiActivity(store);
+  return value.projector.totals(sessionID, {
+    liveNow: now,
+    trustedCurrentInstanceID: value.instanceID
+  });
+}
+/** Structural, store-scoped test observation; no log or user-facing surface. */
+export function tuiActivityDiagnostics(store) {
+  const value = tuiActivity(store);
+  return {
+    ...value.selection.diagnostics(),
+    activeCandidates: value.candidates.size,
+    compactContributions: [...store.sessionRuntime.values()].reduce((sum, runtime) => sum + (retiredContributions.get(runtime)?.size ?? 0), 0),
+    activeResponses: store.active.size,
+    optimisticResponses: store.optimistic.size,
+    runtimeResponses: [...store.sessionRuntime.values()].reduce((sum, runtime) => sum + runtime.contributions.size + runtime.completedContributions.size, 0),
+    progress: observationRuntime(store).metadata.progress.size
+  };
+}
 const observationRuntimes = new WeakMap();
 function observationRuntime(store) {
   let runtime = observationRuntimes.get(store);
@@ -50,93 +205,46 @@ function observationRuntime(store) {
   return runtime;
 }
 function knownCompletedMessage(store, messageID) {
-  return store.completedMessageIDs.has(messageID) || observationRuntime(store).metadata.completed.has(messageID) || store.totalsLedger.settled[messageID] !== undefined || store.totalsLedger.open[messageID]?.quality === "exact";
+  return store.completedMessageIDs.has(messageID) || observationRuntime(store).metadata.completed.has(messageID) || ownValue(store.totalsLedger.settled, messageID) !== undefined || ownValue(store.totalsLedger.open, messageID)?.quality === "exact";
 }
 function knownNonAssistant(store, messageID) {
   const role = observationRuntime(store).metadata.roles.get(messageID);
   return role !== undefined && role !== "assistant";
 }
-const scopeSnapshots = new WeakMap();
-function scopedLedger(store) {
-  const cached = scopeSnapshots.get(store);
-  if (cached?.ledger === store.totalsLedger && cached.registry === store.sourceScopes && cached.revision === store.sourceScopes.revision && cached.records === store.records && cached.disk === store.diskRecords) return cached.ledgerView;
-  const scopes = {
-    ...collectSessionScopeEvidence([...store.diskRecords, ...store.records], store.totalsLedger.sessionScopes)
-  };
-  for (const [id, proof] of Object.entries(store.sourceScopes.serialize())) scopes[id] = mergeScopeEvidence(scopes[id], proof);
-  const ledgerView = {
-    ...store.totalsLedger,
-    sessionScopes: scopes
-  };
-  // Remove only positively excluded reversible contributions, never raw facts.
-  for (const [id, proof] of store.messageScopes) {
-    const contribution = Object.prototype.hasOwnProperty.call(ledgerView.open, id) ? ledgerView.open[id] : ledgerView.settled[id];
-    if (!contribution || contribution === true || contribution.excluded) continue;
-    const direct = ledgerView.sessions[contribution.sessionID];
-    if (!direct) continue;
-    ledgerView.sessions = {
-      ...ledgerView.sessions,
-      [contribution.sessionID]: cloneDirectTotals(direct)
-    };
-    subtractDirect(ledgerView.sessions[contribution.sessionID], contribution.tokens, contribution.cost, contribution.speed);
-    if (ledgerView.open[id]) ledgerView.open = {
-      ...ledgerView.open,
-      [id]: {
-        ...contribution,
-        excluded: proof
-      }
-    };else ledgerView.settled = {
-      ...ledgerView.settled,
-      [id]: {
-        ...contribution,
-        excluded: proof
-      }
-    };
-  }
-  scopeSnapshots.set(store, {
-    ledger: store.totalsLedger,
-    registry: store.sourceScopes,
-    revision: store.sourceScopes.revision,
-    records: store.records,
-    disk: store.diskRecords,
-    ledgerView
-  });
-  return ledgerView;
-}
 function scopeEligible(store, sessionID, messageID) {
-  const ledger = scopedLedger(store);
-  return !(messageID && getExcludedMessageIDs(ledger).has(messageID)) && isMeasurementScopeEligible({
-    sessionID,
-    scope: messageID ? store.messageScopes.get(messageID) : undefined
-  }, ledger.sessionScopes, store.sessionParents);
+  const model = tuiReadModel(store);
+  return !(messageID && model.excluded(messageID)) && model.eligible(sessionID);
 }
 function scopedRecords(store, records) {
-  return filterHistoryRecords(records.map(record => {
-    const proof = store.messageScopes.get(record.messageID);
-    return proof ? {
-      ...record,
-      scope: mergeScopeEvidence(record.scope, proof)
-    } : record;
-  }), scopedLedger(store).sessionScopes, store.sessionParents, getExcludedMessageIDs(scopedLedger(store)));
+  return tuiReadModel(store).filter(records);
 }
 function observeAssistantScope(store, sessionID, messageID, info) {
   const previousRevision = store.sourceScopes.revision;
   const proof = store.sourceScopes.observeMessageMetadata(sessionID, info);
   if (proof.sourceScope === "magic-message" || proof.sourceScope === "magic-session") {
     store.messageScopes.set(messageID, mergeScopeEvidence(store.messageScopes.get(messageID), proof));
-    scopeSnapshots.delete(store);
+    tuiReadModel(store).noteProof(messageID);
   }
-  if (previousRevision !== store.sourceScopes.revision && store.sourceScopes.isExcluded(sessionID) || !scopeEligible(store, sessionID, messageID)) {
-    refreshScopeProjection(store);
+  if (previousRevision !== store.sourceScopes.revision && store.sourceScopes.isExcluded(sessionID)) refreshScopeProjection(store);else if (!scopeEligible(store, sessionID, messageID)) {
+    // A local MC work identity is not a whole-session reclassification. Do not
+    // replay the canonical activity log or scan all past responses for it.
+    finalizeResponse(store, messageID, sessionID, store.active.get(messageID)?.responseEpoch, {
+      authoritative: true
+    });
+    removeOptimisticRecord(store, messageID);
+    const runtime = store.sessionRuntime.get(sessionID);
+    runtime?.contributions.delete(messageID);
+    runtime?.completedContributions.delete(messageID);
+    completeContentMetadata(observationRuntime(store).metadata, messageID);
+    store.records = store.records.filter(record => record.messageID !== messageID);
+    if (store.lastCompletedBySession.get(sessionID)?.record.messageID === messageID) store.lastCompletedBySession.delete(sessionID);
+    store.bump();
   }
   return proof;
 }
 function refreshScopeProjection(store) {
   store.records = scopedRecords(store, store.records);
-  store.activityReplay = replayActivity(store.activityEvents, {
-    sessionScopes: scopedLedger(store).sessionScopes,
-    parentBySessionID: store.sessionParents
-  });
+  tuiReadModel(store).syncScopes();
   for (const state of [...store.active.values()]) if (!scopeEligible(store, state.sessionID, state.messageID)) {
     finalizeResponse(store, state.messageID, state.sessionID, state.responseEpoch, {
       authoritative: true
@@ -144,6 +252,7 @@ function refreshScopeProjection(store) {
   }
   for (const [id, last] of store.lastCompletedBySession) if (!scopeEligible(store, id, last.record.messageID)) store.lastCompletedBySession.delete(id);
   for (const run of store.taskRuns.values()) for (const id of run.activeSessions) if (!scopeEligible(store, id)) run.activeSessions.delete(id);
+  retireCanonicalResponses(store);
   store.bump();
 }
 export function recordTuiPartMetadata(store, properties, event = {}, receivedAt = Date.now()) {
@@ -193,7 +302,10 @@ export function recordTuiObservationLifecycle(store, type, properties, event, re
   const observations = observationRuntime(store);
   const transport = type === "server.connected" ? observations.connected : type === "server.instance.disposed" || type.startsWith("workspace.") && /status|disposed|deleted/.test(type);
   if (type === "server.connected") observations.connected = true;
-  if (transport) observations.observedSince = Math.max(observations.observedSince, receivedAt);
+  if (transport) {
+    disconnectTuiActivity(store);
+    observations.observedSince = Math.max(observations.observedSince, receivedAt);
+  }
   if (transport) for (const state of store.active.values()) {
     taintTuiState(store, state, "transport-disruption");
     observations.liveAssistantMessages.delete(state.messageID);
@@ -253,6 +365,22 @@ function serializeCompletionFact(value, seen = new Set()) {
   seen.delete(value);
   return result;
 }
+const retiredContributions = new WeakMap();
+function compactContribution(record, runEpoch) {
+  return {
+    runEpoch,
+    sessionID: record.sessionID,
+    time: {
+      ...record.time
+    },
+    model: record.model,
+    agent: record.agent,
+    tokens: record.tokens,
+    cost: record.cost,
+    update: record.update
+  };
+}
+let legacyLifecycleOrder = 0;
 function lifecycleStateAt(events, timestamp) {
   return events.filter(event => event.timestamp <= timestamp).at(-1)?.state;
 }
@@ -260,7 +388,7 @@ function mergeLifecycleEvents(left, right) {
   const byTimestamp = new Map();
   for (const event of [...left, ...right]) {
     const existing = byTimestamp.get(event.timestamp);
-    if (!existing || activeTaskSessionState(event.state) && !activeTaskSessionState(existing.state)) {
+    if (!existing || (event.order ?? 0) >= (existing.order ?? 0)) {
       byTimestamp.set(event.timestamp, {
         ...event
       });
@@ -273,9 +401,11 @@ function sameLifecycleEvents(left, right) {
 }
 function recordLifecycleFact(eventsBySession, sessionID, state, timestamp) {
   const previous = eventsBySession.get(sessionID) ?? [];
+  if (previous.find(event => event.timestamp === timestamp)?.state === state) return false;
   const next = mergeLifecycleEvents(previous, [{
     state,
-    timestamp
+    timestamp,
+    order: ++legacyLifecycleOrder
   }]);
   if (sameLifecycleEvents(previous, next)) return false;
   eventsBySession.set(sessionID, next);
@@ -355,6 +485,7 @@ function readNumberFrom(sources, keys) {
 function normalizeEvent(input) {
   const outer = asRecord(input);
   if (!outer) return undefined;
+  if (typeof outer.type === "string") return outer;
   const nested = asRecord(outer.event) ?? asRecord(outer.payload);
   if (nested && typeof nested.type === "string") return nested;
   return outer;
@@ -1048,6 +1179,26 @@ function preferredHistoryRecord(candidate, existing, candidateQuality, existingQ
   return candidate;
 }
 export function applyRecordToSessionRuntime(runtime, record, quality = "exact") {
+  const compact = retiredContributions.get(runtime)?.get(record.messageID);
+  if (compact && !runtime.contributions.has(record.messageID) && !runtime.completedContributions.has(record.messageID)) {
+    if (quality !== "exact") return false;
+    if (compact.runEpoch === runtime.runEpoch) {
+      runtime.runTotals = replaceTokenContribution(runtime.runTotals, compact.tokens, record.tokens);
+      runtime.runCost = Math.max(0, runtime.runCost - compact.cost + record.cost);
+    }
+    const summary = runtime.runSummaries.get(compact.runEpoch);
+    if (summary) {
+      const corrected = {
+        ...summary,
+        tokens: replaceTokenContribution(summary.tokens, compact.tokens, record.tokens),
+        cost: Math.max(0, summary.cost - compact.cost + record.cost)
+      };
+      runtime.runSummaries.set(compact.runEpoch, corrected);
+      if (runtime.lastRunSummary?.runEpoch === compact.runEpoch) runtime.lastRunSummary = corrected;
+    }
+    retiredContributions.get(runtime).set(record.messageID, compactContribution(record, compact.runEpoch));
+    return true;
+  }
   const historical = runtime.completedContributions.get(record.messageID);
   if (!runtime.contributions.has(record.messageID) && historical) {
     const previous = historical.record;
@@ -1157,8 +1308,9 @@ function commitRecord(store, record, markCompleted) {
   const effectiveQuality = selected.quality ?? "exact";
   const existingRuntime = getSessionRuntime(store, record.sessionID);
   const existingContribution = existingRuntime.contributions.get(record.messageID) ?? existingRuntime.completedContributions.get(record.messageID);
-  const runtime = existingContribution ? existingRuntime : ensureSessionRun(store, record.sessionID, record.time.start);
-  const historicalEpoch = existingRuntime.completedContributions.get(record.messageID)?.runEpoch;
+  const compact = retiredContributions.get(existingRuntime)?.get(record.messageID);
+  const runtime = existingContribution || compact ? existingRuntime : ensureSessionRun(store, record.sessionID, record.time.start);
+  const historicalEpoch = existingRuntime.completedContributions.get(record.messageID)?.runEpoch ?? compact?.runEpoch;
   if (runtime.contributions.get(record.messageID)?.quality === "exact" && effectiveQuality === "provisional") return;
   const applied = applyRecordToSessionRuntime(runtime, effectiveRecord, effectiveQuality);
   if (!applied && runtime.contributions.get(record.messageID)?.record !== effectiveRecord && runtime.completedContributions.get(record.messageID)?.record !== effectiveRecord) return;
@@ -1175,6 +1327,7 @@ function commitRecord(store, record, markCompleted) {
   store.bump();
 }
 function parentSessionID(api, sessionID, info, store) {
+  if (store?.sessionParents.has(sessionID)) return store.sessionParents.get(sessionID) ?? undefined;
   const explicit = readStringFrom([info], ["parentSessionID", "parentSessionId"]);
   if (explicit) return explicit;
   let stateParent;
@@ -1184,24 +1337,16 @@ function parentSessionID(api, sessionID, info, store) {
   } catch {
     // State can still be syncing while a response completes.
   }
-  return stateParent ?? store?.sessionParents.get(sessionID);
+  return stateParent ?? store?.sessionParents.get(sessionID) ?? undefined;
 }
 function knownRootSessionID(store, sessionID) {
-  let root = sessionID;
-  const visited = new Set();
-  while (!visited.has(root)) {
-    visited.add(root);
-    const parent = store.sessionParents.get(root);
-    if (!parent) break;
-    root = parent;
-  }
-  return root;
+  return tuiReadModel(store).root(sessionID);
 }
 function rewriteRecordParent(record, parentSessionID) {
   if (parentSessionID === undefined || record.parentSessionID === parentSessionID) return record;
   const next = {
     ...record,
-    parentSessionID
+    parentSessionID: parentSessionID ?? undefined
   };
   const quality = recordQualityByObject.get(record);
   if (quality !== undefined) recordQualityByObject.set(next, quality);
@@ -1400,20 +1545,24 @@ function migrateTaskWallRuns(store, rootSessionID) {
   return changed;
 }
 function rememberSessionParent(store, sessionID, parentID) {
-  if (!sessionID || !parentID || sessionID === parentID) return false;
-  const previous = store.sessionParents.get(sessionID);
-  store.sourceScopes.observeSessionMetadata(sessionID, {
-    parentID
+  if (!sessionID || sessionID === parentID) return false;
+  const changed = tuiReadModel(store).observeParent(sessionID, {
+    parent: parentID,
+    origin: "cache"
   });
-  if (previous !== parentID) store.sessionParents = new Map(store.sessionParents).set(sessionID, parentID);
+  if (!changed) return false;
   const repaired = repairKnownParents(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
   const migrated = migrateTaskWallRuns(store, rootSessionID);
-  return previous !== parentID || repaired || migrated;
+  return changed || repaired || migrated;
 }
 function sessionParentFromEvent(type, properties, event) {
   const normalizedType = type.toLowerCase();
   const sources = [properties, event, asRecord(properties.info), asRecord(properties.message), asRecord(properties.session), asRecord(properties.event), asRecord(event.info), asRecord(event.session), asRecord(event.event)];
+  for (const source of sources) if (source && (Object.hasOwn(source, "parentSessionID") || Object.hasOwn(source, "parentSessionId"))) {
+    const value = source.parentSessionID ?? source.parentSessionId;
+    if (value === null || value === undefined || value === "") return null;
+  }
   const explicit = readStringFrom(sources, ["parentSessionID", "parentSessionId"]);
   if (explicit) return explicit;
   if (!normalizedType.startsWith("session.")) return undefined;
@@ -1424,6 +1573,7 @@ function sessionParentFromEvent(type, properties, event) {
       if (source) sessionEntitySources.push(source);
     }
   }
+  for (const source of sessionEntitySources) if (Object.hasOwn(source, "parentID") && (source.parentID === null || source.parentID === undefined || source.parentID === "")) return null;
   return readStringFrom(sessionEntitySources, ["parentID", "parent.id"]);
 }
 export function cacheSessionParentFromEvent(store, input) {
@@ -1435,9 +1585,22 @@ export function cacheSessionParentFromEvent(store, input) {
   const sessionID = readSessionID(properties, event);
   if (!sessionID) return false;
   const before = store.sourceScopes.revision;
+  const model = tuiReadModel(store);
   store.sourceScopes.observeSessionMetadata(sessionID, eventInfo(properties, event) ?? asRecord(properties.session) ?? properties);
   const parentID = sessionParentFromEvent(type, properties, event);
-  const mapped = parentID ? rememberSessionParent(store, sessionID, parentID) : false;
+  const mapped = parentID !== undefined ? model.observeParent(sessionID, {
+    parent: parentID,
+    origin: "live",
+    identity: readString(event.sourceEventID ?? event.id),
+    sourceEpoch: readString(event.sourceEpoch ?? event.instanceID),
+    sourceSequence: readNumber(event.sourceSequence),
+    entityRevision: readNumber(event.entityRevision)
+  }) : false;
+  model.syncScopes(sessionID);
+  if (mapped) {
+    repairKnownParents(store);
+    migrateTaskWallRuns(store, model.root(sessionID));
+  }
   if (store.sourceScopes.revision !== before) {
     refreshScopeProjection(store);
   }
@@ -1445,29 +1608,37 @@ export function cacheSessionParentFromEvent(store, input) {
 }
 function rootSessionIDFor(store, api, sessionID, info) {
   const previous = store.sourceScopes.revision;
+  const model = tuiReadModel(store);
+  model.bindProof(api[parentProofPort]);
   try {
     // A V2 TUI may attach after parent creation events. Cached ancestor
     // metadata is still authoritative Magic Context evidence; no network read.
     const visited = new Set();
     let id = sessionID;
     while (id && !visited.has(id)) {
+      if (id !== sessionID && model.ancestryChecked.has(id)) break;
       visited.add(id);
       const cached = api.state.session.get(id);
-      if (cached) store.sourceScopes.observeSessionMetadata(id, cached);
-      const parent = cached?.parentID ?? store.sessionParents.get(id);
-      if (parent) rememberSessionParent(store, id, parent);
-      id = parent;
+      if (cached) {
+        store.sourceScopes.observeSessionMetadata(id, cached);
+        model.syncScopes(id);
+      }
+      if (cached && Object.hasOwn(cached, "parentID")) model.observeParent(id, {
+        parent: cached.parentID || null,
+        origin: "cache"
+      });
+      const parent = model.parents.get(id);
+      model.ancestryChecked.add(id);
+      id = parent ?? undefined;
     }
   } catch {/* SDK state may not be ready; unknown is not exclusion evidence. */}
-  const parent = parentSessionID(api, sessionID, info, store);
+  const parent = readStringFrom([info], ["parentSessionID", "parentSessionId"]);
   if (parent) rememberSessionParent(store, sessionID, parent);
   if (previous !== store.sourceScopes.revision && !scopeEligible(store, sessionID)) refreshScopeProjection(store);
   const rootSessionID = knownRootSessionID(store, sessionID);
-  migrateTaskWallRuns(store, rootSessionID);
   return rootSessionID;
 }
 function getTaskWallRun(store, rootSessionID) {
-  migrateTaskWallRuns(store, rootSessionID);
   const existing = store.taskRuns.get(rootSessionID);
   if (existing) return existing;
   const run = createTaskWallRun(rootSessionID);
@@ -1525,6 +1696,12 @@ function taskDisplayIntervals(store, run, now) {
 }
 export function taskWallTimeForSession(store, sessionID, now = Date.now()) {
   if (!sessionID || !scopeEligible(store, sessionID)) return undefined;
+  if (tuiActivities.has(store) || store.activityEvents.length && store.taskRuns.size === 0) {
+    const value = tuiActivity(store);
+    const root = activityRootSessionID(store, sessionID);
+    if (!value.selection.knownRoot(root) && !store.taskRuns.has(root)) return undefined;
+    return tuiActivityTimes(store, root, now).includingMilliseconds;
+  }
   const rootSessionID = activityRootSessionID(store, sessionID);
   migrateTaskWallRuns(store, rootSessionID);
   const runs = taskWallRunsForActivityRoot(store, rootSessionID);
@@ -1534,14 +1711,23 @@ export function taskWallTimeForSession(store, sessionID, now = Date.now()) {
     liveIntervals.push(...taskDisplayIntervals(store, run, now));
     hasCompletedLiveActivity ||= run.lifecycleEvents.size > 0 || run.lastRunWallTime !== undefined || run.lastRunLifecycleEvents.size > 0 || run.lastRunIntervals.length > 0 || run.carriedIntervals.length > 0;
   }
-  const persistedIntervals = persistedActivityIntervalsForRoot(store.activityReplay, rootSessionID, store.sessionParents);
-  const intervals = mergeTaskActivityIntervals(store.activityReplay, sessionID, liveIntervals, store.sessionParents);
+  // Standalone legacy TaskWallRun utility fixtures have no observation facts.
+  // Production lifecycle/canonical consumers always use the shared projector.
+  const intervals = mergeIntervals(liveIntervals);
   if (intervals.length > 0) return intervalElapsed(intervals);
-  const hasCompletedPersistedActivity = persistedCompletedActivityForRoot(store.activityReplay, rootSessionID, store.sessionParents);
-  if (hasCompletedPersistedActivity || hasCompletedLiveActivity || persistedIntervals.length > 0) return 0;
+  if (hasCompletedLiveActivity) return 0;
   return undefined;
 }
 export function hasLiveTaskWallActivity(store) {
+  if (store.disposed) return false;
+  if (tuiActivities.has(store)) {
+    const value = tuiActivity(store);
+    for (const id of value.candidates) {
+      if (tuiActivityTimes(store, id).active) return true;
+      value.candidates.delete(id);
+    }
+    return false;
+  }
   for (const state of store.active.values()) if (observationRuntime(store).liveAssistantMessages.has(state.messageID) && !knownCompletedMessage(store, state.messageID) && scopeEligible(store, state.sessionID, state.messageID)) return true;
   for (const run of store.taskRuns.values()) {
     if (run.phase === "active" && [...run.activeSessions].some(id => scopeEligible(store, id))) return true;
@@ -1570,7 +1756,7 @@ function activityRootSessionIDFromReplay(replay, sessionID, sessionParents) {
   return resolveRootSessionID(sessionID, activityParentMap(replay, sessionParents));
 }
 function activityRootSessionID(store, sessionID) {
-  return activityRootSessionIDFromReplay(store.activityReplay, sessionID, store.sessionParents);
+  return tuiReadModel(store).root(sessionID);
 }
 function activityParticipantIDs(replay) {
   const sessionIDs = new Set();
@@ -1678,8 +1864,7 @@ function preferredUpdateLayer(candidate, existing) {
 }
 function baseHistoryRecords(store) {
   if (store.diskRecords.length > 0 || store.records.length === 0) return scopedRecords(store, store.diskRecords);
-  const optimisticIDs = new Set(store.optimistic.keys());
-  return scopedRecords(store, store.records.filter(record => !optimisticIDs.has(record.messageID)));
+  return scopedRecords(store, store.records.filter(record => !store.optimistic.has(record.messageID)));
 }
 function preferredHistoryLayer(candidate, existing) {
   const selected = selectPreferredHistoryLayer(candidate, existing);
@@ -1740,11 +1925,15 @@ function selectPreferredHistoryLayer(candidate, existing) {
 }
 function addOptimisticRecord(store, record, quality) {
   recordQualityByObject.set(record, quality);
+  const existing = store.optimistic.has(record.messageID);
   store.optimistic.set(record.messageID, record);
   store.optimisticQuality.set(record.messageID, quality);
   store.optimisticOrder.set(record.messageID, store.nextOptimisticOrder);
   store.nextOptimisticOrder += 1;
-  store.records = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, store.maxRecords, store.optimisticQuality, store.optimisticOrder);
+  // The displayed history window is bounded; cumulative unconfirmed evidence
+  // is not a reason to scan every previous response on each completion. A late
+  // correction of a trimmed ID retains its original position, not a new row.
+  if (existing) store.records = store.records.map(entry => entry.messageID === record.messageID ? record : entry);else store.records = mergeHistoryLayers(store.records, new Map([[record.messageID, record]]), store.maxRecords, store.optimisticQuality, store.optimisticOrder);
   store.bump();
   return true;
 }
@@ -1841,8 +2030,8 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
     authoritative: true
   });
   const previous = previousTuiRecord(store, messageID);
-  const openSnapshot = store.totalsLedger.open[messageID];
-  const snapshot = openSnapshot ?? store.totalsLedger.settled[messageID];
+  const openSnapshot = ownValue(store.totalsLedger.open, messageID);
+  const snapshot = openSnapshot ?? ownValue(store.totalsLedger.settled, messageID);
   if (snapshot === true) {
     store.completedMessageIDs.add(messageID);
     observations.metadata.completed.add(messageID);
@@ -1880,14 +2069,17 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
   const quality = exactFields.output !== undefined && exactFields.input !== undefined && (exactFields.reasoning !== undefined || candidateTokens.reasoning === 0) ? "exact" : "provisional";
   if (prior && (prior.quality ?? "exact") === "exact" && quality === "provisional") return false;
   const state = finalized;
-  const tokens = makeTokens(info, state, bytesPerToken);
+  const tokens = {
+    ...(prior?.tokens ?? makeTokens(info, state, bytesPerToken)),
+    ...exactFields
+  };
   const record = makeHistoryRecord({
     messageID,
     sessionID,
     parentSessionID: parentSessionID(api, sessionID, info, store),
     model: modelName(info) ?? state?.model,
     agent: normalizeAgentName(info.agent) ?? state?.agent ?? (previous?.sessionID === sessionID ? previous.agent : undefined),
-    cost: readNumber(info.cost) ?? state?.cost ?? 0,
+    cost: readNumber(info.cost) ?? prior?.cost ?? state?.cost ?? 0,
     tokens,
     samples: calibrateResponseSamples(state ? finalSamples(state) : previous?.samples ?? [], {
       output: tokens.output,
@@ -1920,7 +2112,7 @@ export function handleMessageUpdated(store, api, properties, event, bytesPerToke
   record.speed = mergeRecordSpeed(record, prior, observations.taintedMessages.has(messageID) || state && finalSamples(state).length > 0 && !record.speed?.generation ? "invalidated" : "unobserved");
   record.update = update;
   commitRecord(store, record, true);
-  observations.metadata.completed.add(messageID);
+  completeContentMetadata(observations.metadata, messageID);
   observations.liveAssistantMessages.delete(messageID);
   noteTaskRecord(store, api, record);
   return true;
@@ -1943,6 +2135,14 @@ function previousTuiRecord(store, messageID) {
   if (!selected) {
     for (const runtime of store.sessionRuntime.values()) {
       consider((runtime.contributions.get(messageID) ?? runtime.completedContributions.get(messageID))?.record, "optimistic");
+      const compact = retiredContributions.get(runtime)?.get(messageID);
+      if (compact) consider({
+        ...compact,
+        version: 1,
+        messageID,
+        quality: "exact",
+        samples: []
+      }, "optimistic");
     }
   }
   return selected?.record;
@@ -2024,24 +2224,55 @@ export function handleSessionLifecycle(store, api, type, properties, event, byte
   if (eventParent) rememberSessionParent(store, sessionID, eventParent);
   const rootSessionID = rootSessionIDFor(store, api, sessionID);
   if (!scopeEligible(store, sessionID)) return false;
-  const taskRun = status === "idle" ? findTaskWallRun(store, rootSessionID, sessionID) ?? getTaskWallRun(store, rootSessionID) : getTaskWallRun(store, rootSessionID);
-  if (status === "idle") {
-    const historyBefore = taskRun ? lifecycleHistorySignature(taskRun) : undefined;
-    const finishedSession = finishSessionRun(store, api, sessionID, bytesPerToken, timestamp);
-    const finishedTask = taskRun ? transitionTaskWallRun(taskRun, sessionID, "idle", timestamp) : undefined;
-    const historyChanged = taskRun !== undefined && historyBefore !== lifecycleHistorySignature(taskRun);
-    if (finishedTask || historyChanged) store.bump();
-    return finishedSession || finishedTask !== undefined || historyChanged;
-  }
-  if (!taskRun) return false;
+  const activity = tuiActivity(store);
+  const executionID = readString(event.executionID ?? properties.executionID);
   const runtime = getSessionRuntime(store, sessionID);
-  const historyBefore = lifecycleHistorySignature(taskRun);
-  const currentEpoch = sessionLifecycleFactBelongsToCurrentEpoch(runtime, timestamp);
-  const changed = currentEpoch ? transitionSessionRuntime(runtime, status, timestamp) : false;
-  const finishedTask = transitionTaskWallRun(taskRun, sessionID, status, timestamp);
-  const historyChanged = historyBefore !== lifecycleHistorySignature(taskRun);
-  if (changed || finishedTask || historyChanged) store.bump();
-  return false;
+  const refinesPartial = status !== "idle" && executionID && !executionID.startsWith("partial:") && activity.currentExecutions.get(sessionID)?.startsWith("partial:");
+  const fresh = timestamp >= (runtime.runStartedAt ?? -Infinity) || Boolean(refinesPartial);
+  if (!recordTuiActivityFact(store, {
+    kind: "lifecycle",
+    sessionID,
+    timestamp,
+    state: status,
+    ...(executionID ? {
+      executionID
+    } : {}),
+    parentSessionID: store.sessionParents.get(sessionID)
+  }, event)) return false;
+  if (status !== "idle" && fresh && executionID) activity.currentExecutions.set(sessionID, executionID);
+  if (refinesPartial) runtime.runStartedAt = Math.min(runtime.runStartedAt ?? timestamp, timestamp);
+  const current = fresh && (!executionID || !activity.currentExecutions.has(sessionID) || activity.currentExecutions.get(sessionID) === executionID);
+  const run = getTaskWallRun(store, rootSessionID);
+  if (current) run.lastActivityAt.set(sessionID, timestamp);
+  if (status === "idle" && current) {
+    const changed = finishSessionRun(store, api, sessionID, bytesPerToken, timestamp);
+    run.activeSessions.delete(sessionID);
+    if (!tuiActivityTimes(store, rootSessionID, timestamp).active) {
+      run.phase = "idle";
+      run.lastRunWallTime = {
+        runEpoch: run.runEpoch,
+        startedAt: run.runStartedAt ?? timestamp,
+        completedAt: timestamp,
+        wallTime: tuiActivityTimes(store, rootSessionID, timestamp).includingMilliseconds
+      };
+    }
+    store.bump();
+    return changed;
+  }
+  if (status !== "idle" && current && sessionLifecycleFactBelongsToCurrentEpoch(runtime, timestamp)) {
+    const previousObservation = activity.runtimeEpochs.get(sessionID);
+    if (previousObservation && previousObservation !== activity.instanceID) startSessionRun(runtime, timestamp, status);
+    activity.runtimeEpochs.set(sessionID, activity.instanceID);
+    transitionSessionRuntime(runtime, status, timestamp);
+    if (run.phase === "idle") {
+      run.runEpoch++;
+      run.runStartedAt = timestamp;
+    }
+    run.phase = "active";
+    run.activeSessions.add(sessionID);
+  }
+  store.bump();
+  return status === "idle";
 }
 export function mergeHistoryLayers(diskRecords, optimistic, maxRecords, optimisticQuality, optimisticOrder) {
   const byMessage = new Map();
@@ -2094,13 +2325,57 @@ function removeOptimisticRecord(store, messageID) {
   store.optimisticQuality.delete(messageID);
   store.optimisticOrder.delete(messageID);
 }
+
+/** A canonical reversible contribution retires a full response even after its
+ * history row has been trimmed. Compact ID/revision/scope evidence stays in totals. */
+export function retireCanonicalResponses(store) {
+  const confirmed = (id, record) => {
+    if (record && !scopeEligible(store, record.sessionID, id)) return true;
+    const snapshot = ownValue(store.totalsLedger.open, id) ?? ownValue(store.totalsLedger.settled, id);
+    if (!snapshot || snapshot !== true && snapshot.quality !== "exact") return false;
+    if (snapshot === true || snapshot.excluded || !record) return true;
+    const next = coerceCompletionUpdate(snapshot.update);
+    const previous = coerceCompletionUpdate(record.update);
+    return next && previous ? next.fingerprint === previous.fingerprint || isNewerCompletionUpdate(next, previous) : tokenCountsEqual(snapshot.tokens, record.tokens) && snapshot.cost === record.cost;
+  };
+  for (const [id, record] of store.optimistic) if (confirmed(id, record)) removeOptimisticRecord(store, id);
+  for (const [id, state] of store.active) if (confirmed(id)) {
+    finalizeResponse(store, id, state.sessionID, state.responseEpoch, {
+      authoritative: true
+    });
+  }
+  for (const runtime of store.sessionRuntime.values()) {
+    for (const source of [runtime.contributions, runtime.completedContributions]) {
+      for (const [id, contribution] of source) if (confirmed(id, contribution.record)) {
+        let compact = retiredContributions.get(runtime);
+        if (!compact) {
+          compact = new Map();
+          retiredContributions.set(runtime, compact);
+        }
+        compact.set(id, compactContribution(contribution.record, contribution.runEpoch));
+        source.delete(id);
+        completeContentMetadata(observationRuntime(store).metadata, id);
+      }
+    }
+  }
+  retireContentMetadata(observationRuntime(store).metadata, new Set(store.active.keys()));
+  for (const [id, last] of store.lastCompletedBySession) if (confirmed(last.record.messageID, last.record) && last.record.samples.length) {
+    store.lastCompletedBySession.set(id, {
+      ...last,
+      record: {
+        ...last.record,
+        samples: []
+      }
+    });
+  }
+}
 export function hydrateHistoryState(store, diskRecords) {
   for (const record of diskRecords) {
     if (record.time.completed !== undefined && record.quality !== "provisional") finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch, {
       completedAt: record.time.completed,
       authoritative: true
     });
-    if (!scopeEligible(store, record.sessionID, record.messageID) || !isMeasurementScopeEligible(record, scopedLedger(store).sessionScopes, store.sessionParents) || getExcludedMessageIDs(scopedLedger(store)).has(record.messageID)) continue;
+    if (!scopeEligible(store, record.sessionID, record.messageID) || scopedRecords(store, [record]).length === 0) continue;
     const overlay = store.optimistic.get(record.messageID);
     let selected = record;
     if (overlay) {
@@ -2150,6 +2425,7 @@ export function hydrateHistoryState(store, diskRecords) {
       store.lastCompletedBySession.set(record.sessionID, makeLastCompletedSnapshot(selected, runtime?.runEpoch ?? 0));
     }
   }
+  retireCanonicalResponses(store);
 }
 export async function reloadHistory(store, api, path, totalsPath, maxRecords, generation = store.historyGeneration) {
   if (store.disposed) return;
@@ -2183,7 +2459,8 @@ export async function reloadHistory(store, api, path, totalsPath, maxRecords, ge
   if (store.disposed || generation !== store.historyGeneration) return;
   if (totalsLedger) store.totalsLedger = totalsLedger;
   store.diskRecords = diskRecords.map(record => withCanonicalLedgerSpeed(store.totalsLedger, record));
-  store.sourceScopes = createScopeRegistry(scopedLedger(store).sessionScopes);
+  tuiReadModel(store).syncScopes();
+  store.sourceScopes = createScopeRegistry(collectSessionScopeEvidence(store.diskRecords, tuiReadModel(store).scopes));
   for (const [id, record] of store.optimistic) {
     store.optimistic.set(id, withCanonicalLedgerSpeed(store.totalsLedger, record));
   }
@@ -2197,58 +2474,84 @@ export async function reloadHistory(store, api, path, totalsPath, maxRecords, ge
   refreshScopeProjection(store);
 }
 export async function reloadActivity(store, api, path, generation = store.activityGeneration) {
-  if (store.disposed) return;
+  if (store.disposed) return false;
+  const value = tuiActivity(store),
+    selection = value.selection;
+  const token = ++selection.readToken;
+  selection.retryNeeded = false;
+  const model = tuiReadModel(store);
+  model.bindProof(api[parentProofPort]);
   try {
-    const activityEvents = await readActivityFile(path);
-    const activityReplay = replayActivity(activityEvents, {
-      sessionScopes: scopedLedger(store).sessionScopes,
-      parentBySessionID: store.sessionParents
-    });
-    if (store.disposed || generation !== store.activityGeneration) return;
-    store.activityEvents = activityEvents;
-    store.activityReplay = activityReplay;
+    const delta = await readActivityDelta(path, selection.cursor);
+    if (store.disposed || generation !== store.activityGeneration || token !== selection.readToken) {
+      selection.counters.staleReads++;
+      return false;
+    }
+    if (delta.mode === "unchanged") {
+      selection.cursor = delta.cursor;
+      return true;
+    }
+    if (delta.mode === "reset" && !delta.events.length && !store.activityEvents.length && !selection.cursor && !delta.cursor) return true;
+    model.canonicalParents(delta.events, delta.mode === "reset");
+    let accepted;
+    if (delta.mode === "reset") {
+      store.activityEvents = Array.from(delta.events);
+      value.canonical = store.activityEvents;
+      selection.counters.canonicalArrayCopies += delta.events.length;
+      selection.reset(delta.events);
+      accepted = delta.events;
+    } else {
+      selection.patch();
+      accepted = selection.addCanonical(delta.events);
+      for (const fact of accepted) store.activityEvents.push(fact);
+    }
+    selection.patch();
     store.activityGeneration = generation;
-    let parentChanged = false;
-    for (const [sessionID, parentSessionID] of activityReplay.parentBySessionID) {
-      if (!parentSessionID || store.sessionParents.get(sessionID) === parentSessionID) continue;
-      store.sessionParents = new Map(store.sessionParents).set(sessionID, parentSessionID);
-      store.sourceScopes.observeSessionMetadata(sessionID, {
-        parentID: parentSessionID
-      });
-      parentChanged = true;
-    }
-    if (parentChanged) {
-      repairKnownParents(store);
-      for (const sessionID of activityReplay.parentBySessionID.keys()) {
-        migrateTaskWallRuns(store, activityRootSessionID(store, sessionID));
-      }
-    }
-    // A closed canonical SDK epoch retracts its matching local open overlay.
-    // Old completions cannot close a newer response, tool run or child epoch.
-    for (const participant of activityReplay.participants) {
-      if (!scopeEligible(store, participant.sessionID)) continue;
-      const rootID = activityRootSessionID(store, participant.sessionID);
-      const run = findTaskWallRun(store, rootID, participant.sessionID);
+    // Legacy facts have no SDK identity. Only a complete chain observed during
+    // this observation can confirm a legacy overlay; V2 uses execution/source IDs.
+    for (const sessionID of value.candidates) {
+      if (!scopeEligible(store, sessionID) || value.currentExecutions.has(sessionID)) continue;
+      const rootID = activityRootSessionID(store, sessionID);
+      const run = findTaskWallRun(store, rootID, sessionID);
       if (!run || run.phase !== "active" || run.runStartedAt === undefined) continue;
-      const lastActive = run.lastActivityAt.get(participant.sessionID) ?? run.runStartedAt;
-      for (const instance of participant.instances) {
-        const terminal = instance.events.at(-1);
-        if (!terminal || instance.open || terminal.state === "busy" || terminal.state === "retry" || terminal.timestamp < lastActive || terminal.observedAt < observationRuntime(store).observedSince) continue;
-        if (!instance.events.some(fact => (fact.state === "busy" || fact.state === "retry") && fact.timestamp >= observationRuntime(store).observedSince && fact.timestamp <= lastActive)) continue;
-        const currentID = ownedMessageID(store, participant.sessionID);
+      const lastActive = run.lastActivityAt.get(sessionID) ?? run.runStartedAt;
+      for (const summary of selection.legacy.get(sessionID)?.values() ?? []) {
+        const terminal = summary.latest;
+        if (!terminal || terminal.kind !== "lifecycle" || summary.stable || terminal.state === "busy" || terminal.state === "retry" || terminal.timestamp < lastActive || terminal.observedAt < observationRuntime(store).observedSince) continue;
+        if (!summary.earliestActive || summary.earliestActive.timestamp < observationRuntime(store).observedSince || summary.earliestActive.timestamp > lastActive) continue;
+        const currentID = ownedMessageID(store, sessionID);
         const current = currentID ? store.active.get(currentID) : undefined;
-        if (current?.sessionID === participant.sessionID && observationRuntime(store).liveAssistantMessages.has(current.messageID) && current.startedAt > terminal.timestamp) continue;
-        handleSessionLifecycle(store, api, "session.idle", {
-          sessionID: participant.sessionID
-        }, {
-          type: "session.idle",
-          timestamp: terminal.timestamp
-        }, DEFAULT_BYTES_PER_TOKEN);
+        if (current?.sessionID === sessionID && observationRuntime(store).liveAssistantMessages.has(current.messageID) && current.startedAt > terminal.timestamp) continue;
+        selection.retireLegacy(sessionID, terminal.timestamp);
+        finishSessionRun(store, api, sessionID, DEFAULT_BYTES_PER_TOKEN, terminal.timestamp);
+        run.lastActivityAt.set(sessionID, terminal.timestamp);
+        run.activeSessions.delete(sessionID);
+        value.candidates.delete(sessionID);
+        if (!tuiActivityTimes(store, rootID, terminal.timestamp).active) {
+          run.phase = "idle";
+          run.lastRunWallTime = {
+            runEpoch: run.runEpoch,
+            startedAt: run.runStartedAt ?? terminal.timestamp,
+            completedAt: terminal.timestamp,
+            wallTime: tuiActivityTimes(store, rootID, terminal.timestamp).includingMilliseconds
+          };
+        }
+        break;
       }
     }
-    store.bump();
+    // Commit the stateless cursor only after all current-generation application.
+    selection.cursor = delta.cursor;
+    if (accepted.length || delta.mode === "reset") store.bump();
+    return true;
   } catch (error) {
+    if (store.disposed || generation !== store.activityGeneration || token !== selection.readToken) {
+      selection.counters.staleReads++;
+      return false;
+    }
+    selection.retryNeeded = error instanceof Error && /(?:Activity ledger (?:changed|truncated)|Ledger identity changed)/.test(error.message);
+    if (selection.retryNeeded) selection.counters.readRetries++;
     warnWithToast(api, "activity read failed", error);
+    return false;
   }
 }
 export function resolveOptions(value) {
@@ -2323,7 +2626,7 @@ export function createRuntimeStore(maxRecords, observedSince = Date.now()) {
       maxRecords,
       diskRecords: [],
       records: [],
-      optimistic: new Map(),
+      optimistic: new RevisionMap(),
       optimisticQuality: new Map(),
       optimisticOrder: new Map(),
       nextOptimisticOrder: 1,
@@ -2337,7 +2640,6 @@ export function createRuntimeStore(maxRecords, observedSince = Date.now()) {
       totalsLedger: emptyTotalsLedger(),
       lastCompletedBySession: new Map(),
       activityEvents: [],
-      activityReplay: replayActivity([]),
       activityGeneration: 0,
       pulseExpanded: false,
       historyGeneration: 0,
@@ -2406,6 +2708,11 @@ export function formatCompactNumber(value) {
   const rendered = formatScaledUnit(absolute, divisors[unitIndex] ?? 1_000, decimals, unitIndex === 0);
   return `${sign}${rendered}${units[unitIndex]}`;
 }
+function formatFullNumber(value) {
+  return (Number.isFinite(value) ? value : 0).toLocaleString("en-US", {
+    maximumFractionDigits: 20
+  });
+}
 function formatScaledUnit(absolute, divisor, decimals, trimTrailingZero) {
   let rendered;
   if (decimals <= 0) {
@@ -2426,7 +2733,7 @@ export function formatCacheHitRate(rate) {
 }
 export function formatPulseMetrics(tokens, width = Number.POSITIVE_INFINITY, taskTimeMs) {
   const timeLabel = taskTimeMs !== undefined && Number.isFinite(taskTimeMs) && taskTimeMs >= 0 ? formatDuration(taskTimeMs).replace(/\s+/g, "") : "--";
-  const fields = [`${formatCompactNumber(totalTokens(tokens))} total`, `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`];
+  const fields = [`${formatFullNumber(totalTokens(tokens))} total`, `cache ${formatCacheHitRate(cacheHitRate(tokens))}`, `time ${timeLabel}`];
   return wrapMetricFields(fields, width);
 }
 function wrapMetricFields(fields, width) {
@@ -2458,10 +2765,10 @@ function padLeft(value, width) {
   return value.length >= width ? value.slice(-width) : value.padStart(width, " ");
 }
 export function formatHistoryRow(record) {
-  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatCompactNumber(record.tokens.output)}/${formatCompactNumber(record.tokens.reasoning)}`, 9), padLeft(formatCost(record.cost), 9)].join(" ");
+  return [padRight(formatTime(record.time.completed ?? record.time.start), 8), padRight(shortTail(record.sessionID, 11), 11), padRight(truncateMiddle(record.model, 14), 14), padLeft(`${formatFullNumber(record.tokens.output)}/${formatFullNumber(record.tokens.reasoning)}`, 9), padLeft(formatCost(record.cost), 9)].join(" ");
 }
 function summaryLines(label, tokens, cost, responseCount) {
-  return [label, `  Total tokens (input + generated + cache) ${formatCompactNumber(totalTokens(tokens))}`, `  Uncached input ${formatCompactNumber(tokens.input)}  Cache read (reused) ${formatCompactNumber(tokens.cacheRead)}`, `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`, `  Cache write ${formatCompactNumber(tokens.cacheWrite)}  Visible output ${formatCompactNumber(tokens.output)}`, `  Reasoning ${formatCompactNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatCompactNumber(generatedTokens(tokens))}`, `  Model calls ${formatCompactNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
+  return [label, `  Total tokens (input + generated + cache) ${formatFullNumber(totalTokens(tokens))}`, `  Uncached input ${formatFullNumber(tokens.input)}  Cache read (reused) ${formatFullNumber(tokens.cacheRead)}`, `  Cache hit rate ${formatCacheHitRate(cacheHitRate(tokens))}`, `  Cache write ${formatFullNumber(tokens.cacheWrite)}  Visible output ${formatFullNumber(tokens.output)}`, `  Reasoning ${formatFullNumber(tokens.reasoning)}  Generated (output + reasoning) ${formatFullNumber(generatedTokens(tokens))}`, `  Model calls ${formatFullNumber(responseCount)}  Estimated cost ${formatCost(cost)}`];
 }
 function emptySummaryLines() {
   const empty = emptyTokenCounts();
@@ -2470,31 +2777,31 @@ function emptySummaryLines() {
 function pulseMetricRows(tokens, cost, responseCount) {
   return [{
     label: "Total tokens (input + generated + cache)",
-    value: formatCompactNumber(totalTokens(tokens))
+    value: formatFullNumber(totalTokens(tokens))
   }, {
     label: "Uncached input",
-    value: formatCompactNumber(tokens.input)
+    value: formatFullNumber(tokens.input)
   }, {
     label: "Cache read (reused)",
-    value: formatCompactNumber(tokens.cacheRead)
+    value: formatFullNumber(tokens.cacheRead)
   }, {
     label: "Cache hit rate",
     value: formatCacheHitRate(cacheHitRate(tokens))
   }, {
     label: "Cache write",
-    value: formatCompactNumber(tokens.cacheWrite)
+    value: formatFullNumber(tokens.cacheWrite)
   }, {
     label: "Visible output",
-    value: formatCompactNumber(tokens.output)
+    value: formatFullNumber(tokens.output)
   }, {
     label: "Reasoning",
-    value: formatCompactNumber(tokens.reasoning)
+    value: formatFullNumber(tokens.reasoning)
   }, {
     label: "Generated",
-    value: formatCompactNumber(generatedTokens(tokens))
+    value: formatFullNumber(generatedTokens(tokens))
   }, {
     label: "Model calls",
-    value: formatCompactNumber(responseCount)
+    value: formatFullNumber(responseCount)
   }, {
     label: "Estimated cost",
     value: formatCost(cost)
@@ -2602,7 +2909,7 @@ function ChildAgentRows(props) {
       })(), _el$10);
       _$setProp(_el$10, "wrapMode", "word");
       _$setProp(_el$10, "flexShrink", 0);
-      _$insert(_el$10, () => `${"  ".repeat(row.depth)}${row.sessionID}  ${formatCompactNumber(row.responseCount)} responses  ${formatCompactNumber(row.generated)} generated`);
+      _$insert(_el$10, () => `${"  ".repeat(row.depth)}${row.sessionID}  ${formatFullNumber(row.responseCount)} responses  ${formatFullNumber(row.generated)} generated`);
       _$setProp(_el$11, "wrapMode", "word");
       _$setProp(_el$11, "flexShrink", 0);
       _$insert(_el$11, () => `model ${row.model}`);
@@ -2680,9 +2987,29 @@ export function projectSessionTotals(ledger, records, parentBySessionID, session
 }
 function totalsForSession(store, sessionID) {
   if (!sessionID) return undefined;
-  // Detail-window trimming must not discard unconfirmed direct contributions.
-  const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
-  return projectSessionTotals(scopedLedger(store), scopedRecords(store, contributions), store.sessionParents, sessionID);
+  return visibleTotalsIndex(store).get(sessionID);
+}
+const visibleHistory = new WeakMap();
+function visibleRecords(store) {
+  const cached = visibleHistory.get(store);
+  if (cached?.disk === store.diskRecords && cached.window === store.records && cached.order === store.nextOptimisticOrder && cached.size === store.optimistic.size) return cached.records;
+  // Details rows remain bounded. Full unconfirmed totals are reconciled per MID
+  // by RevisionMap, not re-enumerated/sorted on every visible query.
+  const records = mergeHistoryLayers(baseHistoryRecords(store), new Map(), store.maxRecords);
+  visibleHistory.set(store, {
+    disk: store.diskRecords,
+    window: store.records,
+    order: store.nextOptimisticOrder,
+    size: store.optimistic.size,
+    records
+  });
+  return records;
+}
+function visibleTotalsIndex(store, input) {
+  const model = tuiReadModel(store);
+  const records = input && input !== store.records ? input : visibleRecords(store);
+  model.historyParents(records);
+  return model.totals(records, store.optimistic, windowContributionTerms);
 }
 export function TokenPulseDetails(props) {
   if (!scopeEligible(props.store, props.sessionID)) return (() => {
@@ -2753,15 +3080,11 @@ export function TokenPulseDetails(props) {
       _el$17 = _$createElement("text"),
       _el$19 = _$createElement("text"),
       _el$20 = _$createElement("scrollbox"),
-      _el$21 = _$createElement("box"),
-      _el$22 = _$createElement("text"),
-      _el$24 = _$createElement("text"),
-      _el$25 = _$createElement("text"),
-      _el$27 = _$createElement("text");
+      _el$21 = _$createElement("text");
     _$insertNode(_el$16, _el$17);
     _$insertNode(_el$16, _el$19);
     _$insertNode(_el$16, _el$20);
-    _$insertNode(_el$16, _el$27);
+    _$insertNode(_el$16, _el$21);
     _$setProp(_el$16, "flexDirection", "column");
     _$setProp(_el$16, "width", "100%");
     _$setProp(_el$16, "flexShrink", 0);
@@ -2774,87 +3097,87 @@ export function TokenPulseDetails(props) {
     _$insert(_el$16, (() => {
       var _c$2 = _$memo(() => tree().nodes.length > 1);
       return () => _c$2() && (() => {
-        var _el$29 = _$createElement("box"),
-          _el$30 = _$createElement("text"),
-          _el$31 = _$createElement("select"),
-          _el$32 = _$createElement("box"),
-          _el$33 = _$createElement("text"),
-          _el$35 = _$createElement("text"),
-          _el$37 = _$createElement("text"),
-          _el$39 = _$createElement("text");
-        _$insertNode(_el$29, _el$30);
-        _$insertNode(_el$29, _el$31);
-        _$insertNode(_el$29, _el$32);
-        _$setProp(_el$29, "flexDirection", "column");
-        _$setProp(_el$29, "flexShrink", 0);
-        _$insert(_el$30, () => `SESSION TREE · ${tree().nodes.length} sessions`);
+        var _el$23 = _$createElement("box"),
+          _el$24 = _$createElement("text"),
+          _el$25 = _$createElement("select"),
+          _el$26 = _$createElement("box"),
+          _el$27 = _$createElement("text"),
+          _el$29 = _$createElement("text"),
+          _el$31 = _$createElement("text"),
+          _el$33 = _$createElement("text");
+        _$insertNode(_el$23, _el$24);
+        _$insertNode(_el$23, _el$25);
+        _$insertNode(_el$23, _el$26);
+        _$setProp(_el$23, "flexDirection", "column");
+        _$setProp(_el$23, "flexShrink", 0);
+        _$insert(_el$24, () => `SESSION TREE · ${tree().nodes.length} sessions`);
         _$use(node => {
           selector = node;
           onMount(() => node.focus());
-        }, _el$31);
-        _$setProp(_el$31, "flexShrink", 0);
-        _$setProp(_el$31, "showDescription", false);
-        _$setProp(_el$31, "showScrollIndicator", true);
-        _$setProp(_el$31, "wrapSelection", false);
-        _$setProp(_el$31, "itemSpacing", 0);
-        _$setProp(_el$31, "onChange", (_index, option) => choose(option?.value));
-        _$setProp(_el$31, "onSelect", (_index, option) => {
+        }, _el$25);
+        _$setProp(_el$25, "flexShrink", 0);
+        _$setProp(_el$25, "showDescription", false);
+        _$setProp(_el$25, "showScrollIndicator", true);
+        _$setProp(_el$25, "wrapSelection", false);
+        _$setProp(_el$25, "itemSpacing", 0);
+        _$setProp(_el$25, "onChange", (_index, option) => choose(option?.value));
+        _$setProp(_el$25, "onSelect", (_index, option) => {
           choose(option?.value);
           body?.focus();
         });
-        _$setProp(_el$31, "onKeyDown", key => {
+        _$setProp(_el$25, "onKeyDown", key => {
           if (key.name === "tab") {
             key.preventDefault();
             key.stopPropagation();
             body?.focus();
           }
         });
-        _$insertNode(_el$32, _el$33);
-        _$insertNode(_el$32, _el$35);
-        _$insertNode(_el$32, _el$37);
-        _$insertNode(_el$32, _el$39);
-        _$setProp(_el$32, "flexDirection", "row");
-        _$setProp(_el$32, "height", 1);
-        _$setProp(_el$32, "flexShrink", 0);
-        _$insertNode(_el$33, _$createTextNode(`[prev]`));
-        _$setProp(_el$33, "onMouseDown", () => {
+        _$insertNode(_el$26, _el$27);
+        _$insertNode(_el$26, _el$29);
+        _$insertNode(_el$26, _el$31);
+        _$insertNode(_el$26, _el$33);
+        _$setProp(_el$26, "flexDirection", "row");
+        _$setProp(_el$26, "height", 1);
+        _$setProp(_el$26, "flexShrink", 0);
+        _$insertNode(_el$27, _$createTextNode(`[prev]`));
+        _$setProp(_el$27, "onMouseDown", () => {
           selector?.focus();
           selector?.moveUp();
         });
-        _$insertNode(_el$35, _$createTextNode(` `));
-        _$insertNode(_el$37, _$createTextNode(`[next]`));
-        _$setProp(_el$37, "onMouseDown", () => {
+        _$insertNode(_el$29, _$createTextNode(` `));
+        _$insertNode(_el$31, _$createTextNode(`[next]`));
+        _$setProp(_el$31, "onMouseDown", () => {
           selector?.focus();
           selector?.moveDown();
         });
-        _$insertNode(_el$39, _$createTextNode(` · ↑/↓ · Enter/Tab`));
+        _$insertNode(_el$33, _$createTextNode(` · ↑/↓ · Enter/Tab`));
         _$effect(_p$ => {
-          var _v$15 = theme.accent,
-            _v$16 = Math.min(tree().nodes.length, compact() ? 2 : 3),
-            _v$17 = options(),
-            _v$18 = Math.max(0, tree().nodes.findIndex(node => node.sessionID === details().sessionID)),
-            _v$19 = theme.text,
-            _v$20 = theme.backgroundPanel,
-            _v$21 = theme.backgroundPanel,
-            _v$22 = theme.backgroundElement,
+          var _v$12 = theme.accent,
+            _v$13 = Math.min(tree().nodes.length, compact() ? 2 : 3),
+            _v$14 = options(),
+            _v$15 = Math.max(0, tree().nodes.findIndex(node => node.sessionID === details().sessionID)),
+            _v$16 = theme.text,
+            _v$17 = theme.backgroundPanel,
+            _v$18 = theme.backgroundPanel,
+            _v$19 = theme.backgroundElement,
+            _v$20 = theme.accent,
+            _v$21 = theme.accent,
+            _v$22 = theme.textMuted,
             _v$23 = theme.accent,
-            _v$24 = theme.accent,
-            _v$25 = theme.textMuted,
-            _v$26 = theme.accent,
-            _v$27 = theme.textMuted;
-          _v$15 !== _p$.e && (_p$.e = _$setProp(_el$30, "fg", _v$15, _p$.e));
-          _v$16 !== _p$.t && (_p$.t = _$setProp(_el$31, "height", _v$16, _p$.t));
-          _v$17 !== _p$.a && (_p$.a = _$setProp(_el$31, "options", _v$17, _p$.a));
-          _v$18 !== _p$.o && (_p$.o = _$setProp(_el$31, "selectedIndex", _v$18, _p$.o));
-          _v$19 !== _p$.i && (_p$.i = _$setProp(_el$31, "textColor", _v$19, _p$.i));
-          _v$20 !== _p$.n && (_p$.n = _$setProp(_el$31, "backgroundColor", _v$20, _p$.n));
-          _v$21 !== _p$.s && (_p$.s = _$setProp(_el$31, "focusedBackgroundColor", _v$21, _p$.s));
-          _v$22 !== _p$.h && (_p$.h = _$setProp(_el$31, "selectedBackgroundColor", _v$22, _p$.h));
-          _v$23 !== _p$.r && (_p$.r = _$setProp(_el$31, "selectedTextColor", _v$23, _p$.r));
-          _v$24 !== _p$.d && (_p$.d = _$setProp(_el$33, "fg", _v$24, _p$.d));
-          _v$25 !== _p$.l && (_p$.l = _$setProp(_el$35, "fg", _v$25, _p$.l));
-          _v$26 !== _p$.u && (_p$.u = _$setProp(_el$37, "fg", _v$26, _p$.u));
-          _v$27 !== _p$.c && (_p$.c = _$setProp(_el$39, "fg", _v$27, _p$.c));
+            _v$24 = theme.textMuted;
+          _v$12 !== _p$.e && (_p$.e = _$setProp(_el$24, "fg", _v$12, _p$.e));
+          _v$13 !== _p$.t && (_p$.t = _$setProp(_el$25, "height", _v$13, _p$.t));
+          _v$14 !== _p$.a && (_p$.a = _$setProp(_el$25, "options", _v$14, _p$.a));
+          _v$15 !== _p$.o && (_p$.o = _$setProp(_el$25, "selectedIndex", _v$15, _p$.o));
+          _v$16 !== _p$.i && (_p$.i = _$setProp(_el$25, "textColor", _v$16, _p$.i));
+          _v$17 !== _p$.n && (_p$.n = _$setProp(_el$25, "backgroundColor", _v$17, _p$.n));
+          _v$18 !== _p$.s && (_p$.s = _$setProp(_el$25, "focusedBackgroundColor", _v$18, _p$.s));
+          _v$19 !== _p$.h && (_p$.h = _$setProp(_el$25, "selectedBackgroundColor", _v$19, _p$.h));
+          _v$20 !== _p$.r && (_p$.r = _$setProp(_el$25, "selectedTextColor", _v$20, _p$.r));
+          _v$21 !== _p$.d && (_p$.d = _$setProp(_el$27, "fg", _v$21, _p$.d));
+          _v$22 !== _p$.l && (_p$.l = _$setProp(_el$29, "fg", _v$22, _p$.l));
+          _v$23 !== _p$.u && (_p$.u = _$setProp(_el$31, "fg", _v$23, _p$.u));
+          _v$24 !== _p$.c && (_p$.c = _$setProp(_el$33, "fg", _v$24, _p$.c));
           return _p$;
         }, {
           e: undefined,
@@ -2871,10 +3194,9 @@ export function TokenPulseDetails(props) {
           u: undefined,
           c: undefined
         });
-        return _el$29;
+        return _el$23;
       })();
     })(), _el$20);
-    _$insertNode(_el$20, _el$21);
     _$use(scroll => {
       body = scroll;
       onMount(() => {
@@ -2902,76 +3224,105 @@ export function TokenPulseDetails(props) {
         selector.focus();
       }
     });
-    _$insertNode(_el$21, _el$22);
-    _$insertNode(_el$21, _el$24);
-    _$insertNode(_el$21, _el$25);
-    _$setProp(_el$21, "flexDirection", "column");
+    _$insert(_el$20, (() => {
+      var _c$3 = _$memo(() => !!tree().nodes.length);
+      return () => _c$3() ? (() => {
+        var _el$35 = _$createElement("box"),
+          _el$36 = _$createElement("text"),
+          _el$38 = _$createElement("text"),
+          _el$39 = _$createElement("text");
+        _$insertNode(_el$35, _el$36);
+        _$insertNode(_el$35, _el$38);
+        _$insertNode(_el$35, _el$39);
+        _$setProp(_el$35, "flexDirection", "column");
+        _$setProp(_el$35, "flexShrink", 0);
+        _$setProp(_el$35, "width", "100%");
+        _$insertNode(_el$36, _$createTextNode(`SELECTED SESSION · direct only`));
+        _$setProp(_el$38, "wrapMode", "word");
+        _$insert(_el$38, () => `${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`);
+        _$insert(_el$35, (() => {
+          var _c$4 = _$memo(() => details().direct.responseCount === 0);
+          return () => _c$4() && (() => {
+            var _el$41 = _$createElement("text");
+            _$insertNode(_el$41, _$createTextNode(`No recorded usage for this session`));
+            _$setProp(_el$41, "wrapMode", "word");
+            _$effect(_$p => _$setProp(_el$41, "fg", theme.textMuted, _$p));
+            return _el$41;
+          })();
+        })(), _el$39);
+        _$insertNode(_el$39, _$createTextNode(`SESSION USAGE`));
+        _$insert(_el$35, _$createComponent(PulseMetricGrid, {
+          get theme() {
+            return props.api.theme;
+          },
+          get rows() {
+            return pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map(metric => [metric]);
+          }
+        }), null);
+        _$insert(_el$35, (() => {
+          var _c$5 = _$memo(() => !!details().last?.record.model);
+          return () => _c$5() && (() => {
+            var _el$43 = _$createElement("text");
+            _$setProp(_el$43, "wrapMode", "word");
+            _$insert(_el$43, () => `Last model: ${details().last.record.model}`);
+            _$effect(_$p => _$setProp(_el$43, "fg", theme.textMuted, _$p));
+            return _el$43;
+          })();
+        })(), null);
+        _$insert(_el$35, (() => {
+          var _c$6 = _$memo(() => tree().nodes.length > 1);
+          return () => _c$6() ? [(() => {
+            var _el$44 = _$createElement("text");
+            _$insertNode(_el$44, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
+            _$setProp(_el$44, "paddingTop", 1);
+            _$effect(_$p => _$setProp(_el$44, "fg", theme.accent, _$p));
+            return _el$44;
+          })(), (() => {
+            var _el$46 = _$createElement("text");
+            _$insertNode(_el$46, _$createTextNode(`Includes every descendant once.`));
+            _$setProp(_el$46, "wrapMode", "word");
+            _$effect(_$p => _$setProp(_el$46, "fg", theme.textMuted, _$p));
+            return _el$46;
+          })(), _$createComponent(PulseMetricGrid, {
+            get theme() {
+              return props.api.theme;
+            },
+            get rows() {
+              return pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map(metric => [metric]);
+            }
+          })] : (() => {
+            var _el$48 = _$createElement("text");
+            _$insertNode(_el$48, _$createTextNode(`No known subagents in this scope`));
+            _$setProp(_el$48, "paddingTop", 1);
+            _$setProp(_el$48, "wrapMode", "word");
+            _$effect(_$p => _$setProp(_el$48, "fg", theme.textMuted, _$p));
+            return _el$48;
+          })();
+        })(), null);
+        _$effect(_p$ => {
+          var _v$25 = theme.accent,
+            _v$26 = theme.textMuted,
+            _v$27 = theme.accent;
+          _v$25 !== _p$.e && (_p$.e = _$setProp(_el$36, "fg", _v$25, _p$.e));
+          _v$26 !== _p$.t && (_p$.t = _$setProp(_el$38, "fg", _v$26, _p$.t));
+          _v$27 !== _p$.a && (_p$.a = _$setProp(_el$39, "fg", _v$27, _p$.a));
+          return _p$;
+        }, {
+          e: undefined,
+          t: undefined,
+          a: undefined
+        });
+        return _el$35;
+      })() : (() => {
+        var _el$50 = _$createElement("text");
+        _$insertNode(_el$50, _$createTextNode(`Maintenance session excluded`));
+        _$setProp(_el$50, "flexShrink", 0);
+        _$effect(_$p => _$setProp(_el$50, "fg", theme.textMuted, _$p));
+        return _el$50;
+      })();
+    })());
+    _$insertNode(_el$21, _$createTextNode(`esc / ctrl+c to close`));
     _$setProp(_el$21, "flexShrink", 0);
-    _$setProp(_el$21, "width", "100%");
-    _$insertNode(_el$22, _$createTextNode(`SELECTED SESSION · direct only`));
-    _$setProp(_el$24, "wrapMode", "word");
-    _$insert(_el$24, () => `${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`);
-    _$insert(_el$21, (() => {
-      var _c$3 = _$memo(() => details().direct.responseCount === 0);
-      return () => _c$3() && (() => {
-        var _el$41 = _$createElement("text");
-        _$insertNode(_el$41, _$createTextNode(`No recorded usage for this session`));
-        _$setProp(_el$41, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$41, "fg", theme.textMuted, _$p));
-        return _el$41;
-      })();
-    })(), _el$25);
-    _$insertNode(_el$25, _$createTextNode(`SESSION USAGE`));
-    _$insert(_el$21, _$createComponent(PulseMetricGrid, {
-      get theme() {
-        return props.api.theme;
-      },
-      get rows() {
-        return pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map(metric => [metric]);
-      }
-    }), null);
-    _$insert(_el$21, (() => {
-      var _c$4 = _$memo(() => !!details().last?.record.model);
-      return () => _c$4() && (() => {
-        var _el$43 = _$createElement("text");
-        _$setProp(_el$43, "wrapMode", "word");
-        _$insert(_el$43, () => `Last model: ${details().last.record.model}`);
-        _$effect(_$p => _$setProp(_el$43, "fg", theme.textMuted, _$p));
-        return _el$43;
-      })();
-    })(), null);
-    _$insert(_el$21, (() => {
-      var _c$5 = _$memo(() => tree().nodes.length > 1);
-      return () => _c$5() ? [(() => {
-        var _el$44 = _$createElement("text");
-        _$insertNode(_el$44, _$createTextNode(`INCLUDING SUBAGENTS · entire scope`));
-        _$setProp(_el$44, "paddingTop", 1);
-        _$effect(_$p => _$setProp(_el$44, "fg", theme.accent, _$p));
-        return _el$44;
-      })(), (() => {
-        var _el$46 = _$createElement("text");
-        _$insertNode(_el$46, _$createTextNode(`Includes every descendant once.`));
-        _$setProp(_el$46, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$46, "fg", theme.textMuted, _$p));
-        return _el$46;
-      })(), _$createComponent(PulseMetricGrid, {
-        get theme() {
-          return props.api.theme;
-        },
-        get rows() {
-          return pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map(metric => [metric]);
-        }
-      })] : (() => {
-        var _el$48 = _$createElement("text");
-        _$insertNode(_el$48, _$createTextNode(`No known subagents in this scope`));
-        _$setProp(_el$48, "paddingTop", 1);
-        _$setProp(_el$48, "wrapMode", "word");
-        _$effect(_$p => _$setProp(_el$48, "fg", theme.textMuted, _$p));
-        return _el$48;
-      })();
-    })(), null);
-    _$insertNode(_el$27, _$createTextNode(`esc / ctrl+c to close`));
-    _$setProp(_el$27, "flexShrink", 0);
     _$effect(_p$ => {
       var _v$6 = dimensions().width < 50 ? 1 : 2,
         _v$7 = compact() ? 0 : 1,
@@ -2979,22 +3330,16 @@ export function TokenPulseDetails(props) {
         _v$9 = theme.primary,
         _v$0 = theme.textMuted,
         _v$1 = compact() ? 0 : 1,
-        _v$10 = theme.accent,
-        _v$11 = theme.textMuted,
-        _v$12 = theme.accent,
-        _v$13 = theme.textMuted,
-        _v$14 = compact() ? 0 : 1;
+        _v$10 = theme.textMuted,
+        _v$11 = compact() ? 0 : 1;
       _v$6 !== _p$.e && (_p$.e = _$setProp(_el$16, "paddingX", _v$6, _p$.e));
       _v$7 !== _p$.t && (_p$.t = _$setProp(_el$16, "paddingY", _v$7, _p$.t));
       _v$8 !== _p$.a && (_p$.a = _$setProp(_el$16, "height", _v$8, _p$.a));
       _v$9 !== _p$.o && (_p$.o = _$setProp(_el$17, "fg", _v$9, _p$.o));
       _v$0 !== _p$.i && (_p$.i = _$setProp(_el$19, "fg", _v$0, _p$.i));
       _v$1 !== _p$.n && (_p$.n = _$setProp(_el$20, "paddingTop", _v$1, _p$.n));
-      _v$10 !== _p$.s && (_p$.s = _$setProp(_el$22, "fg", _v$10, _p$.s));
-      _v$11 !== _p$.h && (_p$.h = _$setProp(_el$24, "fg", _v$11, _p$.h));
-      _v$12 !== _p$.r && (_p$.r = _$setProp(_el$25, "fg", _v$12, _p$.r));
-      _v$13 !== _p$.d && (_p$.d = _$setProp(_el$27, "fg", _v$13, _p$.d));
-      _v$14 !== _p$.l && (_p$.l = _$setProp(_el$27, "paddingTop", _v$14, _p$.l));
+      _v$10 !== _p$.s && (_p$.s = _$setProp(_el$21, "fg", _v$10, _p$.s));
+      _v$11 !== _p$.h && (_p$.h = _$setProp(_el$21, "paddingTop", _v$11, _p$.h));
       return _p$;
     }, {
       e: undefined,
@@ -3004,24 +3349,19 @@ export function TokenPulseDetails(props) {
       i: undefined,
       n: undefined,
       s: undefined,
-      h: undefined,
-      r: undefined,
-      d: undefined,
-      l: undefined
+      h: undefined
     });
     return _el$16;
   })();
 }
 /** Read-only UI selection: keep ledger-only descendants, and visit cycles once. */
 export function buildSessionDetailsTree(store, rootID, parents = store.sessionParents) {
-  const contributions = mergeHistoryLayers(baseHistoryRecords(store), store.optimistic, Number.MAX_SAFE_INTEGER, store.optimisticQuality, store.optimisticOrder);
-  const projected = projectTotals(scopedLedger(store), scopedRecords(store, contributions), parents);
-  const children = new Map();
-  for (const [id, parent] of projected.parents) {
-    const siblings = children.get(parent) ?? [];
-    siblings.push(id);
-    children.set(parent, siblings);
-  }
+  const model = tuiReadModel(store);
+  if (parents !== store.sessionParents) for (const [id, parent] of parents) model.observeParent(id, {
+    parent,
+    origin: "cache"
+  });
+  const index = visibleTotalsIndex(store);
   const nodes = [];
   const visited = new Set();
   const pending = [{
@@ -3030,21 +3370,20 @@ export function buildSessionDetailsTree(store, rootID, parents = store.sessionPa
   }];
   while (pending.length) {
     const node = pending.pop();
-    if (isSessionScopeExcluded(node.sessionID, scopedLedger(store).sessionScopes, parents)) continue;
+    if (!model.eligible(node.sessionID)) continue;
     if (visited.has(node.sessionID)) continue;
     visited.add(node.sessionID);
-    const direct = Object.prototype.hasOwnProperty.call(projected.sessions, node.sessionID) ? projected.sessions[node.sessionID] : zeroDirectTotals();
+    const rollup = index.get(node.sessionID);
     nodes.push({
       ...node,
-      direct
+      direct: rollup.direct
     });
-    const descendants = (children.get(node.sessionID) ?? []).slice().sort().reverse();
-    for (const sessionID of descendants) pending.push({
-      sessionID,
+    for (const child of rollup.children.slice().reverse()) pending.push({
+      sessionID: child.sessionID,
       depth: node.depth + 1
     });
   }
-  const including = rollupSessionTotals(projected.sessions, projected.parents, rootID, scopedLedger(store).sessionScopes).including;
+  const including = index.get(rootID).including;
   return {
     rootID,
     nodes,
@@ -3053,9 +3392,13 @@ export function buildSessionDetailsTree(store, rootID, parents = store.sessionPa
 }
 export function selectSessionDetails(tree, sessionID, lastBySession) {
   const node = tree.nodes.find(item => item.sessionID === sessionID) ?? tree.nodes[0];
-  const last = lastBySession.get(node.sessionID);
+  const last = node ? lastBySession.get(node.sessionID) : undefined;
   return {
-    ...node,
+    ...(node ?? {
+      sessionID: tree.rootID,
+      depth: 0,
+      direct: zeroDirectTotals()
+    }),
     last
   };
 }
@@ -3155,7 +3498,7 @@ function projectTotals(ledger, records, parentBySessionID) {
   };
 }
 function applyWindowAdjustments(ledger, records) {
-  const sessions = {};
+  const sessions = Object.create(null);
   for (const [sessionID, session] of Object.entries(ledger.sessions ?? {})) {
     if (sessionID.length === 0 || !session) continue;
     sessions[sessionID] = cloneDirectTotals(session);
@@ -3163,11 +3506,11 @@ function applyWindowAdjustments(ledger, records) {
   const settled = ledger.settled ?? {};
   const open = ledger.open ?? {};
   for (const record of records) {
-    const settledValue = settled[record.messageID];
+    const settledValue = ownValue(settled, record.messageID);
     if (settledValue === true) continue;
     const next = contributionNumbers(withCanonicalLedgerSpeed(ledger, record));
     if (!next) continue;
-    const previous = settledValue ?? open[record.messageID];
+    const previous = settledValue ?? ownValue(open, record.messageID);
     if (previous?.excluded) continue;
     if (previous) {
       if (previous.quality === "exact" && record.quality === "provisional") continue;
@@ -3195,10 +3538,42 @@ function applyWindowAdjustments(ledger, records) {
   return sessions;
 }
 
+/** Same revision policy as applyWindowAdjustments, expressed as compact signed
+ * source contributions so visible queries need not rescan every retained MID. */
+function windowContributionTerms(ledger, record) {
+  const settled = ownValue(ledger.settled, record.messageID);
+  if (settled === true) return [];
+  const next = contributionNumbers(withCanonicalLedgerSpeed(ledger, record));
+  if (!next) return [];
+  const previous = settled ?? ownValue(ledger.open, record.messageID);
+  if (previous?.excluded) return [];
+  if (!previous) return [{
+    contribution: next,
+    sign: 1
+  }];
+  if (previous.quality === "exact" && record.quality === "provisional") return [];
+  const priorUpdate = coerceCompletionUpdate(previous.update);
+  const nextUpdate = coerceCompletionUpdate(record.update);
+  if (previous.speedBackfill && !nextUpdate) return [];
+  if (priorUpdate) {
+    if (!nextUpdate) return [];
+    if (nextUpdate.fingerprint === priorUpdate.fingerprint && nextUpdate.revision === priorUpdate.revision) return [];
+    if (!isNewerCompletionUpdate(nextUpdate, priorUpdate)) return [];
+  }
+  const prior = openNumbers(previous);
+  return !prior || sameContributionNumbers(prior, next) ? [] : [{
+    contribution: prior,
+    sign: -1
+  }, {
+    contribution: next,
+    sign: 1
+  }];
+}
+
 // Server owns speed-only backfill/invalidation. Matching usage is not evidence
 // that a stale history or optimistic record can replace its canonical timing.
 function withCanonicalLedgerSpeed(ledger, record) {
-  const previous = ledger.settled?.[record.messageID] ?? ledger.open?.[record.messageID];
+  const previous = ownValue(ledger.settled, record.messageID) ?? ownValue(ledger.open, record.messageID);
   if (!previous || previous === true || previous.quality !== "exact" && !previous.speedBackfill && !previous.update || previous.sessionID !== record.sessionID || previous.cost !== record.cost || !tokenCountsEqual(previous.tokens, record.tokens)) return record;
   const priorUpdate = coerceCompletionUpdate(previous.update);
   const nextUpdate = coerceCompletionUpdate(record.update);
@@ -3234,6 +3609,10 @@ function sameContributionNumbers(left, right) {
 function projectionParents(parentBySessionID, records) {
   const parents = new Map();
   for (const [sessionID, parent] of parentBySessionID) {
+    if (parent === null) {
+      parents.set(sessionID, null);
+      continue;
+    }
     if (!isParentLink(sessionID, parent)) continue;
     parents.set(sessionID, parent);
   }
@@ -3266,10 +3645,15 @@ function zeroDirectTotals() {
   };
 }
 function ensureDirect(sessions, sessionID) {
-  const existing = sessions[sessionID];
+  const existing = ownValue(sessions, sessionID);
   if (existing) return existing;
   const created = zeroDirectTotals();
-  sessions[sessionID] = created;
+  Object.defineProperty(sessions, sessionID, {
+    value: created,
+    writable: true,
+    enumerable: true,
+    configurable: true
+  });
   return created;
 }
 function addDirect(session, tokens, cost, speed) {
@@ -3340,7 +3724,7 @@ async function readTotalsSnapshot(path) {
   // written by the server process would stay stale. Reload from disk instead.
   let content;
   try {
-    content = await readFile(path, "utf8");
+    content = await readLedgerText(path);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return emptyTotalsLedger();
     throw error;
@@ -3354,25 +3738,25 @@ function coerceTotalsSnapshot(value) {
   if (!isRecord(value.sessions) || !isRecord(value.open)) {
     throw new TypeError("Invalid totals ledger");
   }
-  const sessions = {};
+  const sessions = Object.create(null);
   for (const [sessionID, sessionValue] of Object.entries(value.sessions)) {
     if (sessionID.length === 0) throw new TypeError("Invalid totals ledger");
     sessions[sessionID] = coerceDirectTotals(sessionValue);
   }
-  const open = {};
+  const open = Object.create(null);
   for (const [messageID, contribution] of Object.entries(value.open)) {
     if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
     open[messageID] = coerceOpenContribution(contribution);
   }
-  const sessionScopes = {};
+  const sessionScopes = Object.create(null);
   if (isRecord(value.sessionScopes)) for (const [id, raw] of Object.entries(value.sessionScopes)) {
     const proof = coerceScopeEvidence(raw);
     if (proof) sessionScopes[id] = proof;
   }
-  const messageScopes = {};
+  const messageScopes = Object.create(null);
   if (isRecord(value.messageScopes)) for (const [id, raw] of Object.entries(value.messageScopes)) {
     const proof = coerceScopeEvidence(raw);
-    if (proof && value.settled && asRecord(value.settled)?.[id] === true) messageScopes[id] = proof;
+    if (proof && ownValue(asRecord(value.settled), id) === true) messageScopes[id] = proof;
   }
   const sessionAgents = Object.create(null);
   if (isRecord(value.sessionAgents) && !Array.isArray(value.sessionAgents)) for (const [id, raw] of Object.entries(value.sessionAgents)) {
@@ -3393,9 +3777,9 @@ function coerceTotalsSnapshot(value) {
   };
 }
 function coerceSettled(value) {
-  if (value === undefined) return {};
+  if (value === undefined) return Object.create(null);
   if (!isRecord(value)) throw new TypeError("Invalid totals ledger");
-  const settled = {};
+  const settled = Object.create(null);
   for (const [messageID, marker] of Object.entries(value)) {
     if (messageID.length === 0) throw new TypeError("Invalid totals ledger");
     if (marker === true) {
@@ -3473,33 +3857,50 @@ function isNodeError(value) {
 }
 export function childRows(records, sessionID, store) {
   if (!sessionID || !store) return [];
+  const model = tuiReadModel(store);
+  model.counters.rowDerivations++;
+  const index = visibleTotalsIndex(store, records);
   records = scopedRecords(store, records);
-  const ledger = scopedLedger(store);
-  const projected = projectTotals(ledger, records, store.sessionParents);
-  const root = rollupSessionTotals(projected.sessions, projected.parents, sessionID, ledger.sessionScopes);
+  const bySession = new Map();
+  for (const record of records) {
+    model.counters.rowRecordVisits++;
+    const list = bySession.get(record.sessionID) ?? [];
+    list.push(record);
+    bySession.set(record.sessionID, list);
+  }
+  const root = index.get(sessionID);
   const rows = [];
   const visited = new Set([sessionID]);
-  const append = (childID, depth) => {
-    if (visited.has(childID)) return;
-    if (isSessionScopeExcluded(childID, ledger.sessionScopes, projected.parents)) return;
+  const pending = root.children.slice().reverse().map(child => ({
+    id: child.sessionID,
+    depth: 0
+  }));
+  while (pending.length) {
+    const {
+      id: childID,
+      depth
+    } = pending.pop();
+    if (visited.has(childID) || !model.eligible(childID)) continue;
     visited.add(childID);
-    const rollup = rollupSessionTotals(projected.sessions, projected.parents, childID, ledger.sessionScopes);
-    const directRecords = records.filter(record => record.sessionID === childID);
+    const rollup = index.get(childID);
+    const directRecords = bySession.get(childID) ?? [];
     const show = directRecords.length > 0 || totalsHaveUsage(rollup.including);
     if (show) {
       const modelRecord = directRecords.slice().sort((left, right) => (right.time.completed ?? right.time.start) - (left.time.completed ?? left.time.start))[0];
       rows.push({
         depth,
         sessionID: childID,
-        agents: normalizeAgentNames([...normalizeAgentNames(ledger.sessionAgents?.[childID]), ...directRecords.map(record => record.agent)]),
+        agents: normalizeAgentNames([...normalizeAgentNames(ownValue(store.totalsLedger.sessionAgents, childID)), ...directRecords.map(record => record.agent)]),
         responseCount: rollup.direct.responseCount,
         generated: generatedTokens(rollup.direct.tokens),
         model: modelRecord?.model ?? "-"
       });
     }
-    for (const child of rollup.children) append(child.sessionID, show ? depth + 1 : depth);
-  };
-  for (const child of root.children) append(child.sessionID, 0);
+    for (const child of rollup.children.slice().reverse()) pending.push({
+      id: child.sessionID,
+      depth: show ? depth + 1 : depth
+    });
+  }
   return rows;
 }
 function currentSessionID(api) {
@@ -3532,35 +3933,35 @@ function warnWithToast(api, message, error) {
 }
 function Header(props) {
   return (() => {
-    var _el$50 = _$createElement("box"),
-      _el$51 = _$createElement("text"),
+    var _el$52 = _$createElement("box"),
       _el$53 = _$createElement("text"),
-      _el$54 = _$createTextNode(`session `);
-    _$insertNode(_el$50, _el$51);
-    _$insertNode(_el$50, _el$53);
-    _$setProp(_el$50, "height", 2);
-    _$setProp(_el$50, "flexShrink", 0);
-    _$setProp(_el$50, "paddingX", 1);
-    _$setProp(_el$50, "flexDirection", "column");
-    _$insertNode(_el$51, _$createTextNode(`Token history`));
-    _$insertNode(_el$53, _el$54);
-    _$setProp(_el$53, "truncate", true);
-    _$setProp(_el$53, "wrapMode", "none");
-    _$insert(_el$53, () => shortTail(props.sessionID, 18), null);
+      _el$55 = _$createElement("text"),
+      _el$56 = _$createTextNode(`session `);
+    _$insertNode(_el$52, _el$53);
+    _$insertNode(_el$52, _el$55);
+    _$setProp(_el$52, "height", 2);
+    _$setProp(_el$52, "flexShrink", 0);
+    _$setProp(_el$52, "paddingX", 1);
+    _$setProp(_el$52, "flexDirection", "column");
+    _$insertNode(_el$53, _$createTextNode(`Token history`));
+    _$insertNode(_el$55, _el$56);
+    _$setProp(_el$55, "truncate", true);
+    _$setProp(_el$55, "wrapMode", "none");
+    _$insert(_el$55, () => shortTail(props.sessionID, 18), null);
     _$effect(_p$ => {
       var _v$28 = props.theme.current.backgroundPanel,
         _v$29 = props.theme.current.primary,
         _v$30 = props.theme.current.textMuted;
-      _v$28 !== _p$.e && (_p$.e = _$setProp(_el$50, "backgroundColor", _v$28, _p$.e));
-      _v$29 !== _p$.t && (_p$.t = _$setProp(_el$51, "fg", _v$29, _p$.t));
-      _v$30 !== _p$.a && (_p$.a = _$setProp(_el$53, "fg", _v$30, _p$.a));
+      _v$28 !== _p$.e && (_p$.e = _$setProp(_el$52, "backgroundColor", _v$28, _p$.e));
+      _v$29 !== _p$.t && (_p$.t = _$setProp(_el$53, "fg", _v$29, _p$.t));
+      _v$30 !== _p$.a && (_p$.a = _$setProp(_el$55, "fg", _v$30, _p$.a));
       return _p$;
     }, {
       e: undefined,
       t: undefined,
       a: undefined
     });
-    return _el$50;
+    return _el$52;
   })();
 }
 function SummaryBlock(props) {
@@ -3572,33 +3973,33 @@ function SummaryBlock(props) {
     return [...summaryLines("Session only", rollup.direct.tokens, rollup.direct.cost, rollup.direct.responseCount), ...summaryLines("Including subagents", rollup.including.tokens, rollup.including.cost, rollup.including.responseCount)];
   });
   return (() => {
-    var _el$55 = _$createElement("box"),
-      _el$56 = _$createElement("text");
-    _$insertNode(_el$55, _el$56);
-    _$setProp(_el$55, "paddingX", 1);
-    _$setProp(_el$55, "flexShrink", 0);
-    _$setProp(_el$55, "flexDirection", "column");
-    _$insertNode(_el$56, _$createTextNode(`totals`));
-    _$setProp(_el$56, "flexShrink", 0);
-    _$insert(_el$55, () => lines().map(line => (() => {
-      var _el$58 = _$createElement("text");
-      _$setProp(_el$58, "flexShrink", 0);
-      _$setProp(_el$58, "wrapMode", "word");
-      _$insert(_el$58, line);
-      _$effect(_$p => _$setProp(_el$58, "fg", props.theme.current.text, _$p));
-      return _el$58;
+    var _el$57 = _$createElement("box"),
+      _el$58 = _$createElement("text");
+    _$insertNode(_el$57, _el$58);
+    _$setProp(_el$57, "paddingX", 1);
+    _$setProp(_el$57, "flexShrink", 0);
+    _$setProp(_el$57, "flexDirection", "column");
+    _$insertNode(_el$58, _$createTextNode(`totals`));
+    _$setProp(_el$58, "flexShrink", 0);
+    _$insert(_el$57, () => lines().map(line => (() => {
+      var _el$60 = _$createElement("text");
+      _$setProp(_el$60, "flexShrink", 0);
+      _$setProp(_el$60, "wrapMode", "word");
+      _$insert(_el$60, line);
+      _$effect(_$p => _$setProp(_el$60, "fg", props.theme.current.text, _$p));
+      return _el$60;
     })()), null);
     _$effect(_p$ => {
       var _v$31 = props.theme.current.background,
         _v$32 = props.theme.current.secondary;
-      _v$31 !== _p$.e && (_p$.e = _$setProp(_el$55, "backgroundColor", _v$31, _p$.e));
-      _v$32 !== _p$.t && (_p$.t = _$setProp(_el$56, "fg", _v$32, _p$.t));
+      _v$31 !== _p$.e && (_p$.e = _$setProp(_el$57, "backgroundColor", _v$31, _p$.e));
+      _v$32 !== _p$.t && (_p$.t = _$setProp(_el$58, "fg", _v$32, _p$.t));
       return _p$;
     }, {
       e: undefined,
       t: undefined
     });
-    return _el$55;
+    return _el$57;
   })();
 }
 function HistoryView(props) {
@@ -3607,23 +4008,23 @@ function HistoryView(props) {
     return recentRecords(props.store.records, props.sessionID, props.store);
   });
   return (() => {
-    var _el$59 = _$createElement("box"),
-      _el$60 = _$createElement("box"),
-      _el$61 = _$createElement("text"),
-      _el$63 = _$createElement("scrollbox");
-    _$insertNode(_el$59, _el$60);
-    _$insertNode(_el$59, _el$63);
-    _$setProp(_el$59, "flexDirection", "column");
-    _$setProp(_el$59, "flexGrow", 1);
-    _$insert(_el$59, _$createComponent(Header, {
+    var _el$61 = _$createElement("box"),
+      _el$62 = _$createElement("box"),
+      _el$63 = _$createElement("text"),
+      _el$65 = _$createElement("scrollbox");
+    _$insertNode(_el$61, _el$62);
+    _$insertNode(_el$61, _el$65);
+    _$setProp(_el$61, "flexDirection", "column");
+    _$setProp(_el$61, "flexGrow", 1);
+    _$insert(_el$61, _$createComponent(Header, {
       get theme() {
         return props.api.theme;
       },
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$60);
-    _$insert(_el$59, _$createComponent(SummaryBlock, {
+    }), _el$62);
+    _$insert(_el$61, _$createComponent(SummaryBlock, {
       get theme() {
         return props.api.theme;
       },
@@ -3633,34 +4034,34 @@ function HistoryView(props) {
       get sessionID() {
         return props.sessionID;
       }
-    }), _el$60);
-    _$insertNode(_el$60, _el$61);
-    _$setProp(_el$60, "height", 1);
-    _$setProp(_el$60, "flexShrink", 0);
-    _$setProp(_el$60, "paddingX", 1);
-    _$insertNode(_el$61, _$createTextNode(`TIME SESSION MODEL OUT/REAS COST`));
-    _$setProp(_el$61, "truncate", true);
-    _$setProp(_el$61, "wrapMode", "none");
-    _$setProp(_el$63, "flexGrow", 1);
-    _$setProp(_el$63, "minHeight", 0);
-    _$setProp(_el$63, "flexDirection", "column");
-    _$setProp(_el$63, "paddingX", 1);
-    _$setProp(_el$63, "stickyScroll", true);
-    _$setProp(_el$63, "stickyStart", "top");
-    _$insert(_el$63, (() => {
-      var _c$6 = _$memo(() => rows().length === 0);
-      return () => _c$6() ? (() => {
-        var _el$64 = _$createElement("text");
-        _$insertNode(_el$64, _$createTextNode(`No completed responses yet`));
-        _$effect(_$p => _$setProp(_el$64, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$64;
-      })() : rows().map(record => (() => {
+    }), _el$62);
+    _$insertNode(_el$62, _el$63);
+    _$setProp(_el$62, "height", 1);
+    _$setProp(_el$62, "flexShrink", 0);
+    _$setProp(_el$62, "paddingX", 1);
+    _$insertNode(_el$63, _$createTextNode(`TIME SESSION MODEL OUT/REAS COST`));
+    _$setProp(_el$63, "truncate", true);
+    _$setProp(_el$63, "wrapMode", "none");
+    _$setProp(_el$65, "flexGrow", 1);
+    _$setProp(_el$65, "minHeight", 0);
+    _$setProp(_el$65, "flexDirection", "column");
+    _$setProp(_el$65, "paddingX", 1);
+    _$setProp(_el$65, "stickyScroll", true);
+    _$setProp(_el$65, "stickyStart", "top");
+    _$insert(_el$65, (() => {
+      var _c$7 = _$memo(() => rows().length === 0);
+      return () => _c$7() ? (() => {
         var _el$66 = _$createElement("text");
-        _$setProp(_el$66, "truncate", true);
-        _$setProp(_el$66, "wrapMode", "none");
-        _$insert(_el$66, () => formatHistoryRow(record));
-        _$effect(_$p => _$setProp(_el$66, "fg", props.api.theme.current.text, _$p));
+        _$insertNode(_el$66, _$createTextNode(`No completed responses yet`));
+        _$effect(_$p => _$setProp(_el$66, "fg", props.api.theme.current.textMuted, _$p));
         return _el$66;
+      })() : rows().map(record => (() => {
+        var _el$68 = _$createElement("text");
+        _$setProp(_el$68, "truncate", true);
+        _$setProp(_el$68, "wrapMode", "none");
+        _$insert(_el$68, () => formatHistoryRow(record));
+        _$effect(_$p => _$setProp(_el$68, "fg", props.api.theme.current.text, _$p));
+        return _el$68;
       })());
     })());
     _$effect(_p$ => {
@@ -3668,10 +4069,10 @@ function HistoryView(props) {
         _v$34 = props.api.theme.current.backgroundElement,
         _v$35 = props.api.theme.current.textMuted,
         _v$36 = props.api.theme.current.background;
-      _v$33 !== _p$.e && (_p$.e = _$setProp(_el$59, "backgroundColor", _v$33, _p$.e));
-      _v$34 !== _p$.t && (_p$.t = _$setProp(_el$60, "backgroundColor", _v$34, _p$.t));
-      _v$35 !== _p$.a && (_p$.a = _$setProp(_el$61, "fg", _v$35, _p$.a));
-      _v$36 !== _p$.o && (_p$.o = _$setProp(_el$63, "backgroundColor", _v$36, _p$.o));
+      _v$33 !== _p$.e && (_p$.e = _$setProp(_el$61, "backgroundColor", _v$33, _p$.e));
+      _v$34 !== _p$.t && (_p$.t = _$setProp(_el$62, "backgroundColor", _v$34, _p$.t));
+      _v$35 !== _p$.a && (_p$.a = _$setProp(_el$63, "fg", _v$35, _p$.a));
+      _v$36 !== _p$.o && (_p$.o = _$setProp(_el$65, "backgroundColor", _v$36, _p$.o));
       return _p$;
     }, {
       e: undefined,
@@ -3679,7 +4080,7 @@ function HistoryView(props) {
       a: undefined,
       o: undefined
     });
-    return _el$59;
+    return _el$61;
   })();
 }
 export function rememberVisibleSession(store, sessionID) {
@@ -3720,7 +4121,10 @@ function BottomContent(props) {
     props.store.clockRevision();
     return taskWallTimeForSession(props.store, sessionID());
   });
-  const rows = createMemo(() => childRows(view().records, sessionID(), props.store));
+  const rows = createMemo(() => {
+    props.store.revision();
+    return props.store.pulseExpanded ? childRows(view().records, sessionID(), props.store) : [];
+  });
   const sections = createMemo(() => {
     const totals = view().totals;
     return [{
@@ -3752,97 +4156,97 @@ function BottomContent(props) {
     togglePulse(props.store);
   };
   return (() => {
-    var _el$67 = _$createElement("box");
-    _$setProp(_el$67, "flexDirection", "column");
-    _$setProp(_el$67, "width", "100%");
-    _$setProp(_el$67, "paddingTop", 1);
-    _$setProp(_el$67, "paddingX", 1);
-    _$setProp(_el$67, "overflow", "hidden");
-    _$setProp(_el$67, "flexShrink", 0);
-    _$insert(_el$67, (() => {
-      var _c$7 = _$memo(() => !!visible());
-      return () => _c$7() && [(() => {
-        var _el$68 = _$createElement("box"),
-          _el$69 = _$createElement("text");
-        _$insertNode(_el$68, _el$69);
-        _$setProp(_el$68, "focusable", true);
-        _$setProp(_el$68, "width", "100%");
-        _$setProp(_el$68, "height", 1);
-        _$setProp(_el$68, "paddingX", 1);
-        _$setProp(_el$68, "onMouseDown", onPulseMouseDown);
-        _$setProp(_el$69, "truncate", true);
-        _$setProp(_el$69, "wrapMode", "none");
-        _$insert(_el$69, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
+    var _el$69 = _$createElement("box");
+    _$setProp(_el$69, "flexDirection", "column");
+    _$setProp(_el$69, "width", "100%");
+    _$setProp(_el$69, "paddingTop", 1);
+    _$setProp(_el$69, "paddingX", 1);
+    _$setProp(_el$69, "overflow", "hidden");
+    _$setProp(_el$69, "flexShrink", 0);
+    _$insert(_el$69, (() => {
+      var _c$8 = _$memo(() => !!visible());
+      return () => _c$8() && [(() => {
+        var _el$70 = _$createElement("box"),
+          _el$71 = _$createElement("text");
+        _$insertNode(_el$70, _el$71);
+        _$setProp(_el$70, "focusable", true);
+        _$setProp(_el$70, "width", "100%");
+        _$setProp(_el$70, "height", 1);
+        _$setProp(_el$70, "paddingX", 1);
+        _$setProp(_el$70, "onMouseDown", onPulseMouseDown);
+        _$setProp(_el$71, "truncate", true);
+        _$setProp(_el$71, "wrapMode", "none");
+        _$insert(_el$71, () => expanded() ? "- Token Pulse" : "+ Token Pulse");
         _$effect(_p$ => {
           var _v$37 = props.api.theme.current.backgroundElement,
             _v$38 = props.api.theme.current.primary;
-          _v$37 !== _p$.e && (_p$.e = _$setProp(_el$68, "backgroundColor", _v$37, _p$.e));
-          _v$38 !== _p$.t && (_p$.t = _$setProp(_el$69, "fg", _v$38, _p$.t));
+          _v$37 !== _p$.e && (_p$.e = _$setProp(_el$70, "backgroundColor", _v$37, _p$.e));
+          _v$38 !== _p$.t && (_p$.t = _$setProp(_el$71, "fg", _v$38, _p$.t));
           return _p$;
         }, {
           e: undefined,
           t: undefined
         });
-        return _el$68;
+        return _el$70;
       })(), (() => {
-        var _el$70 = _$createElement("box"),
-          _el$71 = _$createElement("text");
-        _$insertNode(_el$70, _el$71);
-        _$setProp(_el$70, "flexDirection", "column");
-        _$setProp(_el$70, "width", "100%");
-        _$setProp(_el$70, "paddingX", 1);
-        _$setProp(_el$70, "flexShrink", 0);
-        _$setProp(_el$70, "onSizeChange", function () {
+        var _el$72 = _$createElement("box"),
+          _el$73 = _$createElement("text");
+        _$insertNode(_el$72, _el$73);
+        _$setProp(_el$72, "flexDirection", "column");
+        _$setProp(_el$72, "width", "100%");
+        _$setProp(_el$72, "paddingX", 1);
+        _$setProp(_el$72, "flexShrink", 0);
+        _$setProp(_el$72, "onSizeChange", function () {
           setMetricWidth(Math.max(1, this.width - 2));
         });
-        _$setProp(_el$71, "width", "100%");
-        _$setProp(_el$71, "wrapMode", "word");
-        _$setProp(_el$71, "flexShrink", 0);
-        _$insert(_el$71, metricLabel);
-        _$effect(_$p => _$setProp(_el$71, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$70;
-      })(), _$memo(() => _$memo(() => !!expanded())() && (!sessionID() ? (() => {
-        var _el$72 = _$createElement("text");
-        _$insertNode(_el$72, _$createTextNode(`No active session`));
-        _$setProp(_el$72, "paddingTop", 1);
-        _$setProp(_el$72, "truncate", true);
-        _$setProp(_el$72, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$72, "fg", props.api.theme.current.textMuted, _$p));
+        _$setProp(_el$73, "width", "100%");
+        _$setProp(_el$73, "wrapMode", "word");
+        _$setProp(_el$73, "flexShrink", 0);
+        _$insert(_el$73, metricLabel);
+        _$effect(_$p => _$setProp(_el$73, "fg", props.api.theme.current.textMuted, _$p));
         return _el$72;
-      })() : [(() => {
-        var _el$74 = _$createElement("text"),
-          _el$75 = _$createTextNode(`session `);
-        _$insertNode(_el$74, _el$75);
+      })(), _$memo(() => _$memo(() => !!expanded())() && (!sessionID() ? (() => {
+        var _el$74 = _$createElement("text");
+        _$insertNode(_el$74, _$createTextNode(`No active session`));
         _$setProp(_el$74, "paddingTop", 1);
-        _$setProp(_el$74, "wrapMode", "word");
-        _$setProp(_el$74, "flexShrink", 0);
-        _$insert(_el$74, sessionID, null);
-        _$effect(_$p => _$setProp(_el$74, "fg", props.api.theme.current.secondary, _$p));
+        _$setProp(_el$74, "truncate", true);
+        _$setProp(_el$74, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$74, "fg", props.api.theme.current.textMuted, _$p));
         return _el$74;
+      })() : [(() => {
+        var _el$76 = _$createElement("text"),
+          _el$77 = _$createTextNode(`session `);
+        _$insertNode(_el$76, _el$77);
+        _$setProp(_el$76, "paddingTop", 1);
+        _$setProp(_el$76, "wrapMode", "word");
+        _$setProp(_el$76, "flexShrink", 0);
+        _$insert(_el$76, sessionID, null);
+        _$effect(_$p => _$setProp(_el$76, "fg", props.api.theme.current.secondary, _$p));
+        return _el$76;
       })(), _$memo(() => sections().map((section, index) => _$createComponent(PulseSection, {
         get theme() {
           return props.api.theme;
         },
         section: section
       }))), _$memo(() => _$memo(() => !!(!view().aggregate && !totalsHaveUsage(view().totals?.including)))() && (() => {
-        var _el$79 = _$createElement("text");
-        _$insertNode(_el$79, _$createTextNode(`No completed responses yet`));
-        _$setProp(_el$79, "paddingTop", 1);
+        var _el$81 = _$createElement("text");
+        _$insertNode(_el$81, _$createTextNode(`No completed responses yet`));
+        _$setProp(_el$81, "paddingTop", 1);
+        _$setProp(_el$81, "truncate", true);
+        _$setProp(_el$81, "wrapMode", "none");
+        _$effect(_$p => _$setProp(_el$81, "fg", props.api.theme.current.textMuted, _$p));
+        return _el$81;
+      })()), (() => {
+        var _el$78 = _$createElement("box"),
+          _el$79 = _$createElement("text");
+        _$insertNode(_el$78, _el$79);
+        _$setProp(_el$78, "flexDirection", "column");
+        _$setProp(_el$78, "width", "100%");
+        _$setProp(_el$78, "paddingTop", 1);
+        _$insertNode(_el$79, _$createTextNode(`SESSION RUN`));
         _$setProp(_el$79, "truncate", true);
         _$setProp(_el$79, "wrapMode", "none");
-        _$effect(_$p => _$setProp(_el$79, "fg", props.api.theme.current.textMuted, _$p));
-        return _el$79;
-      })()), (() => {
-        var _el$76 = _$createElement("box"),
-          _el$77 = _$createElement("text");
-        _$insertNode(_el$76, _el$77);
-        _$setProp(_el$76, "flexDirection", "column");
-        _$setProp(_el$76, "width", "100%");
-        _$setProp(_el$76, "paddingTop", 1);
-        _$insertNode(_el$77, _$createTextNode(`SESSION RUN`));
-        _$setProp(_el$77, "truncate", true);
-        _$setProp(_el$77, "wrapMode", "none");
-        _$insert(_el$76, _$createComponent(PulseMetricGrid, {
+        _$insert(_el$78, _$createComponent(PulseMetricGrid, {
           get theme() {
             return props.api.theme;
           },
@@ -3853,8 +4257,8 @@ function BottomContent(props) {
             }]];
           }
         }), null);
-        _$effect(_$p => _$setProp(_el$77, "fg", props.api.theme.current.accent, _$p));
-        return _el$76;
+        _$effect(_$p => _$setProp(_el$79, "fg", props.api.theme.current.accent, _$p));
+        return _el$78;
       })(), _$memo(() => _$memo(() => rows().length > 0)() && _$createComponent(ChildAgentRows, {
         get theme() {
           return props.api.theme;
@@ -3864,7 +4268,7 @@ function BottomContent(props) {
         }
       }))]))];
     })());
-    return _el$67;
+    return _el$69;
   })();
 }
 export function createTuiSlotPlugin(api, store, options) {
@@ -4094,8 +4498,14 @@ const initializeTui = async (api, rawOptions) => {
         const generation = activityReloadGeneration;
         if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
         activityReloadTimer = undefined;
-        await reloadActivity(store, api, runsPath, generation);
+        const applied = await reloadActivity(store, api, runsPath, generation);
         if (generation !== activityReloadGeneration) continue;
+        if (!applied && tuiActivity(store).selection.retryNeeded && !disposed) {
+          // Retry an actually rejected FD snapshot, not a quiet-window guess.
+          // A single drain owns I/O and disposal/generation are checked again.
+          await new Promise(resolve => setTimeout(resolve, 5));
+          continue;
+        }
         activityAppliedGeneration = generation;
         return;
       }
@@ -4128,12 +4538,11 @@ const initializeTui = async (api, rawOptions) => {
   const scheduleActivityReload = () => {
     if (disposed) return;
     activityReloadGeneration += 1;
-    const generation = activityReloadGeneration;
-    store.activityGeneration = generation;
-    if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
+    store.activityGeneration = activityReloadGeneration;
+    if (activityReloadTimer !== undefined || activityDrain) return;
     activityReloadTimer = setTimeout(() => {
       activityReloadTimer = undefined;
-      if (!disposed && generation === activityReloadGeneration) void drainActivity();
+      if (!disposed) void drainActivity();
     }, 30);
   };
   const openHistory = () => {
@@ -4207,6 +4616,14 @@ const initializeTui = async (api, rawOptions) => {
     const receivedAt = Date.now();
     try {
       const properties = eventProperties(event);
+      if (type === "pulse.activity") {
+        const fact = asRecord(properties.fact);
+        if (fact) {
+          recordTuiActivityFact(store, fact, event);
+          store.bump();
+        }
+        return;
+      }
       if (type === "server.connected" || type === "server.instance.disposed" || type.startsWith("workspace.")) {
         recordTuiObservationLifecycle(store, type, properties, event, receivedAt);
         return;
@@ -4251,6 +4668,7 @@ const initializeTui = async (api, rawOptions) => {
   subscribe("session.next.text.delta", handleEvent);
   subscribe("session.next.reasoning.delta", handleEvent);
   subscribe("message.updated", handleEvent);
+  subscribe("pulse.activity", handleEvent);
   subscribe("session.next.step.started", handleEvent);
   subscribe("session.next.step.ended", handleEvent);
   subscribe("session.idle", handleEvent);
@@ -4286,12 +4704,29 @@ const initializeTui = async (api, rawOptions) => {
   api.lifecycle.onDispose(() => {
     disposed = true;
     store.disposed = true;
+    store.activityGeneration++;
+    store.historyGeneration++;
     stopLedgerWatchers();
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
     clearInterval(interval);
+    // Stop proof delivery before discarding either model's large state.
+    tuiReadModel(store).dispose();
+    const activity = tuiActivities.get(store);
+    activity?.selection.dispose();
+    if (activity) {
+      activity.canonical = [];
+      activity.executions.clear();
+      activity.runtimeEpochs.clear();
+      activity.currentExecutions.clear();
+      activity.candidates.clear();
+      activity.partialSessions.clear();
+      activity.registry = undefined;
+      activity.ledgerScopes = undefined;
+      activity.parents = undefined;
+    }
     store.active.clear();
-    store.optimistic.clear();
+    if (store.optimistic instanceof RevisionMap) store.optimistic.discard();else store.optimistic.clear();
     store.optimisticQuality.clear();
     store.optimisticOrder.clear();
     store.diskRecords = [];
@@ -4299,10 +4734,14 @@ const initializeTui = async (api, rawOptions) => {
     store.completedMessageIDs.clear();
     store.sessionRuntime.clear();
     store.taskRuns.clear();
-    store.sessionParents.clear();
+    store.messageScopes.clear();
+    store.sourceScopes = createScopeRegistry();
+    store.totalsLedger = emptyTotalsLedger();
     store.activityEvents = [];
-    store.activityReplay = replayActivity([]);
+    tuiActivities.delete(store);
     store.lastCompletedBySession.clear();
+    disposeContentMetadata(observationRuntime(store).metadata);
+    observationRuntimes.delete(store);
     store.focusSessionID = undefined;
     store.disposeSignals();
   });
