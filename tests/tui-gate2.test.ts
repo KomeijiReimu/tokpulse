@@ -269,11 +269,19 @@ for (const n of [1000, 4000]) test(`G2-06 ${n} dirty SIDs batch into one visible
 
 test("G2-03 failed/stale reads never consume cursor; partial/EOF/duplicate/truncate/replace retain exact time", async () => {
   const directory = await fixture(), path = join(directory, "runs.jsonl"), store = createRuntimeStore(1, 0);
-  let held: (() => void) | undefined, entered!: () => void, block = false, changeDuringRead = false;
+  let held: (() => void) | undefined, entered!: () => void, block = false, changeDuringRead = false, replaceDuringRead = false, failRead = false;
+  const warnings: string[] = [];
+  const raceApi = { ui: { toast(value: { message: string }) { warnings.push(value.message); } } } as unknown as TuiPluginApi;
   const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
   const observed = await io(new Set([path]), async () => {
+    if (failRead) { failRead = false; throw Object.assign(Error("fixture activity EIO"), { code: "EIO" }); }
     if (!block) return; block = false; entered(); await new Promise<void>((resolve) => { held = resolve; });
   }, async () => {
+    if (replaceDuringRead) {
+      replaceDuringRead = false;
+      const replacement = join(directory, "racing-replacement");
+      await original.copyFile(path, replacement); await original.rename(replacement, path);
+    }
     if (!changeDuringRead) return; changeDuringRead = false;
     await original.appendFile(path, text([fact(7, "root", "busy", 600), fact(8, "root", "idle", 620)]));
   });
@@ -285,21 +293,32 @@ test("G2-03 failed/stale reads never consume cursor; partial/EOF/duplicate/trunc
     assert.equal(taskWallTimeForSession(store, "root", 1000), 40); assert.equal(tuiActivityDiagnostics(store).staleReads, 1);
     let before = observed.counts.bytes; await reloadActivity(store, api, path, 2); assert.equal(observed.counts.bytes, before);
     await original.appendFile(path, text([fact(5, "root", "busy", 400), fact(6, "root", "idle", 420)]));
-    changeDuringRead = true; const beforeFailure = tuiActivityDiagnostics(store).canonicalIngested;
-    assert.equal(await reloadActivity(store, api, path, 2), false); assert.equal(tuiActivityDiagnostics(store).canonicalIngested, beforeFailure);
-    await reloadActivity(store, api, path, 2); assert.equal(taskWallTimeForSession(store, "root", 1000), 80);
+    changeDuringRead = true; const beforeAppend = tuiActivityDiagnostics(store).canonicalIngested;
+    assert.equal(await reloadActivity(store, raceApi, path, 2), true);
+    assert.equal(tuiActivityDiagnostics(store).canonicalIngested, beforeAppend + 2);
+    assert.equal(taskWallTimeForSession(store, "root", 1000), 60);
+    assert.equal(await reloadActivity(store, raceApi, path, 2), true); assert.equal(taskWallTimeForSession(store, "root", 1000), 80);
     const half = text([fact(9, "root", "busy", 800), fact(10, "root", "idle", 820)]);
     await original.appendFile(path, half.slice(0, 30)); await reloadActivity(store, api, path, 2);
     assert.equal(taskWallTimeForSession(store, "root", 1000), 80);
     await original.appendFile(path, half.slice(30).trimEnd()); await reloadActivity(store, api, path, 2);
     assert.equal(taskWallTimeForSession(store, "root", 1000), 100);
-    await original.appendFile(path, "\n"); await reloadActivity(store, api, path, 2);
-    assert.equal(taskWallTimeForSession(store, "root", 1000), 100); assert.equal(tuiActivityDiagnostics(store).canonicalIngested, 10);
+    await original.appendFile(path, "\n"); replaceDuringRead = true;
+    const beforeFailure = tuiActivityDiagnostics(store).canonicalIngested;
+    assert.equal(await reloadActivity(store, raceApi, path, 2), false);
+    assert.equal(tuiActivityDiagnostics(store).canonicalIngested, beforeFailure);
+    assert.deepEqual(warnings, [], "recoverable replacement races must not toast");
+    await reloadActivity(store, raceApi, path, 2);
+    assert.equal(taskWallTimeForSession(store, "root", 1000), 100);
+    assert.equal(tuiActivityDiagnostics(store).canonicalIngested, beforeFailure + 10, "replacement rebuild counts its ten canonical facts");
+    assert.equal(store.activityEvents.length, 10, "reset must not duplicate canonical facts");
     await original.writeFile(path, text([fact(11, "root", "busy", 900), fact(12, "root", "idle", 930)])); await reloadActivity(store, api, path, 2);
     assert.equal(taskWallTimeForSession(store, "root", 1000), 30);
     const replacement = join(directory, "replacement"); await original.writeFile(replacement, text([fact(13, "root", "busy", 1000), fact(14, "root", "idle", 1040)]));
     await original.rename(replacement, path); await reloadActivity(store, api, path, 2);
-    assert.equal(taskWallTimeForSession(store, "root", 3600000), 40); assert.equal(tuiActivityDiagnostics(store).canonicalResets, 3);
+    assert.equal(taskWallTimeForSession(store, "root", 3600000), 40); assert.equal(tuiActivityDiagnostics(store).canonicalResets, 4);
+    failRead = true; assert.equal(await reloadActivity(store, raceApi, path, 2), false);
+    assert.equal(warnings.length, 1); assert.match(warnings[0], /activity read failed.*fixture activity EIO/);
     assert.equal(observed.counts.opened, observed.counts.closed); assert.ok(tuiActivityDiagnostics(store).readRetries >= 1);
   } finally { held?.(); observed.restore(); store.disposed = true; store.disposeSignals(); await original.rm(directory, { recursive: true, force: true }); }
 });

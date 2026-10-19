@@ -166,9 +166,10 @@ async function ledgerPluginFixture(lateDirectory = false, gateInitialHistory = f
   const startedAt = clock + 10;
   Date.now = () => clock;
   let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
+  const toasts: string[] = [];
   const api = { ...host(80, 40), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
     route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
-    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
+    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: (value: { message: string }) => { toasts.push(value.message); }, dialog: { open: false } },
     slots: { register: (plugin: typeof registered) => { registered = plugin; return "ledger-watch"; } },
     event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => { assert.equal(handlers.has(type), false); handlers.set(type, callback); return () => handlers.delete(type); } },
     lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
@@ -218,7 +219,7 @@ async function ledgerPluginFixture(lateDirectory = false, gateInitialHistory = f
       await waitForLedger(() => ui.__testActivityReads.length > before && ui.__testActivityReads.at(-1) === store.activityGeneration,
         "the initial post-completion activity read must have returned before delayed server commit");
     };
-    return { ui, store, rendered, directory, ledgerDirectory, historyPath, runsPath, startedAt, send, fact, commitRuns, complete, start, awaitEventRead, dispose, initialization,
+    return { ui, store, rendered, directory, ledgerDirectory, historyPath, runsPath, startedAt, send, fact, commitRuns, complete, start, awaitEventRead, dispose, initialization, toasts,
       subscriptionCount: () => handlers.size,
       captureHandler: (type: string) => handlers.get(type),
       initialReadEntered: () => entered,
@@ -279,7 +280,7 @@ test(`A2-07 actual plugin disposal ${shape} ${n} stops resources and discards pa
   }
 });
 
-test("G2 actual fs.watch retries a changing append then native frame shows the committed exact duration", async () => {
+test("actual fs.watch accepts a concurrent append without warnings and renders the exact duration", async () => {
   const f = await ledgerPluginFixture(); const originals = { ...fsPromises };
   const bunTestModule = "bun:test"; const { mock } = await import(bunTestModule);
   let injected = false;
@@ -301,8 +302,9 @@ test("G2 actual fs.watch retries a changing append then native frame shows the c
     f.advance(5001); writeFileSync(f.runsPath, [f.fact("s", "busy", 2000), f.fact("s", "idle", 3000)].map((value) => JSON.stringify(value)).join("\n") + "\n", { flag: "a" });
     await waitForLedger(() => f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 6000) === 3000, "active append race must retry without waiting for a later control/prompt");
     const queryMs = performance.now() - started, after = f.ui.tuiActivityDiagnostics(f.store);
-    assert.ok(injected); assert.ok(after.readRetries + after.staleReads > baseline.readRetries + baseline.staleReads,
-      "the changed read is rejected either by its watcher generation fence or by the current-generation retry path");
+    assert.ok(injected);
+    assert.equal(after.readRetries, baseline.readRetries, "normal appends must not reject the captured prefix");
+    assert.deepEqual(f.toasts, [], "concurrent appends must not produce activity read warnings");
     assert.equal(after.canonicalIngested - baseline.canonicalIngested, 4); assert.equal(after.canonicalResets, baseline.canonicalResets);
     const frameStart = performance.now(); await f.rendered.renderOnce(); const frame = f.rendered.captureCharFrame();
     assert.match(frame, /time 3s/); assert.doesNotMatch(frame, /TPS|TTFT|tok\/s/i);
@@ -337,6 +339,7 @@ test("G2 actual fs.watch publishes successive committed prefixes while the bound
       "final pending prefix drains after bounded writer cleanup");
     const after = f.ui.tuiActivityDiagnostics(f.store);
     assert.equal(after.canonicalResets, baseline.canonicalResets); assert.equal(after.canonicalIngested - baseline.canonicalIngested, written * 2);
+    assert.deepEqual(f.toasts, [], "continuous append traffic must not produce activity read warnings");
     console.log(`G2 continuous-watch progress-ms=${progressMs.toFixed(2)} writes-before-second-prefix=${atProgress}/40 canonical-appends=${after.canonicalAppends - baseline.canonicalAppends}`);
   } finally { if (writer) clearInterval(writer); await f.close(); }
 });

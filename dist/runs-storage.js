@@ -26,6 +26,8 @@ class ActivityCursor {
  * timestamp changes, truncation, replacement and changed guards reset. Bounded
  * checks cannot detect arbitrary middle-only overwrite combined with growth;
  * this is not an integrity monitor for writers violating that protocol.
+ * Concurrent append is allowed: validate the captured prefix with bounded
+ * guards, keep that EOF in the cursor, and leave later bytes for the next read.
  * Cross-batch stable-ID deduplication belongs to the consumer (notably legacy
  * valid EOF can be emitted again when its terminating newline later arrives).
  */
@@ -51,7 +53,7 @@ export async function readActivityDelta(path, cursor) {
     const previous = ActivityCursor.checkpoint(cursor);
     let append = previous !== undefined && previous.path === key && previous.stat.dev === stat.dev && previous.stat.ino === stat.ino && size > previous.size;
     if (previous && previous.path === key && sameActivitySnapshot(previous.stat, stat)) {
-      await assertActivitySnapshot(file, path, stat);
+      await assertActivitySnapshot(file, path, stat, previous);
       return {
         mode: "unchanged",
         events: [],
@@ -65,7 +67,6 @@ export async function readActivityDelta(path, cursor) {
     }
     const start = append && previous ? previous.lineStart : 0;
     const data = await readActivityRange(file, start, size - start);
-    await assertActivitySnapshot(file, path, stat);
     const lineStart = start + data.lastIndexOf(10) + 1;
     let head, tail;
     if (append && previous) {
@@ -79,6 +80,10 @@ export async function readActivityDelta(path, cursor) {
       head = Buffer.from(data.subarray(0, ACTIVITY_GUARD_BYTES));
       tail = Buffer.from(data.subarray(-ACTIVITY_GUARD_BYTES));
     }
+    await assertActivitySnapshot(file, path, stat, {
+      head,
+      tail
+    });
     const events = parseActivityJsonl(`${start === 0 ? "" : "\n"}${data.toString("utf8")}`);
     return {
       mode: append ? "append" : "reset",
@@ -99,14 +104,28 @@ export async function readActivityDelta(path, cursor) {
 function sameActivitySnapshot(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
-async function assertActivitySnapshot(file, path, snapshot) {
+async function assertActivitySnapshot(file, path, snapshot, guards) {
   const after = await file.stat({
     bigint: true
   });
-  const named = await inspectLedgerFile(path);
-  if (!sameActivitySnapshot(snapshot, after) || !named || BigInt(named.dev) !== after.dev || BigInt(named.ino) !== after.ino) {
-    throw new Error(`Activity ledger changed during read: ${path}`);
+  const changed = () => new Error(`Activity ledger changed during read: ${path}`);
+  if (after.dev !== snapshot.dev || after.ino !== snapshot.ino || after.size < snapshot.size || !after.isFile() || after.nlink !== 1n) throw changed();
+  if (!sameActivitySnapshot(snapshot, after)) {
+    // A lease writer may keep appending throughout this read. Validate the
+    // captured prefix, not a moving EOF: the returned cursor still ends at
+    // snapshot.size. Metadata can become visible just before append's size;
+    // check guards and then observe size again, without waiting for quiescence.
+    // Only a detected race pays these bounded guard reads.
+    const head = await readActivityRange(file, 0, guards.head.length);
+    const tail = await readActivityRange(file, Number(snapshot.size) - guards.tail.length, guards.tail.length);
+    if (!head.equals(guards.head) || !tail.equals(guards.tail)) throw changed();
+    const final = await file.stat({
+      bigint: true
+    });
+    if (final.size < after.size || final.dev !== after.dev || final.ino !== after.ino || !final.isFile() || final.nlink !== 1n || final.size === snapshot.size && !sameActivitySnapshot(snapshot, final)) throw changed();
   }
+  const named = await inspectLedgerFile(path);
+  if (!named || BigInt(named.dev) !== after.dev || BigInt(named.ino) !== after.ino || BigInt(named.size) < snapshot.size) throw changed();
 }
 async function readActivityRange(file, position, length) {
   const buffer = Buffer.allocUnsafe(length);

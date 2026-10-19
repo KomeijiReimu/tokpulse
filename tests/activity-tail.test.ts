@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import * as fs from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeActivityEvent, type ActivityEvent } from "../src/activity.js";
 import { readLedgerText } from "../src/persistence-files.js";
+import { acquireWriterLease } from "../src/persistence.js";
 import { createActivityLedger, parseActivityJsonl, readActivityDelta, readActivityFile, serializeActivityJsonl, writeActivityFile, type ActivityReadCursor } from "../src/runs-storage.js";
 const { spyOn } = require("bun:test");
 
@@ -25,6 +27,158 @@ function deferred() {
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+async function duringValidation(path: string, change: () => Promise<void>, read: () => Promise<void>) {
+  const original = fs.open;
+  const handles: { mockRestore(): void }[] = [];
+  let injected = false;
+  const opening = spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof original>) => {
+    const file = await original(...args);
+    if (String(args[0]) !== path) return file;
+    const stat = file.stat.bind(file);
+    let snapshots = 0;
+    handles.push(spyOn(file, "stat").mockImplementation(async (...params: any[]) => {
+      if (params[0]?.bigint && ++snapshots === 2) { injected = true; await change(); }
+      return (stat as any)(...params);
+    }));
+    return file;
+  });
+  try { await read(); assert.equal(injected, true); }
+  finally { for (const handle of handles.reverse()) handle.mockRestore(); opening.mockRestore(); }
+}
+
+for (const mode of ["cold", "reset", "append", "unchanged"] as const) {
+  test(`normal append during ${mode} validation commits only captured EOF without starving`, async (context) => {
+    const base = await directory(context), path = join(base, "runs");
+    const ledger = createActivityLedger(path);
+    await ledger.append(fact("A"));
+    const previous = mode === "cold" ? undefined : (await readActivityDelta(path)).cursor;
+    if (mode === "reset") await writeActivityFile(path, [fact("B", 1)]);
+    if (mode === "append") await ledger.append(fact("B", 1));
+    let committed: ActivityReadCursor | undefined;
+    await duringValidation(path, () => ledger.append(fact("C", 2)).then(() => {}), async () => {
+      const result = await readActivityDelta(path, previous);
+      assert.equal(result.mode, mode === "cold" ? "reset" : mode);
+      assert.deepEqual(result.events.map((event) => event.eventID), mode === "unchanged" ? [] : [mode === "cold" ? "A" : "B"]);
+      committed = result.cursor;
+    });
+    const next = await readActivityDelta(path, committed);
+    assert.equal(next.mode, "append");
+    assert.deepEqual(next.events.map((event) => event.eventID), ["C"]);
+    assert.equal((await readActivityDelta(path, next.cursor)).mode, "unchanged");
+  });
+}
+
+test("partial UTF8 completed during validation is recovered from the captured line boundary", async (context) => {
+  const base = await directory(context), path = join(base, "runs");
+  const line = Buffer.from(JSON.stringify(fact("中文-race", 1)));
+  const split = line.indexOf(Buffer.from("中")) + 1;
+  await fs.writeFile(path, line.subarray(0, split));
+  let cursor: ActivityReadCursor | undefined;
+  await duringValidation(path, () => fs.appendFile(path, Buffer.concat([line.subarray(split), Buffer.from("\n")])), async () => {
+    const result = await readActivityDelta(path);
+    assert.deepEqual(result.events, []);
+    cursor = result.cursor;
+  });
+  assert.deepEqual((await readActivityDelta(path, cursor)).events.map((event) => event.eventID), ["中文-race"]);
+});
+
+test("every validation can overlap another append without forcing reader quiescence or advancing beyond read bytes", async (context) => {
+  const base = await directory(context), path = join(base, "runs");
+  const ledger = createActivityLedger(path);
+  await ledger.append(fact("n0"));
+  let cursor: ActivityReadCursor | undefined;
+  for (let round = 0; round < 8; round++) {
+    await duringValidation(path, () => ledger.append(fact(`n${round + 1}`, round + 1)).then(() => {}), async () => {
+      const delta = await readActivityDelta(path, cursor);
+      assert.deepEqual(delta.events.map((event) => event.eventID), [`n${round}`]);
+      cursor = delta.cursor;
+    });
+  }
+  const last = await readActivityDelta(path, cursor);
+  assert.deepEqual(last.events.map((event) => event.eventID), ["n8"]);
+  assert.equal((await readActivityDelta(path, last.cursor)).mode, "unchanged");
+});
+
+test("concurrent validation still rejects replacement, truncation and guarded overwrite including growth", async (context) => {
+  const base = await directory(context), path = join(base, "runs");
+  for (const kind of ["replace", "truncate", "overwrite", "overwrite-grow"]) {
+    await writeActivityFile(path, [fact("A")]);
+    const before = (await fs.stat(path)).size;
+    await duringValidation(path, async () => {
+      if (kind === "replace") await writeActivityFile(path, [fact("B", 1)]);
+      else if (kind === "truncate") await fs.truncate(path, 0);
+      else {
+        const file = await fs.open(path, "r+");
+        try { await file.write(serializeActivityJsonl([fact("B")]), 0, "utf8"); }
+        finally { await file.close(); }
+        if (kind === "overwrite-grow") await fs.appendFile(path, serializeActivityJsonl([fact("C", 1)]));
+        else assert.equal((await fs.stat(path)).size, before);
+      }
+    }, async () => { await assert.rejects(readActivityDelta(path), /changed|truncated/); });
+  }
+});
+
+test("independent producers through one lease writer converge while the reader repeatedly overlaps live appends", async (context) => {
+  const base = await directory(context), path = join(base, "runs");
+  const lease = await acquireWriterLease({ historyPath: join(base, "history"), totalsPath: join(base, "totals"), runsPath: path });
+  context.after(() => lease.release());
+  const ledger = createActivityLedger(path, { lease });
+  await ledger.append(fact("seed"));
+  let writes = 0, reads = 0, overlapped = 0, done = false;
+  const children: ReturnType<typeof spawn>[] = [];
+  context.after(async () => { for (const child of children) if (child.exitCode === null) child.kill(); });
+  const producers = Array.from({ length: 3 }, (_, producer) => (async () => {
+    const script = `for(let i=0;i<60;i++){console.log(JSON.stringify({id:'p${producer}-'+i,seq:i,sid:'s${producer}'}));await Bun.sleep(1);}`;
+    const child = spawn(process.execPath, ["--eval", script], { stdio: ["ignore", "pipe", "pipe"], env: {
+      ...process.env, TMPDIR: join(homedir(), ".cache", "tokpulse-test-tmp"),
+    } });
+    children.push(child);
+    const exited = once(child, "exit");
+    let buffer = "", stderr = "";
+    child.stderr!.on("data", (chunk) => { stderr += String(chunk); });
+    for await (const chunk of child.stdout!) {
+      buffer += String(chunk);
+      for (;;) {
+        const end = buffer.indexOf("\n");
+        if (end < 0) break;
+        const input = JSON.parse(buffer.slice(0, end));
+        buffer = buffer.slice(end + 1);
+        await ledger.append(fact(input.id, input.seq, input.sid));
+        writes++;
+      }
+    }
+    assert.equal(buffer, "");
+    assert.equal((await exited)[0], 0, stderr);
+  })());
+  const producing = Promise.all(producers).finally(() => { done = true; });
+  // Attach a rejection handler immediately; await below still propagates it.
+  void producing.catch(() => {});
+  let cursor: ActivityReadCursor | undefined;
+  const seen = new Set<string>();
+  const apply = async () => {
+    const before = writes;
+    const delta = await readActivityDelta(path, cursor);
+    reads++;
+    if (writes > before) overlapped++;
+    for (const event of delta.events) {
+      assert.equal(seen.has(event.eventID), false, `double canonical fact ${event.eventID}`);
+      seen.add(event.eventID);
+    }
+    cursor = delta.cursor;
+  };
+  const deadline = performance.now() + 10000;
+  while (!done && performance.now() < deadline) { await apply(); await new Promise<void>((resolve) => setImmediate(resolve)); }
+  assert.equal(done, true, "bounded producer/reader run must finish");
+  await producing;
+  await apply();
+  assert.equal((await readActivityDelta(path, cursor)).mode, "unchanged");
+  assert.equal(writes, 180);
+  assert.equal(seen.size, 181);
+  assert.deepEqual([...seen].sort(), (await readActivityFile(path)).map((event) => event.eventID).sort());
+  assert.ok(reads > 1);
+  assert.ok(overlapped > 0, "live writer must overlap actual reader calls");
+});
 function countReads(path: string, fail?: { once: boolean; readFile?: boolean }) {
   const counts = { bytes: 0, reads: 0, readFiles: 0, parsed: 0, opened: 0, closed: 0 };
   const open = fs.open;

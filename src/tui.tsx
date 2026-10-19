@@ -3459,7 +3459,12 @@ export async function reloadActivity(
   } catch (error) {
     if (store.disposed || generation !== store.activityGeneration || token !== selection.readToken) { selection.counters.staleReads++; return false; }
     selection.retryNeeded = error instanceof Error && /(?:Activity ledger (?:changed|truncated)|Ledger identity changed)/.test(error.message);
-    if (selection.retryNeeded) selection.counters.readRetries++;
+    if (selection.retryNeeded) {
+      // Replacement/truncation is retried by the existing reload drain with
+      // the previous cursor intact; it is not a user-actionable I/O failure.
+      selection.counters.readRetries++;
+      return false;
+    }
     warnWithToast(api, "activity read failed", error);
     return false;
   }
