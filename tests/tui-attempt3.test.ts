@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdir, mkdtemp, writeFile, appendFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { normalizeActivityEvent, replayActivity, createActivityProjector, activityProjectionDiagnostics, type ActivityEvent } from "../src/activity.js";
+import { normalizeActivityEvent, replayActivity, createActivityProjector, type ActivityEvent } from "../src/activity.js";
 import { TuiActivitySelection, tuiReadModel, type ParentProofPort, type ParentProofOutcome, type ParentProofWake } from "../src/tui-read-model.js";
 import { createRuntimeStore, recordTuiActivityFact, reloadActivity, taskWallTimeForSession,
   tuiActivityDiagnostics, cacheSessionParentFromEvent, recordTuiObservationLifecycle,
@@ -273,24 +273,22 @@ test("A2-06 disruption freezes each current stream at its own prefix, never anot
   } finally { store.disposeSignals(); }
 });
 
-for (const n of [100, 200, 400, 1000, 2000, 4000]) test(`A2-PROBE one retired execution ${n} late refinements stays cumulative and linear`, async () => {
+for (const n of [100, 200, 400, 1000, 2000, 4000]) test(`A2-07 one retired execution ${n} late refinements stays cumulative and linear`, async () => {
   const spans: Array<[string, number, number]> = Array.from({ length: n }, (_, i) => [`m${i}`, i * 10 + 1, i * 10 + 4]);
   spans.push(["normal", n * 10 + 5, n * 10 + 6]); const input = scenario(spans, n * 10 + 10), f = await fixture(input);
   try {
     const before = tuiActivityDiagnostics(f.store), refined = new Set<string>(), samples: Array<{ at: number; actual: unknown; reference: number }> = [];
-    const startupStarted = performance.now(), initial = f.query(), startupCandidateMs = performance.now() - startupStarted;
-    const startupReferenceStarted = performance.now(), initialReference = input.reference(refined), startupReferenceMs = performance.now() - startupReferenceStarted;
+    const initial = f.query(), initialReference = input.reference(refined);
     assert.equal(initial, initialReference);
     const warmed = tuiActivityDiagnostics(f.store);
-    const checkpoints = new Set([1, 2, 4, 10, Math.floor(n / 2), n]); let candidateMs = 0, referenceMs = 0;
+    const checkpoints = new Set([1, 2, 4, 10, Math.floor(n / 2), n]);
     for (let i = 0; i < n; i++) {
-      const started = performance.now(); recordTuiActivityFact(f.store, input.proof(`m${i}`) as unknown as Record<string, unknown>); const actual = f.query(); candidateMs += performance.now() - started;
+      recordTuiActivityFact(f.store, input.proof(`m${i}`) as unknown as Record<string, unknown>); const actual = f.query();
       refined.add(`m${i}`);
-      if (checkpoints.has(i + 1)) { const referenceStarted = performance.now(), reference = input.reference(refined); referenceMs += performance.now() - referenceStarted; samples.push({ at: i + 1, actual, reference }); }
+      if (checkpoints.has(i + 1)) samples.push({ at: i + 1, actual, reference: input.reference(refined) });
     }
     const after = tuiActivityDiagnostics(f.store), delta = Object.fromEntries(["coldRepairFacts", "coldStreamRepairs", "coldFactVisits", "workFactVisits", "workSpanVisits", "factVisits", "factMaterializations", "intervalVisits", "intervalMaterializations", "factSortComparisons", "intervalSortComparisons", "indexNodeVisits", "contextNodeVisits", "indexBuilds", "snapshotBuilds", "selectorChanges", "canonicalArrayCopies", "pureReceiptCopies", "pureReceiptEntries"].map((key) => [key, Number((after as any)[key]) - Number((before as any)[key])]));
     const warmIndexBuilds = after.indexBuilds - warmed.indexBuilds;
-    console.log(`A2-PROBE ${JSON.stringify({ n, startup: { candidateMs: startupCandidateMs, referenceMs: startupReferenceMs, indexBuilds: warmed.indexBuilds - before.indexBuilds }, candidateMs, referenceMs, samples, delta, warmIndexBuilds })}`);
     assert.deepEqual({ correct: samples.every((sample) => sample.actual === sample.reference), linearRepair: delta.coldRepairFacts <= n * 32 + 128,
       linearMaterialization: delta.factMaterializations <= n * 80 + 256 }, { correct: true, linearRepair: true, linearMaterialization: true });
     assert.deepEqual([delta.coldStreamRepairs, delta.coldFactVisits, delta.factSortComparisons, warmIndexBuilds, delta.selectorChanges,
@@ -299,14 +297,12 @@ for (const n of [100, 200, 400, 1000, 2000, 4000]) test(`A2-PROBE one retired ex
   } finally { await f.close(); }
 });
 
-test("A2-API-PROBE existing shared ingest positive metadata capability (not a TUI repair)", () => {
+test("A2-08 shared ingest accepts positive metadata refinements with matching business identity", () => {
   const input = scenario([["m1", 10, 30], ["m2", 40, 70], ["normal", 80, 90]]), projector = createActivityProjector(input.facts);
   const refined = new Set<string>(), samples = [{ actual: projector.totals("root", { replayCutoff: 1000 }).includingMilliseconds, reference: input.reference(refined) }];
-  const before = activityProjectionDiagnostics(projector);
   for (const id of ["m1", "m2"]) {
     projector.ingest([input.proof(id, true)]); refined.add(id);
     samples.push({ actual: projector.totals("root", { replayCutoff: 1000 }).includingMilliseconds, reference: input.reference(refined) });
   }
-  const after = activityProjectionDiagnostics(projector), delta = Object.fromEntries(Object.keys(before).map((key) => [key, Number((after as any)[key]) - Number((before as any)[key])]));
-  console.log(`A2-API-PROBE ${JSON.stringify({ samples, delta })}`); assert.ok(samples.every((sample) => sample.actual === sample.reference));
+  assert.ok(samples.every((sample) => sample.actual === sample.reference));
 });
