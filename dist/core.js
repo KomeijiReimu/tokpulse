@@ -1,5 +1,4 @@
 export const DEFAULT_BYTES_PER_TOKEN = 5.5;
-export const DEFAULT_ROLLING_WINDOW_MS = 10_000;
 export const MIN_ROLLING_OBSERVATION_MS = 1_000;
 export const HISTORY_VERSION = 1;
 export function emptyTokenCounts() {
@@ -63,117 +62,6 @@ export function bytesToTokens(bytes, bytesPerToken = DEFAULT_BYTES_PER_TOKEN) {
   return bytes / bytesPerToken;
 }
 export const estimateTokensFromBytes = bytesToTokens;
-export function createSpeedSample(bytes, timestamp = Date.now(), kind = "output", bytesPerToken = DEFAULT_BYTES_PER_TOKEN) {
-  const estimatedTokens = bytesToTokens(bytes, bytesPerToken);
-  return {
-    timestamp: finiteNumber(timestamp, Date.now()),
-    tokens: estimatedTokens,
-    estimatedTokens,
-    bytes: Math.max(0, finiteNumber(bytes, 0)),
-    kind
-  };
-}
-export function appendSpeedSample(samples, sample, windowMs = DEFAULT_ROLLING_WINDOW_MS) {
-  const next = [...samples, sample].sort((left, right) => left.timestamp - right.timestamp);
-  if (!Number.isFinite(windowMs) || windowMs <= 0 || next.length === 0) return next;
-  const newest = next[next.length - 1].timestamp;
-  const cutoff = newest - windowMs;
-  // Retain the entire equal-timestamp predecessor batch for interpolation.
-  const predecessor = next.filter(entry => entry.timestamp < cutoff).at(-1)?.timestamp;
-  return next.filter(entry => entry.timestamp >= cutoff || entry.timestamp === predecessor);
-}
-/** Local, immutable-to-consumers normalization shared by LIVE and extrema. */
-function normalizeArrivalPoints(samples, now, windowMs) {
-  const ordered = samples.filter(sample => Number.isFinite(sample.timestamp)).sort((left, right) => left.timestamp - right.timestamp);
-  const points = [];
-  const referenceNow = now ?? ordered.at(-1)?.timestamp;
-  const result = {
-    points,
-    referenceNow
-  };
-  if (referenceNow === undefined || !Number.isFinite(referenceNow) || windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs < 0)) return result;
-  for (const sample of ordered) {
-    if (sample.timestamp > referenceNow) break;
-    result.latestObservationAt = sample.timestamp;
-    const tokens = nonNegativeNumber(sample.estimatedTokens ?? sample.tokens);
-    if (tokens > 0) result.latestTokenAt = sample.timestamp;
-    const previous = points.at(-1);
-    if (previous?.timestamp === sample.timestamp) previous.tokens += tokens;else {
-      if (previous && windowMs !== undefined && sample.timestamp - previous.timestamp > windowMs) points.length = 0;
-      points.push({
-        timestamp: sample.timestamp,
-        tokens
-      });
-    }
-  }
-  return result;
-}
-
-/**
- * Measures token arrivals, not the model's precise generation speed. The first
- * timestamp is a cumulative-count baseline (its unknown batch is excluded).
- * Later batches are spread uniformly across the preceding arrival interval;
- * a left-edge crossing takes only the overlapping fraction, not a whole-batch
- * deletion. Silence extends the denominator, never the numerator. A full-window
- * arrival gap starts a new warmup; we do not interpolate across inactive gaps.
- * Equal timestamps merge. Final usage calibration does not improve arrival
- * timing: estimatedTokens, where present, remain the numerator for LIVE/peaks.
- */
-export function measureRollingTokenRate(samples, now, windowMs = DEFAULT_ROLLING_WINDOW_MS) {
-  const empty = {
-    status: "warming",
-    rate: 0,
-    elapsedMs: 0,
-    observedTokens: 0,
-    observationCount: 0
-  };
-  const {
-    points,
-    referenceNow,
-    latestObservationAt,
-    latestTokenAt
-  } = normalizeArrivalPoints(samples, now, windowMs);
-  if (referenceNow === undefined || !Number.isFinite(referenceNow) || !Number.isFinite(windowMs) || windowMs < 0) return empty;
-  const cutoff = referenceNow - windowMs;
-  const baseline = points.length > 0 ? Math.max(cutoff, points[0].timestamp) : referenceNow;
-  const elapsedMs = referenceNow - baseline;
-  let observedTokens = 0;
-  let observationCount = points.filter(point => point.timestamp >= cutoff).length;
-  // The predecessor is a real timestamp supporting the interpolated boundary.
-  if (points.some(point => point.timestamp < cutoff) && (points.find(point => point.timestamp >= cutoff)?.timestamp ?? cutoff) > cutoff) observationCount += 1;
-  for (let index = 1; index < points.length; index += 1) {
-    const previous = points[index - 1];
-    const point = points[index];
-    if (point.timestamp <= baseline) continue;
-    const fraction = (point.timestamp - Math.max(baseline, previous.timestamp)) / (point.timestamp - previous.timestamp);
-    observedTokens += point.tokens * fraction;
-  }
-  const measurement = {
-    ...empty,
-    elapsedMs,
-    observedTokens,
-    observationCount
-  };
-  const lastActivityAt = latestTokenAt ?? latestObservationAt;
-  if (lastActivityAt !== undefined && referenceNow - lastActivityAt >= windowMs) {
-    return {
-      ...measurement,
-      status: "inactive"
-    };
-  }
-  if (observationCount < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) return measurement;
-  const rate = observedTokens / elapsedMs * 1000;
-  if (!Number.isFinite(elapsedMs) || !Number.isFinite(rate)) return measurement;
-  return {
-    ...measurement,
-    status: "ready",
-    rate
-  };
-}
-export function rollingTokenRate(samples, now, windowMs = DEFAULT_ROLLING_WINDOW_MS) {
-  return measureRollingTokenRate(samples, now, windowMs).rate;
-}
-export const calculateRollingRate = rollingTokenRate;
 export function calculateRateStats(values) {
   const valid = values.filter(value => Number.isFinite(value) && value >= 0);
   if (valid.length === 0) return {
@@ -186,51 +74,6 @@ export function calculateRateStats(values) {
     avg: total / valid.length,
     max: Math.max(...valid),
     min: Math.min(...valid)
-  };
-}
-export function calculateSpeedStats(samples) {
-  const {
-    points
-  } = normalizeArrivalPoints(samples);
-  const prefix = [];
-  const rates = [];
-  let segmentStart = 0;
-  let left = 0;
-  let latestTokenAt;
-  // Peaks/troughs are supported rolling windows ending at actual observations,
-  // not arbitrary adjacent-chunk rates or a response-average fallback. One sort,
-  // then a linear moving boundary; prefix sums exclude each segment's baseline.
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
-    if (index > 0 && point.timestamp - points[index - 1].timestamp > DEFAULT_ROLLING_WINDOW_MS) {
-      segmentStart = index;
-      left = index;
-    }
-    prefix[index] = index === segmentStart ? 0 : prefix[index - 1] + point.tokens;
-    if (point.tokens > 0) latestTokenAt = point.timestamp;
-    const cutoff = point.timestamp - DEFAULT_ROLLING_WINDOW_MS;
-    while (points[left].timestamp < cutoff) left += 1;
-    const elapsedMs = point.timestamp - Math.max(cutoff, points[segmentStart].timestamp);
-    const interpolated = left > segmentStart && points[left].timestamp > cutoff;
-    const observationCount = index - left + 1 + Number(interpolated);
-    if (point.timestamp - (latestTokenAt ?? point.timestamp) >= DEFAULT_ROLLING_WINDOW_MS || observationCount < 2 || elapsedMs < MIN_ROLLING_OBSERVATION_MS) continue;
-    let observedTokens = prefix[index] - prefix[left];
-    if (interpolated) observedTokens += points[left].tokens * ((points[left].timestamp - cutoff) / (points[left].timestamp - points[left - 1].timestamp));
-    // Rare overflowing/huge token sums cannot safely be subtracted. Preserve the
-    // original per-window finite-rate decision rather than poisoning later windows.
-    if (!Number.isFinite(observedTokens) || prefix[index] > Number.MAX_SAFE_INTEGER || prefix[left] > Math.abs(observedTokens) * 10_000) {
-      const measurement = measureRollingTokenRate(samples, point.timestamp);
-      if (measurement.status === "ready") rates.push(measurement.rate);
-      continue;
-    }
-    const rate = observedTokens / elapsedMs * 1000;
-    if (Number.isFinite(elapsedMs) && Number.isFinite(rate)) rates.push(rate);
-  }
-  return {
-    ...calculateRateStats(rates),
-    available: rates.length > 0,
-    extremaAvailable: rates.length > 0,
-    estimated: true
   };
 }
 export function timeToFirstToken(record) {
