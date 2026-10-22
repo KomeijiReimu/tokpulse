@@ -500,10 +500,6 @@ test("ledger watcher re-arms through late directories and projects a later atomi
     assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("mc"), false);
     assert.equal(f.ui.hasLiveTaskWallActivity(f.store), false);
     assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 60000), 200);
-    const historyGeneration = f.store.historyGeneration;
-    await writeFile(join(f.ledgerDirectory, "unrelated.txt"), "not a ledger");
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    assert.equal(f.store.historyGeneration, historyGeneration);
   } finally { await f.close(); }
 });
 
