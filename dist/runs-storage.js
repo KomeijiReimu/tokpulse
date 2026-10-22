@@ -1,7 +1,7 @@
 import { appendLedgerText, inspectLedgerFile, openLedgerFile, readLedgerText, replaceLedgerText } from "./persistence-files.js";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { dedupeActivityEvents, normalizeActivityEvent, replayActivity, filterActivityEvents } from "./activity.js";
+import { dedupeActivityEvents, normalizeActivityEvent, normalizeActivityEvents, replayActivity, filterActivityEvents } from "./activity.js";
 export const DEFAULT_RUNS_FILENAME = "runs.jsonl";
 const activityReadCursorBrand = Symbol("ActivityReadCursor");
 /** Opaque immutable checkpoint. Save only after applying a current-generation result. */
@@ -176,13 +176,13 @@ export function parseActivityJsonl(content, options = {}) {
     const line = index === 0 ? rawLine.replace(/^\uFEFF/, "") : rawLine;
     if (!line.trim()) continue;
     try {
-      const event = normalizeActivityEvent(JSON.parse(line));
-      if (event) parsed.push(event);
+      parsed.push(JSON.parse(line));
     } catch {
       // A partial final line or a corrupt line must not hide valid facts.
     }
   }
-  const events = options.dedupe === false ? parsed : dedupeActivityEvents(parsed);
+  // Both paths normalize exactly once; dedupe already validates its inputs.
+  const events = options.dedupe === false ? normalizeActivityEvents(parsed) : dedupeActivityEvents(parsed);
   if (!options.sessionScopes && !options.parentBySessionID) return events;
   const eligible = new Set(filterActivityEvents(events, options.sessionScopes, options.parentBySessionID).map(event => event.sessionID));
   return events.filter(event => eligible.has(event.sessionID) && event.scope?.sourceScope !== "magic-message");

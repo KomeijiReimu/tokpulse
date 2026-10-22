@@ -42,6 +42,7 @@ export function normalizeActivityEvent(value) {
   const explicitKind = value.kind;
   const kind = explicitKind === "lifecycle" || explicitKind === "parent" || explicitKind === "work" || explicitKind === "execution-scope" ? explicitKind : explicitKind === undefined ? inferEventKind(value) : undefined;
   if (!kind) return undefined;
+  const scope = coerceScopeEvidence(value.scope);
   const common = {
     version: value.version === 1 ? 1 : ACTIVITY_VERSION,
     kind,
@@ -58,8 +59,8 @@ export function normalizeActivityEvent(value) {
     ...(lastObservedAt === undefined ? {} : {
       lastObservedAt
     }),
-    ...(coerceScopeEvidence(value.scope) ? {
-      scope: coerceScopeEvidence(value.scope)
+    ...(scope ? {
+      scope
     } : {}),
     ...(nonEmptyString(value.executionID) ? {
       executionID: value.executionID

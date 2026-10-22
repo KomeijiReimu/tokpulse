@@ -289,6 +289,7 @@ export function normalizeActivityEvent(value: unknown): ActivityEvent | undefine
       : undefined;
   if (!kind) return undefined;
 
+  const scope = coerceScopeEvidence(value.scope);
   const common = {
     version: (value.version === 1 ? 1 : ACTIVITY_VERSION) as 1 | 2,
     kind,
@@ -299,7 +300,7 @@ export function normalizeActivityEvent(value: unknown): ActivityEvent | undefine
     ...(seq === undefined ? {} : { seq }),
     ...(instanceEndedAt === undefined ? {} : { instanceEndedAt }),
     ...(lastObservedAt === undefined ? {} : { lastObservedAt }),
-    ...(coerceScopeEvidence(value.scope) ? { scope: coerceScopeEvidence(value.scope) } : {}),
+    ...(scope ? { scope } : {}),
     ...(nonEmptyString(value.executionID) ? { executionID: value.executionID } : {}),
     ...(nonEmptyString(value.sourceEventID) ? { sourceEventID: value.sourceEventID } : {}),
     ...(Number.isSafeInteger(value.sourceSequence) ? { sourceSequence: value.sourceSequence } : {}),
