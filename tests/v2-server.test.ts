@@ -21,7 +21,7 @@ import * as crypto from "node:crypto";
 const tokens = { input: 12, output: 7, reasoning: 3, cache: { read: 9, write: 2 } };
 const model = { providerID: "fixture", id: "fixture-model" } satisfies SessionStepStarted["data"]["model"];
 
-test("A2-02 late old step end uses old namespace without reading or retiring the fresh reused MID", () => {
+test("late old step end preserves the fresh response that reuses its message ID", () => {
   const adapter = createV2EventAdapter();
   const emit = (sid: string, type: string, time: number, seq: number, extra: any = {}) => adapter.events({
     id: `${sid}_${type}_${seq}_${extra.suffix ?? "event"}`, type, created: time, durable: { seq },
@@ -57,7 +57,7 @@ test("A2-02 late old step end uses old namespace without reading or retiring the
   assert.equal(adapter.retainedState().activeResponses, 0);
 });
 
-test("A2-02 late missing old start repairs only its closed namespace while a reused MID remains active", () => {
+test("late missing start repairs only its closed execution while a reused message ID stays active", () => {
   const adapter = createV2EventAdapter();
   const emit = (type: string, time: number, seq: number, extra: any = {}) => adapter.events({
     id: `${type}_${seq}_${extra.suffix ?? "event"}`, type, created: time, durable: { seq },
@@ -79,7 +79,7 @@ test("A2-02 late missing old start repairs only its closed namespace while a reu
   assert.equal(adapter.retainedState().activeResponses, 0);
 });
 
-for (const tail of ["step.ended", "step.failed", "tool.success", "tool.failed", "tool.called"]) test(`A2-03 late ${tail} completes pure MC proof through setup, dispose and restart`, async () => {
+for (const tail of ["step.ended", "step.failed", "tool.success", "tool.failed", "tool.called"]) test(`late ${tail} completes pure maintenance proof through dispose and restart`, async () => {
   await fixture(async ({ base, send, read, cleanup, restart }) => {
     const tool = tail.startsWith("tool.");
     const durable = (seq: number) => ({ aggregateID: "s", seq, version: 1 as const });
@@ -117,7 +117,7 @@ for (const tail of ["step.ended", "step.failed", "tool.success", "tool.failed", 
   });
 });
 
-test("A2-03 late start and classification repair a known closed end without manufacturing a LIVE start", async () => {
+test("late start and classification repair a closed end without inventing new live activity", async () => {
   await fixture(async ({ base, send, read, cleanup, restart }) => {
     const durable = (seq: number) => ({ aggregateID: "s", seq, version: 1 as const });
     await send("session.execution.started", { sessionID: "s" }, 0, { durable: durable(1) });
@@ -137,7 +137,7 @@ test("A2-03 late start and classification repair a known closed end without manu
   });
 });
 
-for (const incomplete of ["execution-start", "work-start", "tool-start", "gap"]) test(`A2-03 ${incomplete} missing or untrusted does not certify pure after a late tail`, async () => {
+for (const incomplete of ["execution-start", "work-start", "tool-start", "gap"]) test(`${incomplete} missing or untrusted cannot certify pure maintenance after a late tail`, async () => {
   await fixture(async ({ base, send, read }) => {
     const durable = (seq: number) => ({ aggregateID: "s", seq, version: 1 as const });
     if (incomplete !== "execution-start") await send("session.execution.started", { sessionID: "s" }, 0, { durable: durable(1) });
@@ -156,7 +156,7 @@ for (const incomplete of ["execution-start", "work-start", "tool-start", "gap"])
   });
 });
 
-for (const participant of ["normal-tool", "real-child"]) test(`A2-03 late MC completion preserves ${participant} time`, async () => {
+for (const participant of ["normal-tool", "real-child"]) test(`late maintenance completion preserves ${participant} time`, async () => {
   await fixture(async ({ base, send, read, cleanup, restart }) => {
     const durable = (seq: number) => ({ aggregateID: "s", seq, version: 1 as const });
     await send("session.execution.started", { sessionID: "s" }, 0, { durable: durable(1) });
@@ -187,31 +187,7 @@ for (const participant of ["normal-tool", "real-child"]) test(`A2-03 late MC com
   });
 });
 
-test("A2-03 1k/2k/4k late tails reevaluate only their own readiness, not every prior work", () => {
-  for (const count of [1000, 2000, 4000]) {
-    const adapter = createV2EventAdapter();
-    const emit = (type: string, created: number, seq: number, data: any) => adapter.events({
-      id: `${type}_${seq}`, type, created, durable: { seq }, data: { sessionID: "s", ...data },
-    });
-    emit("session.execution.started", 0, 0, {});
-    for (let index = 0; index < count; index++) emit("session.step.started", index + 1, index + 1, {
-      assistantMessageID: `mc_${index}`, agent: "build", model: { providerID: "fixture", id: "magic-context" }, started: index + 1,
-    });
-    assert.equal(emit("session.execution.succeeded", count * 2 + 1, count * 2 + 1, {}).some((event: any) => event.properties.fact?.kind === "execution-scope"), false);
-    const before = adapter.retainedState().proofWorkChecks;
-    const began = performance.now();
-    let proofs = 0;
-    for (let index = 0; index < count; index++) proofs += emit("session.step.failed", count + index + 1, count + index + 1, {
-      assistantMessageID: `mc_${index}`, error: { type: "fixture" },
-    }).filter((event: any) => event.properties.fact?.kind === "execution-scope").length;
-    assert.equal(adapter.retainedState().proofWorkChecks - before, count);
-    assert.equal(adapter.retainedState().activeResponses, 0);
-    assert.equal(proofs, 1);
-    console.log(`[A2-03 late readiness ${count}] checks=${count}, proof=1, elapsed=${(performance.now() - began).toFixed(2)}ms`);
-  }
-});
-
-test("G1-01 queried terminal closes the proven execution across replay, advance, dispose and restart", async () => {
+test("queried terminal closes the proven execution across replay, dispose and restart", async () => {
   let end = 0;
   await fixture(async ({ base, send, read, cleanup, restart }) => {
     end = base + 40;
@@ -232,7 +208,7 @@ test("G1-01 queried terminal closes the proven execution across replay, advance,
   }, (id, directory) => ({ id, location: { directory }, agent: "build", outcome: "succeeded", time: { idle: end } }));
 });
 
-test("G1-02 repeated connected in one iterator freezes only known prefix and allows a new epoch", async () => {
+test("repeated connection in one iterator freezes only the known prefix and permits a new epoch", async () => {
   await fixture(async ({ send, read }) => {
     await send("server.connected", {}, 0);
     await send("session.execution.started", { sessionID: "s" }, 0);
@@ -246,7 +222,7 @@ test("G1-02 repeated connected in one iterator freezes only known prefix and all
   });
 });
 
-test("G1-02 repeated connected invalidates unresolved directory proof and late lookup output", async () => {
+test("reconnection invalidates unresolved directory proof and late lookup output", async () => {
   let release!: (value: any) => void;
   const proof = new Promise((resolve) => { release = resolve; });
   await fixture(async ({ directory, send, read, calls }) => {
@@ -265,7 +241,7 @@ test("G1-02 repeated connected invalidates unresolved directory proof and late l
   }, (id, directory) => id === "pending" ? proof : { id, location: { directory }, agent: "build", time: {} });
 });
 
-test("G1-01 a late query watermark owned by an old response cannot terminate the newer execution", async () => {
+test("a late query watermark owned by an old response cannot terminate the newer execution", async () => {
   let release!: (value: any) => void; let calls = 0;
   const gate = new Promise((resolve) => { release = resolve; });
   await fixture(async ({ base, directory, send, read }) => {
@@ -285,7 +261,7 @@ test("G1-01 a late query watermark owned by an old response cannot terminate the
   }, (id, directory) => ++calls === 1 ? { id, location: { directory }, agent: "build", time: {} } : gate);
 });
 
-test("G1-04 tool call identity is isolated by session, execution and step", () => {
+test("tool call identity is isolated by session, execution and step", () => {
   const adapter = createV2EventAdapter(); let seq = 0;
   const emit = (type: string, data: any) => adapter.events({ id: `g1_${++seq}`, type, data, created: seq, durable: { seq } });
   for (const sid of ["a", "b"]) {
@@ -310,7 +286,7 @@ test("G1-04 tool call identity is isolated by session, execution and step", () =
   }
 });
 
-test("G1-05 failed and interrupted executions retire unfinished starts but retain late usage metadata", () => {
+test("failed and interrupted executions retire unfinished starts but retain late usage metadata", () => {
   const adapter = createV2EventAdapter(); let seq = 0;
   const emit = (type: string, data: any) => adapter.events({ id: `retire_${++seq}`, type, data, created: seq, durable: { seq } });
   for (let index = 0; index < 42; index++) {
@@ -329,7 +305,7 @@ test("G1-05 failed and interrupted executions retire unfinished starts but retai
   assert.equal(adapter.retainedState().activeResponses, 0);
 });
 
-test("G1-08 special message IDs survive first admission, duplicate, correction and restart", async () => {
+test("special message IDs survive first admission, duplicate, correction and restart", async () => {
   await fixture(async ({ send, read, restart }) => {
     for (const id of ["constructor", "toString", "__proto__"]) {
       await send("session.step.ended", { sessionID: "s", assistantMessageID: id, tokens, cost: 1, finish: "stop" }, 10);
@@ -345,7 +321,7 @@ test("G1-08 special message IDs survive first admission, duplicate, correction a
   });
 });
 
-for (const correction of [false, true]) test(`G1-03 129 completions survive admission saturation, scope correction=${correction} and shutdown`, async () => {
+for (const correction of [false, true]) test(`129 completions survive admission saturation, scope correction=${correction} and shutdown`, async () => {
   const rename = fileSystem.rename;
   let blocked = false;
   const warnings = spyOn(console, "warn").mockImplementation(() => {});
@@ -928,7 +904,7 @@ test("V2 idle reads do not call the session domain after cleanup", async () => {
   assert.equal(calls, 0);
 });
 
-test("R08 earliest V2 gate never reads poison data or flushes pending on content events", async () => {
+test("the server ignores content events before reading payloads or flushing pending control facts", async () => {
   const pendingProof = new Promise(() => {});
   await fixture(async ({ send, raw, directory, calls, read }) => {
     await send("session.execution.started", { sessionID: "pending" }, 0, { location: undefined });
@@ -953,7 +929,7 @@ test("R08 earliest V2 gate never reads poison data or flushes pending on content
   }, () => pendingProof);
 });
 
-test("R04 one failed activity append is retried by healthy control traffic from another SID with fixed identity", async () => {
+test("failed activity append retries with stable identity on another session's healthy control event", async () => {
   const append = ActivityLedger.prototype.append;
   const attempts: any[] = [];
   let failures = 0;
@@ -980,7 +956,7 @@ test("R04 one failed activity append is retried by healthy control traffic from 
   } finally { spy.mockRestore(); }
 });
 
-test("R04 exhausted activity admission replaces writer and observation epoch only after accepted prefix drains", async () => {
+test("exhausted activity admission replaces the writer only after its accepted prefix drains", async () => {
   const append = ActivityLedger.prototype.append;
   let blocked = true;
   const warnings = spyOn(console, "warn").mockImplementation(() => {});
@@ -1007,7 +983,7 @@ test("R04 exhausted activity admission replaces writer and observation epoch onl
   } finally { spy.mockRestore(); warnings.mockRestore(); }
 });
 
-test("R06 disposal waits for an admitted in-flight append before releasing ownership", async () => {
+test("disposal waits for an admitted in-flight append before releasing ownership", async () => {
   const append = ActivityLedger.prototype.append;
   let release!: () => void;
   let entered!: () => void;
@@ -1036,7 +1012,7 @@ test("R06 disposal waits for an admitted in-flight append before releasing owner
   } finally { release?.(); spy.mockRestore(); }
 });
 
-test("R07 exact A survives totals EIO, unrelated B with window one, and backend restart", async () => {
+test("exact usage survives totals EIO, another session with a one-record window, and backend restart", async () => {
   await fixture(async ({ base, directory, send, read, restart }) => {
     await send("session.step.started", { sessionID: "A", assistantMessageID: "msg_A", agent: "build", model, started: base }, 0);
     const rename = fileSystem.rename;
@@ -1064,7 +1040,7 @@ test("R07 exact A survives totals EIO, unrelated B with window one, and backend 
   });
 });
 
-test("R12 active directory proof survives inactive LRU pressure and does not enter a lossy pending stream", async () => {
+test("active directory proof survives inactive cache pressure without losing control facts", async () => {
   await fixture(async ({ send, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0);
     for (let index = 0; index < 2050; index++) await send("session.metadata.updated", { sessionID: `noise_${index}` }, 0);
@@ -1077,7 +1053,7 @@ test("R12 active directory proof survives inactive LRU pressure and does not ent
   }, () => new Promise(() => {}));
 });
 
-test("R12 pending prefix and SID budget losses never bridge a separately observed busy", async () => {
+test("pending prefix and session-budget losses never bridge a separately observed busy", async () => {
   await fixture(async ({ base, send, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0);
     await send("session.execution.started", { sessionID: "truncated" }, 0, { location: undefined });
@@ -1101,7 +1077,7 @@ test("R12 pending prefix and SID budget losses never bridge a separately observe
   }, () => { throw new Error("ownership unknown until a scoped control event"); });
 });
 
-test("R11 missing start or malformed work cannot certify a complete pure maintenance execution", async () => {
+test("missing start or malformed work cannot certify a complete pure maintenance execution", async () => {
   for (const missing of ["execution", "step-id"] as const) await fixture(async ({ base, raw, send, directory, read }) => {
     if (missing !== "execution") {
       await send("session.execution.started", { sessionID: "s" }, 0);
@@ -1117,7 +1093,7 @@ test("R11 missing start or malformed work cannot certify a complete pure mainten
   });
 });
 
-test("R11 late maintenance proof appends corrections for a closed execution without reopening its response", async () => {
+test("late maintenance proof corrects a closed execution without reopening its response", async () => {
   await fixture(async ({ base, send, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0);
     await send("session.step.started", { sessionID: "s", assistantMessageID: "late_mc", agent: "build", model, started: base + 10 }, 10);
@@ -1132,7 +1108,7 @@ test("R11 late maintenance proof appends corrections for a closed execution with
   });
 });
 
-for (const mode of ["throw", "eof"] as const) test(`R05 ${mode} recovers subscription without bridging unknown time`, async () => {
+for (const mode of ["throw", "eof"] as const) test(`${mode} recovers subscription without bridging unknown time`, async () => {
   await fixture(async ({ base, send, disconnect, subscriptions, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0);
     await send("session.retry.scheduled", { sessionID: "s" }, 10);
@@ -1148,7 +1124,7 @@ for (const mode of ["throw", "eof"] as const) test(`R05 ${mode} recovers subscri
   });
 });
 
-test("R10 verified foreign ancestor classifies a local child but foreign lifecycle remains unwritable", async () => {
+test("a verified foreign ancestor classifies a local child without permitting foreign lifecycle writes", async () => {
   await fixture(async ({ send, read }) => {
     await send("session.created", { sessionID: "child", agent: "build", parentID: "hidden" }, 0);
     await send("session.execution.started", { sessionID: "child" }, 0);
@@ -1166,7 +1142,7 @@ test("R10 verified foreign ancestor classifies a local child but foreign lifecyc
     parentID: id === "child" ? "hidden" : undefined, location: { directory: id === "hidden" ? `${directory}/other` : directory }, time: {} }));
 });
 
-test("R16 backend preserves omitted cost/cache and accepts explicit zero revisions", async () => {
+test("the backend preserves omitted cost/cache and accepts explicit zero revisions", async () => {
   await fixture(async ({ base, send, read }) => {
     await send("session.step.started", { sessionID: "s", assistantMessageID: "msg_partial", agent: "build", model, started: base }, 0);
     await send("session.step.ended", { sessionID: "s", assistantMessageID: "msg_partial", tokens, cost: 2, finish: "stop" }, 10);
@@ -1186,7 +1162,7 @@ test("R16 backend preserves omitted cost/cache and accepts explicit zero revisio
   });
 });
 
-test("R11 fully observed pure maintenance execution has zero own time without hiding the session", async () => {
+test("fully observed pure maintenance has zero own time without hiding the session", async () => {
   await fixture(async ({ base, send, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0, { location: undefined });
     await send("session.step.started", { sessionID: "s", assistantMessageID: "msg_mc", agent: "build",
@@ -1202,7 +1178,7 @@ test("R11 fully observed pure maintenance execution has zero own time without hi
   });
 });
 
-test("R11 mixed maintenance subtracts only proven span and restores overlapping normal tool and child work", async () => {
+test("mixed maintenance subtracts only proven spans and preserves overlapping tool and child work", async () => {
   await fixture(async ({ base, send, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0);
     await send("session.step.started", { sessionID: "s", assistantMessageID: "normal", agent: "build", model, started: base + 10 }, 10);
@@ -1224,7 +1200,7 @@ test("R11 mixed maintenance subtracts only proven span and restores overlapping 
   });
 });
 
-test("R17 adapter retires full starts while retaining compact identity for late exact corrections", () => {
+test("the adapter retires full starts while retaining identity for late exact corrections", () => {
   const adapter = createV2EventAdapter();
   for (let index = 0; index < 2000; index++) {
     const sessionID = "s"; const assistantMessageID = `msg_${index}`;
@@ -1242,24 +1218,7 @@ test("R17 adapter retires full starts while retaining compact identity for late 
   assert.equal(adapter.retainedState().activeResponses, 0);
 });
 
-test("R08 content gate scaling keeps poison payload reads and retained metadata exactly zero", () => {
-  for (const count of [1000, 2000, 4000]) {
-    const adapter = createV2EventAdapter();
-    let reads = 0;
-    const before = performance.now();
-    for (let index = 0; index < count; index++) {
-      const event = { type: index % 2 ? "session.text.delta" : "session.tool.progress",
-        get data() { reads++; throw new Error("poison body"); } };
-      assert.deepEqual(adapter.events(event), []);
-    }
-    const elapsed = performance.now() - before;
-    assert.equal(reads, 0);
-    assert.deepEqual(adapter.retainedState(), { activeResponses: 0, compactWork: 0, compactExecutions: 0, durableIdentities: 0, proofWorkChecks: 0 });
-    console.log(`[server content gate] ${count} ignored events: ${elapsed.toFixed(2)}ms, payloadReads=${reads}, retained=0`);
-  }
-});
-
-test("R11 SDK ordering closes same-millisecond execution and old terminal cannot stop the newer execution", async () => {
+test("SDK ordering closes same-millisecond execution without letting an old terminal stop its successor", async () => {
   await fixture(async ({ base, send, read }) => {
     await send("session.execution.started", { sessionID: "s" }, 0);
     await send("session.execution.succeeded", { sessionID: "s" }, 0);

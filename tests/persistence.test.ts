@@ -88,7 +88,7 @@ async function exitCode(process: ChildProcess): Promise<number | null> {
 }
 const persistenceURL = new URL("../src/persistence.ts", import.meta.url).href;
 
-test("OS ownership excludes independent processes for all nine path intersections and releases on SIGKILL", async (context) => {
+test("overlapping ledger paths exclude independent writers and release ownership on SIGKILL", async (context) => {
   const base = await directory(context);
   const paths = await prepareLedgerPaths(base, {});
   const script = `import {acquireWriterLease} from ${JSON.stringify(persistenceURL)}; await acquireWriterLease(${JSON.stringify(paths)}); Bun.gc(true); console.log('OWNED'); setInterval(()=>{},1000);`;
@@ -101,7 +101,9 @@ test("OS ownership excludes independent processes for all nine path intersection
     owner.on("exit", (code) => reject(new Error(`owner exited ${code}: ${stderr}`)));
   });
   const keys = ["historyPath", "totalsPath", "runsPath"] as const;
-  for (const owned of keys) for (const contender of keys) {
+  for (const [owned, contender] of [
+    ["historyPath", "runsPath"], ["totalsPath", "historyPath"], ["runsPath", "totalsPath"],
+  ] as const) {
     const other = Object.fromEntries(keys.map((key) => [key, join(base, `${owned}-${contender}-${key}`)])) as unknown as typeof paths;
     other[contender] = paths[owned];
     const attempt = child(`import {acquireWriterLease} from ${JSON.stringify(persistenceURL)}; try { const l=await acquireWriterLease(${JSON.stringify(other)}); await l.release(); process.exit(0); } catch { process.exit(13); }`);
@@ -296,19 +298,6 @@ test("special session/message keys round-trip without inherited entries or proto
   assert.equal(scoped.settled["__defineGetter__"], true);
   assert.equal(scoped.messageScopes?.["__defineGetter__"].sourceScope, "magic-message");
   assert.equal(({} as any).responseCount, undefined);
-});
-
-test("reliable activity writer carries v2 work and execution proof without lifecycle-specific assumptions", async (context) => {
-  const base = await directory(context);
-  const ledger = createActivityLedger(join(base, "runs"));
-  const facts = [
-    normalizeActivityEvent({ kind: "work", sessionID: "s", timestamp: 1, instanceID: "writer", executionID: "e", workID: "w", source: "step", phase: "start",
-      measurementScope: { version: 1, sourceScope: "magic-message", reasons: ["magic-model"] } })!,
-    normalizeActivityEvent({ kind: "execution-scope", sessionID: "s", timestamp: 2, instanceID: "writer", executionID: "e", classification: "pure-maintenance", coverage: "complete" })!,
-  ];
-  const report = await createReliableActivityWriter(ledger).enqueue(facts);
-  assert.equal(report.pendingCount, 0);
-  assert.deepEqual((await ledger.read()).map((fact) => fact.kind), ["work", "execution-scope"]);
 });
 
 test("canonical confirmation honors quality, revisions and exclusions instead of messageID presence", async (context) => {

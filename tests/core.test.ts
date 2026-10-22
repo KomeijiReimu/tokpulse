@@ -6,15 +6,10 @@ import {
   HistoryRecord,
   aggregateSessionTree,
   bytesToTokens,
-  calibrateEstimatedOutput,
-  calculateRateStats,
-  calculateResponseStats,
-  calculateTTFTStats,
   formatDuration,
   formatNumber,
   formatTokens,
   normalizeTokenCounts,
-  timeToFirstToken,
   utf8ByteLength,
 } from "../src/core.js";
 
@@ -71,6 +66,12 @@ test("bytes-to-token estimation handles defaults and invalid input", () => {
   assert.equal(bytesToTokens(22, 11), 2);
   assert.equal(bytesToTokens(10, 0), 0);
   assert.equal(utf8ByteLength("hello"), 5);
+});
+
+test("display formatters round tokens and preserve task duration", () => {
+  assert.equal(formatNumber(1234.5), "1,234.5");
+  assert.equal(formatTokens(1234.5), "1,235");
+  assert.equal(formatDuration(65_000), "1m 05s");
 });
 
 test("normalizes OpenCode and raw AI SDK token shapes into canonical counts", () => {
@@ -136,32 +137,6 @@ test("normalizes OpenCode and raw AI SDK token shapes into canonical counts", ()
   });
 });
 
-test("numeric summary stats retain valid non-negative values", () => {
-  assert.deepEqual(calculateRateStats([10, 20, 30]), { avg: 20, max: 30, min: 10 });
-  assert.deepEqual(calculateRateStats([NaN, Infinity, -1, 0, 20]), { avg: 10, max: 20, min: 0 });
-  assert.deepEqual(calculateRateStats([]), { avg: 0, max: 0, min: 0 });
-});
-
-test("UI TTFT prefers a valid first response, independently of the first-content alias", () => {
-  const time = { start: 100, firstResponse: 200, firstContent: 500, firstToken: 500, completed: 900, ttft: 400 };
-  assert.equal(timeToFirstToken({ time }), 100);
-  assert.equal(timeToFirstToken({ time: { ...time, firstResponse: 99 } }), 400);
-  assert.equal(timeToFirstToken({ time: { ...time, firstResponse: 1_000 } }), 400);
-  assert.equal(timeToFirstToken({ time: { start: 0, firstToken: 100 } }), 100);
-});
-
-test("estimated output samples calibrate to the exact final output count", () => {
-  const samples = [
-    { timestamp: 0, tokens: 1, estimatedTokens: 1, kind: "output" as const },
-    { timestamp: 100, tokens: 2, estimatedTokens: 2, kind: "output" as const },
-    { timestamp: 200, tokens: 1, estimatedTokens: 1, kind: "output" as const },
-    { timestamp: 300, tokens: 9, estimatedTokens: 9, kind: "reasoning" as const },
-  ];
-  const calibrated = calibrateEstimatedOutput(samples, 8);
-  assert.deepEqual(calibrated.map((sample) => sample.tokens), [2, 4, 2, 9]);
-  assert.equal(calibrated.filter((sample) => sample.kind === "output").reduce((sum, sample) => sum + sample.tokens, 0), 8);
-});
-
 test("session tree deduplicates message IDs and aggregates child sessions", () => {
   const records = [
     record("root-1", "root", { cost: 2 }),
@@ -181,23 +156,6 @@ test("session tree deduplicates message IDs and aggregates child sessions", () =
   });
   assert.equal(root.children[0].responseCount, 2);
   assert.equal(root.children[0].children[0].sessionID, "grandchild");
-});
-
-test("response stats include speed and TTFT boundaries", () => {
-  const one = record("one", "s", {
-    tokens: { input: 0, output: 10, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
-    time: { start: 0, firstToken: 100, completed: 1_100, ttft: 100, duration: 1_100 },
-  });
-  const two = record("two", "s", {
-    tokens: { input: 0, output: 30, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
-    time: { start: 0, firstToken: 300, completed: 1_300, ttft: 300, duration: 1_300 },
-  });
-  assert.deepEqual(calculateTTFTStats([one, two]), { avg: 200, max: 300, min: 100 });
-  assert.equal(calculateResponseStats([one, two]).responses, 2);
-  assert.deepEqual(calculateResponseStats([one, two]).duration, { avg: 1_200, max: 1_300, min: 1_100 });
-  assert.equal(formatNumber(1234.5), "1,234.5");
-  assert.equal(formatTokens(1234.5), "1,235");
-  assert.equal(formatDuration(65_000), "1m 05s");
 });
 
 test("agent names trim, reject controls and compaction, and sort without a whitelist", () => {

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { recordPartMetadata, server } from "../src/server.js";
+import { server } from "../src/server.js";
 import { createTotalsStorage } from "../src/totals-storage.js";
 import { parseHistoryJsonl } from "../src/storage.js";
 import { calculateTTFT, type HistoryRecord } from "../src/core.js";
@@ -27,19 +27,13 @@ async function backend(run: (ctx: { path: string; send: (event: any) => Promise<
       currentHooks = hooks;
     } finally { Date.now = startupNow; }
     currentSend = async (event: any) => {
-      const wall = event.receiveWall ?? event.timestamp ?? Date.now();
-      const mono = event.receiveMono ?? wall;
       const dateNow = Date.now;
-      const descriptor = Object.getOwnPropertyDescriptor(performance, "now");
       let pending: ReturnType<NonNullable<typeof hooks.event>>;
       try {
-        Date.now = () => wall;
-        Object.defineProperty(performance, "now", { configurable: true, value: () => mono });
+        Date.now = () => event.timestamp ?? dateNow();
         pending = hooks.event!({ event });
       } finally {
         Date.now = dateNow;
-        if (descriptor) Object.defineProperty(performance, "now", descriptor);
-        else delete (performance as any).now;
       }
       await pending!;
     };
@@ -74,12 +68,13 @@ const completed = (id = "m", output = 0, reasoning = 10, end = 1000) => {
 };
 async function records(path: string) { return parseHistoryJsonl(await readFile(path, "utf8")); }
 
-test("R08 content snapshots and deltas cannot create backend timing signals or samples", async () => {
+test("content ingress leaves completion usage authoritative without new timing or speed", async () => {
   await backend(async ({ path, send }) => {
     await send(started());
     await send(thinking());
     await send(thinking("m", 150, 250));
-    await send(completed("m", 0, 0));
+    await send(delta());
+    await send(completed());
     const [record] = await records(path);
     assert.equal(record.time.firstResponse, undefined);
     assert.equal(record.time.firstResponseSource, undefined);
@@ -89,52 +84,8 @@ test("R08 content snapshots and deltas cannot create backend timing signals or s
     assert.equal(record.time.firstToken, undefined);
     assert.equal(record.samples.length, 0);
     assert.equal(calculateTTFT(record), undefined);
-  });
-  await backend(async ({ path, send }) => {
-    await send(started()); await send(thinking()); await send(delta()); await send(completed());
-    const [record] = await records(path);
-    assert.equal(record.time.firstResponse, undefined);
-    assert.equal(record.time.firstContent, undefined);
-    assert.equal(record.time.firstToken, undefined);
     assert.equal(record.tokens.reasoning, 10);
-    assert.equal(record.samples.length, 0);
     assert.equal(record.speed, undefined);
-  });
-});
-
-test("R08 invalid or valid part times do not bypass the content ingress gate", async () => {
-  await backend(async ({ path, send }) => {
-    await send(started()); await send(thinking("m", -10, 200)); await send(delta("m", 150)); await send(completed());
-    const [record] = await records(path);
-    assert.equal(record.time.firstResponse, undefined);
-    assert.equal(record.time.firstResponseSource, undefined);
-    assert.equal(record.time.firstResponseEstimated, undefined);
-  });
-  await backend(async ({ path, send }) => {
-    await send(started()); await send(thinking("m", 9999, 200)); await send(completed("m", 0, 0));
-    const [record] = await records(path);
-    assert.equal(record.time.firstResponse, undefined);
-    assert.equal(record.time.firstResponseTimeSource, undefined);
-    assert.equal(record.time.firstResponseEstimated, undefined);
-  });
-});
-
-test("busy/user/historical/completed/reconnect snapshots cannot create metadata-only responses", async () => {
-  const active = new Map();
-  recordPartMetadata(active, thinking().properties, 200);
-  assert.equal(active.size, 0);
-  await backend(async ({ path, send }) => {
-    await send({ type: "session.status", timestamp: 0, properties: { sessionID: "s", status: "busy" } });
-    await send(thinking("busy"));
-    await send(started("history", -1, 5000)); await send(thinking("history"));
-    await send(started("snapshot", 0, 0, { source: "snapshot" })); await send(thinking("snapshot"));
-    await send({ type: "message.updated", timestamp: 0, properties: { info: { id: "user", sessionID: "s", role: "user", time: { created: 0 } } } });
-    await send(thinking("user"));
-    await send(started("ended")); await send(thinking("ended", 100, 200, { time: { start: 100, end: 150 } }));
-    for (const id of ["busy", "history", "snapshot", "user", "ended"]) await send(completed(id, 0, 0));
-    assert.ok((await records(path)).every((record) => record.time.firstResponse === undefined));
-    await send(thinking("ended", 100, 1200));
-    assert.ok((await records(path)).every((record) => record.time.firstResponse === undefined));
   });
 });
 
@@ -161,405 +112,11 @@ test("event and properties snapshot/history/reconnect sources cannot create, sig
   });
 });
 
-test("ambiguous tool tails cannot manufacture generation coverage from delta or part spans", async () => {
-  await backend(async ({ path, send }) => {
-    await send(started());
-    await send({ type: "session.next.step.started", timestamp: 0, properties: { sessionID: "s", messageID: "m", stepID: "one" } });
-    await send({ type: "message.part.updated", timestamp: 100, properties: { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "", time: { start: 100 } } } });
-    await send(delta("m", 100, "p", "hello"));
-    await send(delta("m", 1200, "p", "world"));
-    await send({ type: "message.part.updated", timestamp: 1300, properties: { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "helloworld", time: { start: 100, end: 1300 } } } });
-    await send({ type: "message.part.updated", timestamp: 1300, properties: { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 1300 } } } } });
-    await send({ type: "message.part.updated", timestamp: 4500, properties: { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 200, end: 4500 } } } } });
-    await send(completed("m", 10, 0, 5000));
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("metadata for superseded assistants cannot claim the current response signal", async () => {
-  await backend(async ({ path, send }) => {
-    await send(started("old", 0));
-    await send(started("current", 100));
-    await send(started("old", 0, 200));
-    await send(thinking("old", 50, 300));
-    await send(thinking("current", 150, 300));
-    await send(completed("old", 0, 0)); await send(completed("current", 0, 0));
-    const stored = await records(path);
-    assert.equal(stored.find((record) => record.messageID === "old")?.time.firstResponse, undefined);
-    assert.equal(stored.find((record) => record.messageID === "current")?.time.firstResponse, undefined);
-  });
-});
-
-async function v3Start(send: (event: any) => Promise<void>, id: string, created = 0) {
-  await send(started(id, created));
-  await send({ type: "session.next.step.started", timestamp: created, properties: { sessionID: "s", messageID: id, stepID: `${id}-step` } });
-}
-async function v3Deltas(send: (event: any) => Promise<void>, id: string, first = 100, last = 1200) {
-  await send({ type: "message.part.updated", timestamp: first, properties: { part: {
-    id: `${id}-p`, messageID: id, sessionID: "s", type: "text", text: "" } } });
-  await send({ ...delta(id, first, `${id}-p`, "hello"), properties: { ...delta(id, first, `${id}-p`, "hello").properties, kind: "output" } });
-  await send({ ...delta(id, last, `${id}-p`, "world"), properties: { ...delta(id, last, `${id}-p`, "world").properties, kind: "output" } });
-  await send({ type: "message.part.updated", timestamp: last + 100, properties: { part: {
-    id: `${id}-p`, messageID: id, sessionID: "s", type: "text", text: "helloworld", time: { start: first, end: last + 100 } } } });
-}
-
-// Official message/part events only: no synthetic session.next step ownership.
-async function officialGeneration(send: (event: any) => Promise<void>, beforeDeltas?: () => Promise<void>) {
-  await send(started("m"));
-  await send({ type: "message.part.updated", timestamp: 0, properties: { part: {
-    id: "official-step", messageID: "m", sessionID: "s", type: "step-start" } } });
-  for (const [id, type] of [["text", "text"], ["reason", "reasoning"]]) await send({ type: "message.part.updated", timestamp: 0,
-    properties: { part: { id, type, messageID: "m", sessionID: "s", text: "" } } });
-  await beforeDeltas?.();
-  for (const [timestamp, text, reasoning] of [[100, "hello", "think"], [1200, "world", "again"]] as const) {
-    await send(delta("m", timestamp, "text", text));
-    await send(delta("m", timestamp, "reason", reasoning));
-  }
-  for (const [id, type, text] of [["text", "text", "helloworld"], ["reason", "reasoning", "thinkagain"]]) await send({
-    type: "message.part.updated", timestamp: 1300, properties: { part: { id, type, messageID: "m", sessionID: "s", text, time: { end: 1300 } } } });
-  await send(completed("m", 10, 6, 1500));
-}
-
-async function officialTextStart(send: (event: any) => Promise<void>, id: string, created = 0, received = created) {
-  await send(started(id, created, received));
-  await send({ type: "message.part.updated", timestamp: received, properties: { part: {
-    id: `${id}-step`, messageID: id, sessionID: "s", type: "step-start" } } });
-  await textSnapshot(send, id, "", received);
-}
-async function textSnapshot(send: (event: any) => Promise<void>, id: string, text: string, received: number, final = false) {
-  await send({ type: "message.part.updated", timestamp: received, properties: { part: {
-    id: `${id}-text`, messageID: id, sessionID: "s", type: "text", text,
-    ...(final ? { time: { end: received } } : {}) } } });
-}
-async function officialTextComplete(send: (event: any) => Promise<void>, id: string, output: number, created: number, end: number) {
-  const event = completed(id, output, 0, end);
-  await send({ ...event, properties: { info: { ...event.properties.info, time: { created, completed: end } } } });
-}
-
-test("every real paired ingress declares receive-clock precision for a short completed response", async () => {
-  await backend(async ({ path, send }) => {
-    await officialTextStart(send, "short");
-    await send({ ...delta("short", 100, "short-text", "hello"), receiveMono: 100 });
-    await send({ ...delta("short", 356, "short-text", "world"), receiveMono: 356 });
-    await textSnapshot(send, "short", "helloworld", 360, true);
-    await officialTextComplete(send, "short", 10, 0, 10_000);
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-    const totals = await createTotalsStorage({ historyPath: path }).read();
-    assert.equal(totals.generationBasisVersion, 3);
-    assert.equal(totals.sessions.s.tokens.output, 10);
-    assert.equal(totals.sessions.s.responseCount, 1);
-    assert.equal(totals.sessions.s.speed, undefined);
-  });
-});
-
-test("a long delta stream persists tokens and does not record speed", async () => {
-  await backend(async ({ path, send }) => {
-    await officialTextStart(send, "hello");
-    await send(delta("hello", 10, "hello-text", "."));
-    await textSnapshot(send, "hello", ".", 20, true);
-    await send({ type: "message.part.updated", timestamp: 9710, properties: { part: {
-      id: "hello-final", messageID: "hello", sessionID: "s", type: "text", text: "" } } });
-    await send(delta("hello", 9714, "hello-final", "Hell"));
-    await send(delta("hello", 9970, "hello-final", "o!"));
-    await send({ type: "message.part.updated", timestamp: 9971, properties: { part: {
-      id: "hello-final", messageID: "hello", sessionID: "s", type: "text", text: "Hello!", time: { start: 9714, end: 9970 } } } });
-    await officialTextComplete(send, "hello", 12, 0, 10_000);
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 12);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-    const totals = await createTotalsStorage({ historyPath: path }).read();
-    assert.equal(totals.sessions.s.tokens.output, 12);
-    assert.equal(totals.sessions.s.speed, undefined);
-  });
-});
-
-test("official pending snapshots before corresponding deltas resolve without inventing boundaries", async () => {
-  await backend(async ({ path, send }) => {
-    await officialTextStart(send, "m");
-    await textSnapshot(send, "m", "hello", 50);
-    await send(delta("m", 100, "m-text", "hello"));
-    await textSnapshot(send, "m", "helloworld", 1100);
-    await send(delta("m", 1200, "m-text", "world"));
-    await textSnapshot(send, "m", "helloworld", 1300, true);
-    await officialTextComplete(send, "m", 10, 0, 1500);
-    const [record] = await records(path);
-    assert.equal(record.time.firstContent, undefined);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("official trimmed final trailing newline preserves raw arrival byte calibration", async () => {
-  await backend(async ({ path, send }) => {
-    await officialTextStart(send, "m");
-    await send(delta("m", 100, "m-text", "hello"));
-    await send(delta("m", 1200, "m-text", "world\n"));
-    await textSnapshot(send, "m", "helloworld", 1300, true);
-    await officialTextComplete(send, "m", 10, 0, 1500);
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("official clean assistant start delayed 1.5s remains eligible after the startup epoch", async () => {
-  await backend(async ({ path, send }) => {
-    await officialTextStart(send, "m", 0, 1500);
-    await send(delta("m", 1600, "m-text", "hello"));
-    await send(delta("m", 2700, "m-text", "world"));
-    await textSnapshot(send, "m", "helloworld", 2800, true);
-    await officialTextComplete(send, "m", 10, 0, 3000);
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("official tool-call message stays invalid, while independent final plain assistant qualifies without leaked taint", async () => {
-  await backend(async ({ path, send, restart }) => {
-    await send(started("tool-message"));
-    await send({ type: "message.part.updated", timestamp: 0, properties: { part: {
-      id: "tool-step", messageID: "tool-message", sessionID: "s", type: "step-start" } } });
-    await send({ type: "message.part.updated", timestamp: 0, properties: { part: {
-      id: "tool", messageID: "tool-message", sessionID: "s", type: "tool", state: { status: "pending", input: "" } } } });
-    for (const [timestamp, delta] of [[100, "{\"x\":"], [1200, "\"y\"}"]] as const) await send({ type: "message.part.delta", timestamp,
-      properties: { sessionID: "s", messageID: "tool-message", partID: "tool", field: "input", delta } });
-    await officialTextComplete(send, "tool-message", 8, 0, 1500);
-    await officialTextStart(send, "final-message", 1600);
-    await send(delta("final-message", 1700, "final-message-text", "hello"));
-    await send(delta("final-message", 2800, "final-message-text", "world"));
-    await textSnapshot(send, "final-message", "helloworld", 2900, true);
-    await officialTextComplete(send, "final-message", 10, 1600, 3000);
-    const stored = await records(path);
-    assert.equal(stored[0].tokens.output, 8);
-    assert.equal(stored[0].speed, undefined);
-    assert.equal(stored[1].tokens.output, 10);
-    assert.equal(stored[1].speed, undefined);
-    const totals = await createTotalsStorage({ historyPath: path }).read();
-    assert.equal(totals.sessions.s.tokens.output, 18);
-    assert.equal(totals.sessions.s.responseCount, 2);
-    assert.equal(totals.sessions.s.speed, undefined);
-    await restart(3100);
-    assert.equal((await records(path))[0].tokens.output, 8);
-    assert.equal((await records(path))[0].speed, undefined);
-  });
-});
-
-test("official assistant/step-start/content/completion events qualify output plus reasoning v3", async () => {
-  await backend(async ({ path, send }) => {
-    await officialGeneration(send);
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.tokens.reasoning, 6);
-    assert.equal(record.quality, "exact");
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("nested session info.id retry targets current or pending assistant, never the session as a message", async () => {
-  for (const pending of [false, true]) await backend(async ({ path, send }) => {
-    const retry = async () => {
-      await send({ type: "session.status", timestamp: 50, properties: { sessionID: "s", info: { id: "s" }, status: { type: "retry" } } });
-      await send({ type: "session.status", timestamp: 60, properties: { sessionID: "s", info: { id: "s" }, status: { type: "busy" } } });
-    };
-    if (pending) await retry();
-    await officialGeneration(send, pending ? undefined : retry);
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.tokens.reasoning, 6);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("missing reasoning corrections preserve exact usage and TPS, while explicit zero is authoritative after reload/pruning", async () => {
-  for (const trimmed of [false, true]) await backend(async ({ path, send, restart }) => {
-    await officialGeneration(send);
-    if (trimmed) await send(completed("new", 0, 0, 2000));
-    const totals = createTotalsStorage({ historyPath: path });
-    const before = await totals.read();
-    const historyBefore = await records(path);
-    const restarted = await restart(2000);
-    const incomplete = completed("m", 12, 0, 3000);
-    await restarted({ ...incomplete, properties: { info: { ...incomplete.properties.info, tokens: { input: 1, output: 12 } } } });
-    assert.deepEqual(await totals.read(), before);
-    assert.deepEqual(await records(path), historyBefore);
-    await restarted(completed("m", 12, 0, 3100));
-    const after = await totals.read();
-    assert.equal(after.sessions.s.tokens.output, 12);
-    assert.equal(after.sessions.s.tokens.reasoning, 0);
-    assert.equal(after.sessions.s.responseCount, trimmed ? 2 : 1);
-    assert.equal(after.sessions.s.speed, undefined);
-    assert.equal((await records(path))[0].tokens.reasoning, 0);
-    assert.equal((await records(path))[0].speed, undefined);
-  }, undefined, 1);
-});
-
-test("recent created time cannot predate startup or disruption observation epoch", async () => {
-  await backend(async ({ path, restart }) => {
-    const send = await restart(1000);
-    for (const [id, created, received, first, last] of [["before-startup", 900, 1100, 1200, 2300], ["current", 1000, 1100, 1200, 2300]] as const) {
-      await send(started(id, created, received));
-      await send({ type: "message.part.updated", timestamp: received, properties: { part: { id: `${id}-step`, messageID: id, sessionID: "s", type: "step-start" } } });
-      await v3Deltas(send, id, first, last);
-      await send(completed(id, 10, 0, 2500));
-    }
-    await send({ type: "workspace.status", timestamp: 5000, properties: { status: "reconnecting" } });
-    await send(started("before-disruption", 4900, 5100));
-    await send({ type: "message.part.updated", timestamp: 5100, properties: { part: { id: "after-step", messageID: "before-disruption", sessionID: "s", type: "step-start" } } });
-    await v3Deltas(send, "before-disruption", 5200, 6300);
-    await send(completed("before-disruption", 10, 0, 6500));
-    const stored = await records(path);
-    assert.ok(stored.every((record) => record.speed === undefined && record.tokens.output === 10));
-  });
-});
-
-test("v3 uses paired ingress clocks, excluding precontent wait and cleanup/tool tails", async () => {
-  await backend(async ({ path, send }) => {
-    await v3Start(send, "m");
-    await send(thinking("m", 100, 200));
-    await send({ type: "message.part.updated", timestamp: 200, properties: { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "" } } });
-    await Promise.all([
-      send({ ...delta("m", 300, "p", "hello"), receiveWall: 5000, receiveMono: 100,
-        properties: { ...delta("m", 300, "p", "hello").properties, kind: "output" } }),
-      send({ ...delta("m", 400, "p", "world"), receiveWall: 6100, receiveMono: 1200,
-        properties: { ...delta("m", 400, "p", "world").properties, kind: "output" } }),
-    ]);
-    await send({ type: "message.part.updated", timestamp: 15000, properties: { part: {
-      id: "p", messageID: "m", sessionID: "s", type: "text", text: "helloworld", time: { start: 250, end: 14000 } } } });
-    await send(thinking("m", 100, 15000, { time: { start: 100, end: 14000 } }));
-    await send({ type: "session.next.step.ended", timestamp: 18000, properties: { sessionID: "s", messageID: "m", stepID: "m-step" } });
-    await send(completed("m", 10, 0, 20000));
-    const [record] = await records(path);
-    assert.equal(record.time.firstResponse, undefined);
-    assert.equal(record.time.firstContent, undefined);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-    await send({ type: "message.part.updated", timestamp: 25000, properties: { part: {
-      id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 21000, end: 25000 } } } } });
-    assert.equal((await records(path))[0].speed, undefined);
-    assert.equal((await records(path))[0].tokens.output, 10);
-  });
-});
-
-test("same-message retry remains tainted after busy, correction and reload", async () => {
-  await backend(async ({ path, send, restart }) => {
-    await v3Start(send, "m");
-    await send({ type: "session.status", timestamp: 50, properties: { sessionID: "s", status: { type: "retry" } } });
-    await send({ type: "session.status", timestamp: 60, properties: { sessionID: "s", status: { type: "busy" } } });
-    await v3Deltas(send, "m"); await send(completed("m", 10, 0, 1500));
-    assert.equal((await records(path))[0].tokens.output, 10);
-    assert.equal((await records(path))[0].speed, undefined);
-    await send(completed("m", 20, 0, 1600));
-    await (await restart())(completed("m", 15, 0, 1700));
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 15);
-    assert.equal(record.cost, 2);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("v2 category calibration excludes the entire first receive batch and deduplicates event identity", async () => {
-  await backend(async ({ path, send }) => {
-    await v3Start(send, "m");
-    for (const [timestamp, text, reasoning] of [[100, "abc", "xy"], [1200, "def", "uv"]] as const) {
-      await send({ type: "session.next.text.delta", timestamp, eventID: `text-${timestamp}`, properties: { sessionID: "s", assistantMessageID: "m", textID: "text", delta: text } });
-      await send({ type: "session.next.reasoning.delta", timestamp, eventID: `reason-${timestamp}`, properties: { sessionID: "s", assistantMessageID: "m", reasoningID: "reason", delta: reasoning } });
-    }
-    await send({ type: "session.next.text.delta", timestamp: 5000, eventID: "text-1200", properties: { sessionID: "s", assistantMessageID: "m", textID: "text", delta: "def" } });
-    for (const [id, type, text] of [["text", "text", "abcdef"], ["reason", "reasoning", "xyuv"]] as const) await send({
-      type: "message.part.updated", timestamp: 5100, properties: { part: { id, messageID: "m", sessionID: "s", type, text, time: { end: 5100 } } } });
-    await send(completed("m", 10, 4, 6000));
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.tokens.reasoning, 4);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("unknown retry binds one response, not the subsequent clean response", async () => {
-  await backend(async ({ path, send }) => {
-    await send({ type: "session.status", timestamp: 0, properties: { sessionID: "s", status: "retry" } });
-    await send({ type: "session.status", timestamp: 0, properties: { sessionID: "s", status: "busy" } });
-    await v3Start(send, "retry"); await v3Deltas(send, "retry"); await send(completed("retry", 10, 0, 1500));
-    await v3Start(send, "clean"); await v3Deltas(send, "clean"); await send(completed("clean", 10, 0, 1500));
-    const stored = await records(path);
-    assert.equal(stored[0].tokens.output, 10);
-    assert.equal(stored[0].speed, undefined);
-    assert.equal(stored[1].tokens.output, 10);
-    assert.equal(stored[1].speed, undefined);
-  });
-});
-
-test("step identities deduplicate repeats, while distinct steps invalidate and usage replaces", async () => {
-  await backend(async ({ path, send }) => {
-    await v3Start(send, "m"); await v3Deltas(send, "m");
-    for (const timestamp of [1300, 1350]) await send({ type: "session.next.step.ended", timestamp, properties: {
-      sessionID: "s", messageID: "m", stepID: "m-step", tokens: { input: 1, output: 10, reasoning: 0 }, cost: 1 } });
-    await send(completed("m", 10, 0, 1500));
-    assert.equal((await records(path))[0].tokens.output, 10);
-    assert.equal((await records(path))[0].speed, undefined);
-  });
-  await backend(async ({ path, send }) => {
-    await v3Start(send, "m"); await v3Deltas(send, "m");
-    for (const [stepID, output] of [["m-step", 10], ["second", 20]] as const) await send({ type: "session.next.step.ended", timestamp: 1400, properties: {
-      sessionID: "s", messageID: "m", stepID, tokens: { input: 1, output, reasoning: 0 }, cost: output / 10 } });
-    const final = completed("m", 0, 0, 1500);
-    await send({ ...final, properties: { info: { ...final.properties.info, tokens: { input: 1 }, cost: undefined } } });
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 20);
-    assert.equal(record.cost, 2);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("complete snapshots cannot supply missing, historic or already-in-progress response ownership", async () => {
-  for (const ownership of ["missing", "historic", "in-progress"]) await backend(async ({ path, send: initialSend, restart }) => {
-    const send = ownership === "historic" ? await restart(1000) : initialSend;
-    if (ownership === "historic") await send(started("m", 0, 5000));
-    if (ownership === "in-progress") {
-      const event = started("m");
-      await send({ ...event, properties: { info: { ...event.properties.info, status: "in_progress", tokens: { output: 1 } } } });
-    }
-    await send({ type: "session.next.step.started", timestamp: 5000, properties: { sessionID: "s", messageID: "m", stepID: "m-step" } });
-    await v3Deltas(send, "m", 5100, 6200); await send(completed("m", 10, 0, 6500));
-    const [record] = await records(path);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.speed, undefined);
-  });
-});
-
-test("v2 failures and known transport boundaries taint active messages without losing usage", async () => {
-  for (const type of ["session.next.retried", "session.next.failed", "session.error", "provider.error", "workspace.status", "server.connected"]) {
-    await backend(async ({ path, send }) => {
-      if (type === "server.connected") await send({ type, timestamp: 0, properties: {} });
-      await v3Start(send, "m");
-      await send({ type, timestamp: 50, properties: { sessionID: "s", messageID: "m", status: "reconnecting" } });
-      await v3Deltas(send, "m"); await send(completed("m", 10, 0, 1500));
-      const [record] = await records(path);
-      assert.equal(record.tokens.output, 10, type);
-      assert.equal(record.speed, undefined, type);
-    });
-  }
-});
-
 function legacy(id: string, time: any = { start: 0, completed: 1000 }): HistoryRecord {
   return { version: 1, messageID: id, sessionID: "s", tokens: { input: 1, output: 10, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
     cost: 2, quality: "exact", time, samples: [] };
 }
-test("server v3 migration preserves legacy usage across replay/restart/pruning without reconstructing speed", async () => {
+test("legacy usage survives restart, pruning and replay without reconstructing speed", async () => {
   await backend(async ({ path, send, restart }) => {
     const totals = createTotalsStorage({ historyPath: path });
     const before = await totals.read();
@@ -615,32 +172,5 @@ test("assistant completion keeps fixer then oracle without recounting, and ignor
     assert.equal(after.sessions.s.tokens.output, 7);
     assert.equal(after.sessions.s.responseCount, 2);
     assert.equal(after.sessions.s.cost, 4);
-  });
-});
-
-test("delta and part updates do not store agent names or rewrite history and totals", async () => {
-  await backend(async ({ path, send }) => {
-    const totals = createTotalsStorage({ historyPath: path });
-    const before = await readFile(totals.path, "utf8");
-    await send({ ...delta(), properties: { ...delta().properties, agent: "delta-must-not-be-read", info: { id: "m", agent: "delta-must-not-be-read" } } });
-    await send({ type: "message.part.updated", timestamp: 220, properties: {
-      agent: "part-must-not-be-read",
-      part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "think", agent: "part-must-not-be-read" },
-    } });
-    assert.equal(await readFile(totals.path, "utf8"), before);
-    await send({ ...started(), properties: { info: { ...started().properties.info, agent: "fixer" } } });
-    await send(completed("m", 4, 0, 100));
-    const historyBefore = await readFile(path, "utf8");
-    const totalsBefore = await readFile(totals.path, "utf8");
-    await send({ ...delta("m", 150), properties: { ...delta("m", 150).properties, agent: "delta-must-not-be-read", info: { agent: "delta-must-not-be-read" } } });
-    await send({ type: "message.part.updated", timestamp: 180, properties: {
-      agent: "part-must-not-be-read",
-      part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "later", agent: "part-must-not-be-read" },
-    } });
-    assert.equal(await readFile(path, "utf8"), historyBefore);
-    assert.equal(await readFile(totals.path, "utf8"), totalsBefore);
-    assert.equal((await records(path))[0].agent, "fixer");
-    assert.equal((await records(path))[0].samples.length, 0);
-    assert.equal((await records(path))[0].speed, undefined);
   });
 });

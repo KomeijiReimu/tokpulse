@@ -1,3 +1,5 @@
+import type { Route, SlotClaim } from "@opencode/plugin/tui/context";
+import * as tuiSolid from "@opentui/solid";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
@@ -5,20 +7,25 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createRoot, createSignal } from "solid-js";
-import * as tuiSolid from "@opentui/solid";
-import type { Route, SlotClaim } from "@opencode/plugin/tui/context";
-import type { HistoryRecord } from "../src/core.js";
 import { normalizeActivityEvent } from "../src/activity.js";
-import { initializeTui, buildSessionDetailsTree, createRuntimeStore, reloadHistory, reloadActivity, tuiActivityTimes } from "../src/tui.js";
-import { createV2TuiBridge, type V2TuiContext } from "../src/tui-v2.js";
+import type { HistoryRecord } from "../src/core.js";
+import { parentProofPort, tuiReadModel, type ParentProofPort } from "../src/tui-read-model.js";
 import { sessionSourcePaths } from "../src/tui-source.js";
-import { tuiReadModel, parentProofPort, type ParentProofPort } from "../src/tui-read-model.js";
+import { createV2TuiBridge, type V2TuiContext } from "../src/tui-v2.js";
+import { buildSessionDetailsTree, createRuntimeStore, initializeTui, reloadActivity,
+  reloadHistory, taskWallTimeForSession, tuiActivityTimes } from "../src/tui.js";
 const { spyOn } = require("bun:test");
 
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
+}
+
+async function eventually(predicate: () => boolean, message: string) {
+  const deadline = performance.now() + 1500;
+  while (!predicate() && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(predicate(), message);
 }
 
 async function fixture(t: { after(callback: () => Promise<void>): void }) {
@@ -73,8 +80,8 @@ function host(directory: string, initial = "root") {
     setSession(id: string, root: string) { sessions.set(id, { id, location: { directory: root, worktree: "/wrong-worktree" } }); state.changed(); },
     setRoute(id: string) { state.setRoute({ type: "session", sessionID: id }); },
     setSync(fn: typeof sync) { sync = fn; },
-    send(type: string, data: Record<string, unknown>, root?: string) {
-      send({ details: { type, data, id: `event-${Math.random()}`, created: Date.now(),
+    send(type: string, data: Record<string, unknown>, root?: string, created = Date.now()) {
+      send({ details: { type, data, id: `event-${Math.random()}`, created,
         ...(root === undefined ? {} : { location: { directory: root } }) } });
     },
     async dispose() { await bridge.dispose(); stopEffects(); },
@@ -547,4 +554,125 @@ test("actual missing runs is not an empty reset, while a successfully opened emp
     assert.equal(tuiActivityTimes(store, "root").directMilliseconds, 0);
     assert.deepEqual(store.sourceState.missing, []); assert.deepEqual(store.sourceState.errors, {});
   } finally { store.disposed = true; tuiReadModel(store).dispose(); store.disposeSignals(); await f.dispose(); }
+});
+
+test("read-only totals reject a symlink without losing known usage, then accept an atomic replacement", async (t) => {
+  const base = await fixture(t), paths = await ledger(base, 11), outside = join(base, "outside.json");
+  const f = host(base); f.setSession("root", base);
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!, known = h.store.totalsLedger;
+    const bytes = JSON.stringify({ ...known, sessions: { root: { ...known.sessions.root,
+      tokens: { ...known.sessions.root.tokens, input: 999 } } } });
+    await fs.writeFile(outside, bytes); await fs.rm(paths.totals); await fs.symlink(outside, paths.totals);
+    await reloadHistory(h.store, f.bridge.api, paths.history, paths.totals, 100);
+    assert.equal(h.store.sourceState.status, "error"); assert.ok(h.store.sourceState.errors?.totals);
+    assert.equal(h.store.totalsLedger, known); assert.equal(selected(h.store), 11);
+    assert.equal(await fs.readFile(outside, "utf8"), bytes); assert.equal((await fs.lstat(paths.totals)).isSymbolicLink(), true);
+    await fs.rm(paths.totals);
+    const replacement = join(base, "replacement");
+    await fs.writeFile(replacement, JSON.stringify({ ...known, sessions: { root: { ...known.sessions.root,
+      tokens: { ...known.sessions.root.tokens, input: 22 } } } }));
+    await fs.rename(replacement, paths.totals);
+    await reloadHistory(h.store, f.bridge.api, paths.history, paths.totals, 100);
+    await eventually(() => selected(h.store) === 22 && h.store.sourceState.status === "ready",
+      "actual atomic replacement must survive watcher generation invalidation");
+    assert.equal(selected(h.store), 22); assert.equal(h.store.sourceState.status, "ready");
+    assert.equal(await fs.readFile(outside, "utf8"), bytes);
+  } finally { await f.dispose(); warning.mockRestore(); }
+});
+
+test("fresh parent ownership follows canonical corrections; replay cannot restore a cleared edge", async (t) => {
+  const base = await fixture(t), paths = await ledger(base, 11, "child");
+  const parent = (parentSessionID: string | null, instanceID: string, seq: number, eventID: string) => normalizeActivityEvent({
+    version: 2, kind: "parent", sessionID: "child", parentSessionID, instanceID, seq, eventID,
+    timestamp: seq, observedAt: seq,
+  })!;
+  const a = parent("A", "old-collector", 1000, "old-parent"), b = parent("B", "new-collector", 1, "new-parent");
+  const runs = await fs.readFile(paths.runs, "utf8");
+  await fs.writeFile(paths.runs, JSON.stringify(a) + "\n" + runs);
+  const f = host(base); f.setSession("root", base);
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!;
+    assert.equal(buildSessionDetailsTree(h.store, "A").including.tokens.input, 11);
+    assert.equal(taskWallTimeForSession(h.store, "A", 10000), 11);
+    // Unlike the old standalone projector probe, the real bridge requires
+    // fresh ownership when canonical evidence crosses observation domains.
+    f.sessions.set("child", { id: "child", parentID: "B", location: { directory: base } });
+    await fs.appendFile(paths.runs, JSON.stringify(b) + "\n"); await reloadActivity(h.store, f.bridge.api, paths.runs);
+    await eventually(() => buildSessionDetailsTree(h.store, "B").including.tokens.input === 11,
+      "actual watcher/proof hydration must confirm B ownership");
+    assert.equal(h.store.sessionParents.get("child"), "B", "fresh ownership confirms the new collector despite its lower sequence/timestamp");
+    assert.equal(buildSessionDetailsTree(h.store, "A").including.responseCount, 0);
+    assert.equal(buildSessionDetailsTree(h.store, "B").including.tokens.input, 11);
+    assert.equal(taskWallTimeForSession(h.store, "B", 10000), 11);
+    const root = { ...b, parentSessionID: null };
+    f.sessions.set("child", { id: "child", location: { directory: base } });
+    await fs.appendFile(paths.runs, [root, b, a].map((fact) => JSON.stringify(fact)).join("\n") + "\n");
+    await reloadActivity(h.store, f.bridge.api, paths.runs);
+    await eventually(() => h.store.sessionParents.get("child") === null, "actual ownership must confirm the explicit root");
+    assert.equal(h.store.sessionParents.get("child"), null);
+    assert.equal(buildSessionDetailsTree(h.store, "B").including.responseCount, 0);
+    assert.equal(selected(h.store, "child"), 11); assert.equal(taskWallTimeForSession(h.store, "child", 10000), 11);
+    const restarted = host(base); restarted.setSession("root", base);
+    try {
+      const fresh = (await initializeTui(restarted.bridge.api, {}))!;
+      assert.equal(fresh.store.sessionParents.get("child"), null);
+      assert.equal(selected(fresh.store, "child"), 11); assert.equal(taskWallTimeForSession(fresh.store, "child", 10000), 11);
+    } finally { await restarted.dispose(); }
+  } finally { await f.dispose(); }
+});
+
+test("partial activity appends do not invent time and an atomic replacement leaves one frozen clock", async (t) => {
+  const base = await fixture(t), paths = await ledger(base, 11);
+  const f = host(base), store = createRuntimeStore(100); f.setSession("root", base);
+  const fact = (state: "busy" | "idle", timestamp: number, seq: number) => normalizeActivityEvent({
+    version: 2, kind: "lifecycle", sessionID: "root", state, timestamp, observedAt: timestamp,
+    instanceID: "collector", seq, eventID: `fact-${seq}`, executionID: `epoch-${Math.floor((seq - 1) / 2)}`,
+  })!;
+  try {
+    await reloadActivity(store, f.bridge.api, paths.runs);
+    const next = [fact("busy", 200, 1), fact("idle", 220, 2)].map((value) => JSON.stringify(value)).join("\n") + "\n";
+    await fs.appendFile(paths.runs, next.slice(0, 30)); await reloadActivity(store, f.bridge.api, paths.runs);
+    assert.equal(taskWallTimeForSession(store, "root", 1000), 11);
+    await fs.appendFile(paths.runs, next.slice(30)); await reloadActivity(store, f.bridge.api, paths.runs);
+    assert.equal(taskWallTimeForSession(store, "root", 1000), 31);
+    await fs.appendFile(paths.runs, next); await reloadActivity(store, f.bridge.api, paths.runs);
+    assert.equal(taskWallTimeForSession(store, "root", 1000), 31, "replayed committed bytes are not a second task interval");
+    const replacement = join(base, "replacement");
+    await fs.writeFile(replacement, [fact("busy", 1000, 3), fact("idle", 1040, 4)].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    await fs.rename(replacement, paths.runs); await reloadActivity(store, f.bridge.api, paths.runs);
+    assert.equal(taskWallTimeForSession(store, "root", 2000), 40);
+    assert.equal(taskWallTimeForSession(store, "root", 3600000), 40);
+    assert.equal(await reloadActivity(store, f.bridge.api, paths.runs), true);
+    assert.equal(taskWallTimeForSession(store, "root", 3600000), 40);
+  } finally { store.disposed = true; tuiReadModel(store).dispose(); store.disposeSignals(); await f.dispose(); }
+});
+
+test("historical clock domains and canonical replacement cannot shorten the current live or closed task", async (t) => {
+  const base = await fixture(t), paths = await ledger(base, 11), now = Date.now();
+  const fact = (sessionID: string, timestamp: number, state: "busy" | "idle", seq: number) => normalizeActivityEvent({
+    version: 2, kind: "lifecycle", sessionID, state, timestamp, observedAt: timestamp, seq,
+    instanceID: "old-backend", executionID: `old-${sessionID}`, eventID: `old-${seq}`,
+  })!;
+  const bytes = [fact("root", now + 100000, "busy", 1), fact("root", now + 100100, "idle", 2),
+    fact("unrelated", now + 200000, "busy", 3), fact("unrelated", now + 200100, "idle", 4)]
+    .map((value) => JSON.stringify(value)).join("\n") + "\n";
+  await fs.writeFile(paths.runs, bytes);
+  const f = host(base); f.setSession("root", base);
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!;
+    const liveStart = Date.now();
+    f.send("session.execution.started", { sessionID: "root" }, base, liveStart);
+    assert.equal(taskWallTimeForSession(h.store, "root", liveStart + 1000), 1100);
+    const replacement = join(base, "replacement"); await fs.writeFile(replacement, bytes); await fs.rename(replacement, paths.runs);
+    let accepted = false;
+    for (let retry = 0; retry < 5 && !accepted; retry++) accepted = await reloadActivity(h.store, f.bridge.api, paths.runs);
+    assert.equal(accepted, true, "the actual replacement must be applied, not bypassed by a stale generation");
+    assert.equal(taskWallTimeForSession(h.store, "root", liveStart + 1000), 1100);
+    assert.equal(taskWallTimeForSession(h.store, "unrelated", liveStart + 1000), 100);
+    f.send("session.execution.succeeded", { sessionID: "root" }, base, liveStart + 1500);
+    assert.equal(taskWallTimeForSession(h.store, "root", liveStart + 2000), 1600);
+    assert.equal(taskWallTimeForSession(h.store, "root", liveStart + 3600000), 1600);
+  } finally { await f.dispose(); }
 });

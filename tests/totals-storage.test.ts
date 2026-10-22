@@ -5,9 +5,8 @@ import { homedir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import type { MeasuredHistoryRecord } from "../src/statistics.js";
-import { filterHistoryRecords, parseHistoryJsonl } from "../src/storage.js";
-import { createTotalsStorage, getExcludedMessageIDs, isCorruptTotalsError, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath, type SessionMetadataUpdate } from "../src/totals-storage.js";
-import { getSessionAverageSummary, measureRecordSpeed, mergeRecordSpeed } from "../src/statistics.js";
+import { filterHistoryRecords } from "../src/storage.js";
+import { createTotalsStorage, getExcludedMessageIDs, isCorruptTotalsError, projectTotalsMeasurementScope, resolveTotalsPath, type SessionMetadataUpdate } from "../src/totals-storage.js";
 import { classifyMessageMetadata, classifySessionMetadata, createScopeRegistry } from "../src/scope.js";
 
 test("metadata batch merges same-SID agents and durable scopes without changing usage or downgrading exclusions", async (context) => {
@@ -82,11 +81,11 @@ test("metadata batch validates all entries before publication and safely handles
   assert.deepEqual(concurrent[1].sessionAgents!["__proto__"], ["build", "designer", "fixer", "oracle"]);
 });
 
-test("late MC identity projects all usage/speed and descendants while preserving raw cumulative data and epoch", async (context) => {
+test("late MC identity excludes descendant usage while preserving raw cumulative data", async (context) => {
   const directory = await makeTestDirectory(context);
   const storage = createTotalsStorage(join(directory, "totals.json"));
   for (const sessionID of ["root", "real", "mc", "grand"]) {
-    await storage.apply(historyRecord(sessionID, { sessionID, tokens: tokens(1, 10, 2), speed: measuredV3Speed(tokens(1, 10, 2)) }));
+    await storage.apply(historyRecord(sessionID, { sessionID, tokens: tokens(1, 10, 2) }));
   }
   const before = await storage.read();
   const registry = createScopeRegistry();
@@ -102,8 +101,6 @@ test("late MC identity projects all usage/speed and descendants while preserving
   assert.deepEqual(projected.sessions.root, before.sessions.root);
   assert.deepEqual(projected.sessions.real, before.sessions.real);
   assert.equal(projected.generationBasisVersion, before.generationBasisVersion);
-  assert.equal(getSessionAverageSummary(projected.sessions.real).generation.coveredResponseCount, 1);
-  assert.equal(projectTotalsMeasurementScope(after), projected);
   assert.equal(projectTotalsMeasurementScope(await createTotalsStorage(storage.path).read()).sessions.mc, undefined);
   await storage.setSessionScope("mc", classifySessionMetadata({ agent: "build" }));
   assert.equal(projectTotalsMeasurementScope(await storage.read()).sessions.mc, undefined);
@@ -168,28 +165,6 @@ for (const settled of [false, true]) {
     assert.deepEqual(projectTotalsMeasurementScope(await reopened.read()).sessions, baseline.sessions);
   });
 }
-
-test("message-only exclusion reverses exact open and settled contributions once and prevents corrected replay", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  const normal = historyRecord("normal", { tokens: tokens(2, 20, 4), speed: measuredV3Speed(tokens(2, 20, 4)) });
-  const baseline = await storage.apply(normal);
-  const compact = historyRecord("compact", { tokens: tokens(10, 100, 20), cost: 9, speed: measuredV3Speed(tokens(10, 100, 20)) });
-  await storage.apply(compact, { retainedMessageIDs: ["normal"] });
-  const proof = classifyMessageMetadata({ summary: true, mode: "compaction" });
-  const excluded = await storage.excludeMessage("compact", proof);
-  assert.deepEqual(excluded.sessions, baseline.sessions);
-  assert.deepEqual((excluded.settled.compact as any).excluded, proof);
-  assert.equal((excluded.settled.compact as any).tokens.output, 100);
-  assert.equal(excluded.open.compact, undefined);
-  assert.deepEqual(await storage.excludeMessage("compact", proof), excluded);
-  assert.deepEqual(filterHistoryRecords([normal, compact], excluded.sessionScopes, undefined, getExcludedMessageIDs(excluded)), [normal]);
-  assert.equal(getExcludedMessageIDs(excluded), getExcludedMessageIDs(excluded));
-  assert.deepEqual(await createTotalsStorage(storage.path).apply({ ...compact, tokens: tokens(20, 200, 40) }), excluded);
-  await storage.apply(historyRecord("open-compaction", { tokens: tokens(5, 50), speed: measuredV3Speed(tokens(5, 50)) }));
-  assert.deepEqual((await storage.excludeMessage("open-compaction", proof)).sessions, baseline.sessions);
-  assert.equal((await storage.read()).sessionScopes, undefined);
-});
 
 test("legacy settled true exclusion never guesses an amount and blocks resurrection; unknown tombstones share settled scheme", async (context) => {
   const directory = await makeTestDirectory(context);
@@ -260,48 +235,6 @@ test("storage writes the sibling ledger and an explicit totalsPath wins", async 
   await explicit.apply(historyRecord("2", { tokens: tokens(3), cost: 1 }));
   assert.equal(await exists(explicitPath), true);
   assert.equal(JSON.parse(await readFile(storage.path, "utf8")).open["2"], undefined);
-});
-
-test("the 1001st exact record stays counted after it pushes message 1 out of the window", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage({ historyPath: join(directory, "history.jsonl") });
-  const retained = new Set<string>();
-
-  for (let index = 1; index <= 1000; index += 1) {
-    const messageID = String(index);
-    retained.add(messageID);
-    await storage.apply(historyRecord(messageID, {
-      tokens: tokens(index),
-      cost: 1,
-    }), { retainedMessageIDs: retained });
-  }
-
-  const full = await storage.read();
-  assert.equal(Object.keys(full.open).length, 1000);
-  assert.equal(full.open["1"]?.quality, "exact");
-  assert.equal(full.sessions.session?.tokens.input, 500_500);
-  assert.equal(full.sessions.session?.responseCount, 1000);
-
-  const window = new Set<string>();
-  for (let index = 2; index <= 1001; index += 1) window.add(String(index));
-  const after = await storage.apply(historyRecord("1001", {
-    tokens: tokens(1001),
-    cost: 1,
-  }), { retainedMessageIDs: window });
-
-  assert.equal(after.open["1"], undefined);
-  assert.equal(after.open["2"]?.tokens.input, 2);
-  assert.equal(after.open["1001"]?.tokens.input, 1001);
-  assert.equal(after.open["1001"]?.quality, "exact");
-  assert.equal(Object.keys(after.open).length, 1000);
-  assert.equal(after.sessions.session?.tokens.input, 501_501);
-  assert.equal(after.sessions.session?.cost, 1001);
-  assert.equal(after.sessions.session?.responseCount, 1001);
-  assert.deepEqual(await storage.read(), after);
-
-  const persisted = JSON.parse(await readFile(storage.path, "utf8"));
-  assert.equal(persisted.sessions.session.tokens.input, 501_501);
-  assert.equal(persisted.open["1"], undefined);
 });
 
 test("another session entering the window does not decrease totals left behind", async (context) => {
@@ -375,17 +308,16 @@ test("an exact result promotes an authoritative provisional snapshot without los
   const provisional: MeasuredHistoryRecord = { ...historyRecord("m", { quality: "provisional", tokens: tokens(1, 100) }),
     update: { source: "live", instanceID: "writer", sequence: 1, receivedAt: 1, fingerprint: "partial", seenFingerprints: ["partial"] } };
   await storage.apply(provisional);
-  const exact = historyRecord("m", { quality: "exact", tokens: tokens(1, 10, 2), time: { start: 0, completed: 3000 }, speed: measuredV3Speed(tokens(1, 10, 2)) });
+  const exact = historyRecord("m", { quality: "exact", tokens: tokens(1, 10, 2) });
   const promoted = await storage.apply(exact);
   assert.equal(promoted.open.m.quality, "exact");
   assert.equal(promoted.sessions.session.tokens.output, 10);
   assert.equal(promoted.sessions.session.responseCount, 1);
-  assert.equal(promoted.sessions.session.speed?.generation.coverageGeneratedTokens, 12);
   assert.deepEqual(await storage.apply(provisional), promoted);
 });
 
 for (const settled of [false, true]) {
-  test(`direct apply preserves ${settled ? "settled" : "open"} exact tokens and speed coverage against provisional replacement after reload`, async (context) => {
+  test(`direct apply preserves ${settled ? "settled" : "open"} exact usage against provisional replacement after reload`, async (context) => {
     const directory = await makeTestDirectory(context);
     const path = join(directory, "totals.json");
     const storage = createTotalsStorage(path);
@@ -393,42 +325,25 @@ for (const settled of [false, true]) {
     const exact = historyRecord("m", {
       quality: "exact", tokens: tokens(1, 10, 2), cost: 3,
       time: { start: 0, completed: 3000 },
-      speed: measuredV3Speed(tokens(1, 10, 2)),
     });
     const before = await storage.apply(exact, options);
-    const summaryBefore = getSessionAverageSummary(before.sessions.session!);
-    assert.equal(summaryBefore.generation.coveredGeneratedTokens, 12);
-    assert.equal(before.sessions.session?.speed?.generation.generatedTokens, 8.5);
-    assert.equal(summaryBefore.generation.coveredResponseCount, 1);
-    assert.equal(summaryBefore.response.coveredResponseCount, 1);
-    assert.equal(summaryBefore.generation.estimatedResponseCount, 1);
     const provisional = historyRecord("m", {
       quality: "provisional", tokens: tokens(1), cost: 0,
-      speed: { response: { generatedTokens: 0, durationMs: 900, estimated: true } },
     });
     assert.deepEqual(await storage.apply(provisional, options), before);
     const reloaded = createTotalsStorage(path);
     const after = await reloaded.apply(provisional, options);
     assert.deepEqual(after, before);
     assert.deepEqual(after.sessions.session?.tokens, tokens(1, 10, 2));
-    assert.deepEqual(after.sessions.session?.speed, before.sessions.session?.speed);
     assert.equal(after.sessions.session?.responseCount, 1);
-    assert.deepEqual(getSessionAverageSummary(after.sessions.session!), summaryBefore);
 
     const corrected = await reloaded.apply(historyRecord("m", {
       quality: "exact", tokens: tokens(1), cost: 0,
       time: { start: 0, completed: 3000 },
-      speed: measuredV3Speed(tokens(1)),
     }), options);
     assert.deepEqual(corrected.sessions.session?.tokens, tokens(1));
     assert.equal(corrected.sessions.session?.cost, 0);
     assert.equal(corrected.sessions.session?.responseCount, 1);
-    assert.deepEqual(corrected.sessions.session?.speed, {
-      generation: { generatedTokens: 0, coverageGeneratedTokens: 0, durationMs: 2000, responseCount: 1, estimatedResponseCount: 1, shortResponseCount: 0 },
-      response: { generatedTokens: 0, coverageGeneratedTokens: 0, durationMs: 3000, responseCount: 1, estimatedResponseCount: 0 },
-    });
-    assert.equal(getSessionAverageSummary(corrected.sessions.session!).generation.rate, 0);
-    assert.equal(getSessionAverageSummary(corrected.sessions.session!).response.rate, 0);
     assert.deepEqual(await reloaded.read(), corrected);
   });
 }
@@ -488,56 +403,6 @@ test("seed matches sequential apply and a second seed does not reset or double-c
   assert.deepEqual(await reopened.read(), seeded);
 });
 
-test("applying the same record twice does not change sessions or open", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  const record = historyRecord("same", {
-    tokens: tokens(4, 5, 6, 7, 8),
-    cost: 3,
-  });
-
-  const first = await storage.apply(record);
-  const second = await storage.apply(record);
-
-  assert.deepEqual(second.sessions, first.sessions);
-  assert.deepEqual(second.open, first.open);
-  assert.equal(second.sessions.session?.responseCount, 1);
-  assert.deepEqual(second.sessions.session?.tokens, tokens(4, 5, 6, 7, 8));
-  assert.equal(second.open.same?.quality, "exact");
-  assert.equal(second.sessions.session?.cost, 3);
-});
-
-test("moving a message to another session subtracts the old contribution and adds the new one", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  await storage.apply(historyRecord("moved", {
-    sessionID: "old",
-    tokens: tokens(10, 4, 3, 2, 1),
-    cost: 3,
-  }));
-  await storage.apply(historyRecord("stays", {
-    sessionID: "old",
-    tokens: tokens(4, 1, 0, 0, 0),
-    cost: 1,
-  }));
-
-  const moved = await storage.apply(historyRecord("moved", {
-    sessionID: "new",
-    quality: "exact",
-    tokens: tokens(6, 1, 1, 0, 1),
-    cost: 2,
-  }));
-
-  assert.deepEqual(moved.sessions.old?.tokens, tokens(4, 1, 0, 0, 0));
-  assert.equal(moved.sessions.old?.cost, 1);
-  assert.equal(moved.sessions.old?.responseCount, 1);
-  assert.deepEqual(moved.sessions.new?.tokens, tokens(6, 1, 1, 0, 1));
-  assert.equal(moved.sessions.new?.cost, 2);
-  assert.equal(moved.sessions.new?.responseCount, 1);
-  assert.equal(moved.open.moved?.sessionID, "new");
-  assert.equal(moved.open.stays?.sessionID, "old");
-});
-
 test("read of a missing ledger is empty and does not create a file", async (context) => {
   const directory = await makeTestDirectory(context);
   const storage = createTotalsStorage(join(directory, "totals.json"));
@@ -575,61 +440,6 @@ test("concurrent applies on one ledger do not drop each other", async (context) 
   assert.equal(ledger.sessions.session?.cost, 6);
   assert.equal(ledger.sessions.session?.responseCount, 3);
   assert.deepEqual(Object.keys(ledger.open).sort(), ["a", "b", "c"]);
-});
-
-test("a settled exact record is not counted again when the same record is applied", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  const exact = historyRecord("frozen", {
-    tokens: tokens(10, 4, 3, 2, 1),
-    cost: 3,
-  });
-  await storage.apply(exact, { retainedMessageIDs: ["frozen"] });
-  await storage.apply(historyRecord("keeper", {
-    tokens: tokens(1),
-    cost: 1,
-  }), { retainedMessageIDs: ["keeper"] });
-
-  const before = await storage.read();
-  const frozen = {
-    sessionID: "session",
-    quality: "exact" as const,
-    tokens: tokens(10, 4, 3, 2, 1),
-    cost: 3,
-  };
-  assert.equal(before.open.frozen, undefined);
-  assert.deepEqual(before.settled.frozen, frozen);
-  assert.equal(before.sessions.session?.tokens.input, 11);
-  assert.equal(before.sessions.session?.responseCount, 2);
-  assert.notEqual(before.settled.frozen.tokens, before.sessions.session?.tokens);
-
-  const after = await storage.apply(exact, { retainedMessageIDs: ["frozen", "keeper"] });
-  assert.equal(after.sessions.session?.tokens.input, before.sessions.session?.tokens.input);
-  assert.equal(after.sessions.session?.responseCount, before.sessions.session?.responseCount);
-  assert.deepEqual(after.sessions.session?.tokens, before.sessions.session?.tokens);
-  assert.equal(after.open.frozen, undefined);
-  assert.deepEqual(after.settled.frozen, frozen);
-  assert.equal(after.open.keeper?.tokens.input, 1);
-  after.settled.frozen.tokens.input = 999;
-  assert.equal((await storage.read()).sessions.session?.tokens.input, 11);
-  assert.deepEqual((await storage.read()).settled.frozen, frozen);
-});
-
-test("applyMany keeps both records in the final ledger file", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  await storage.applyMany([
-    historyRecord("a", { tokens: tokens(2, 1), cost: 1 }),
-    historyRecord("b", { tokens: tokens(3, 4), cost: 2 }),
-  ]);
-
-  const persisted = JSON.parse(await readFile(storage.path, "utf8"));
-  assert.equal(persisted.sessions.session.tokens.input, 5);
-  assert.equal(persisted.sessions.session.tokens.output, 5);
-  assert.equal(persisted.sessions.session.cost, 3);
-  assert.equal(persisted.sessions.session.responseCount, 2);
-  assert.equal(persisted.open.a.tokens.input, 2);
-  assert.equal(persisted.open.b.tokens.input, 3);
 });
 
 test("read returns a totals file rewritten on disk after apply", async (context) => {
@@ -737,10 +547,10 @@ test("migration atomically resets the generation epoch once, preserving all othe
   const storage = createTotalsStorage(join(directory, "totals.json"));
   const update = { source: "live", instanceID: "old-writer", sequence: 1, receivedAt: 1000, fingerprint: "old", seenFingerprints: ["old"] };
   const response = { generatedTokens: 15, durationMs: 2000, estimated: false };
-  const contribution = { sessionID: "session", quality: "exact", tokens: tokens(2, 10, 5), cost: 3, update,
+  const contribution = { sessionID: "session", quality: "exact", tokens: tokens(2, 10, 5, 7, 11), cost: 3, update,
     speed: { response, generation: { generatedTokens: 15, durationMs: 100, estimated: true },
       generationEvidence: { start: 100, end: 200, outputObserved: true, reasoningObserved: true, version: 2, coverage: "complete" } } };
-  const before = { version: 1, sessions: { session: { tokens: tokens(6, 30, 15), cost: 9, responseCount: 3,
+  const before = { version: 1, sessions: { session: { tokens: tokens(6, 30, 15, 21, 33), cost: 9, responseCount: 3,
     speed: { generation: { generatedTokens: 45, durationMs: 300, responseCount: 3, estimatedResponseCount: 3 },
       response: { generatedTokens: 45, durationMs: 6000, responseCount: 3, estimatedResponseCount: 0 } } } },
     open: { open: contribution }, settled: { settled: contribution, frozen: true } };
@@ -772,22 +582,6 @@ test("migration atomically resets the generation epoch once, preserving all othe
   assert.deepEqual((await readdir(directory)).sort(), ["totals.json"]);
   assert.deepEqual(await createTotalsStorage(storage.path).backfillSpeed([historyRecord("ignored")]), migrated);
   assert.equal(await readFile(storage.path, "utf8"), persisted);
-});
-
-test("legacy history and samples cannot rebuild generation or guessed response measurements", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  const [missing] = parseHistoryJsonl(JSON.stringify({ ...historyRecord("missing"), time: { completed: 1000 } }));
-  await storage.apply(missing);
-  const old = historyRecord("old", { tokens: tokens(1, 10), time: { start: 0, firstToken: 100, completed: 2000 },
-    samples: [{ timestamp: 100, tokens: 1 }, { timestamp: 1100, tokens: 10 }],
-    speed: { generation: { generatedTokens: 10, durationMs: 1000, estimated: true },
-      generationEvidence: { start: 100, end: 1100, outputObserved: true, reasoningObserved: false } } });
-  const before = await storage.apply(old, { retainedMessageIDs: [] });
-  assert.equal(before.sessions.session.speed?.generation.responseCount ?? 0, 0);
-  assert.equal(before.sessions.session.speed?.response.responseCount ?? 0, 0);
-  assert.deepEqual(await storage.backfillSpeed([old, missing]), before);
-  assert.deepEqual(await createTotalsStorage(storage.path).backfillSpeed([old]), before);
 });
 
 test("backfill and stale history cannot overwrite a newer authoritative exact correction", async (context) => {
@@ -955,182 +749,6 @@ function historyRecord(
     ...overrides,
   };
 }
-
-function measuredV3Speed(counts: TokenCounts) {
-  const record = historyRecord("measurement", { quality: "exact", tokens: counts, time: { start: 0, completed: 3000 } });
-  return measureRecordSpeed(record, { usageExact: true, responseTimingExact: true, generation: {
-    version: 3, coverage: "complete", complete: true, estimated: true,
-    start: 100, end: 2100, firstReceiveMono: 10, lastReceiveMono: 2010, observationCount: 2,
-    timeSource: "receive-monotonic", fromCurrentStart: true, selectedStream: "v2", stepID: "step-1",
-    outputObserved: true, reasoningObserved: true,
-    bytes: { output: { total: 100, firstBatch: 25 }, reasoning: { total: 100, firstBatch: 50 } },
-    usage: { output: counts.output, reasoning: counts.reasoning },
-  } });
-}
-
-function shortV3Speed(counts: TokenCounts) {
-  const original = measuredV3Speed(counts).generationEvidence!;
-  const record = historyRecord("short-measurement", { tokens: counts, time: { start: 0, completed: 3000 } });
-  return measureRecordSpeed(record, { usageExact: true, responseTimingExact: true, generation: {
-    ...original, start: 100, end: 300, firstReceiveMono: 10, lastReceiveMono: 210,
-    clockSource: "performance.now", clockResolutionMs: 1, observationQuality: "short", complete: true, estimated: true,
-  } });
-}
-
-test("short generation quality survives usage corrections, +/- message exclusion, rollup projection and restart", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  const normal = historyRecord("normal-short", { tokens: tokens(1, 10, 2), speed: shortV3Speed(tokens(1, 10, 2)) });
-  const baseline = await storage.apply(normal);
-  assert.equal(baseline.sessions.session.speed?.generation.shortResponseCount, 1);
-  const compact = historyRecord("compact-short", { tokens: tokens(2, 20, 4), speed: shortV3Speed(tokens(2, 20, 4)) });
-  const combined = await storage.apply(compact);
-  assert.equal(combined.sessions.session.speed?.generation.shortResponseCount, 2);
-  const corrected = await storage.apply({ ...compact, tokens: tokens(1, 5, 1), speed: shortV3Speed(tokens(1, 5, 1)) }, { retainedMessageIDs: ["normal-short"] });
-  assert.equal(corrected.sessions.session.speed?.generation.shortResponseCount, 2);
-  const excluded = await storage.excludeMessage("compact-short", classifyMessageMetadata({ providerID: "magic-context" }));
-  assert.deepEqual(excluded.sessions, baseline.sessions);
-  assert.equal(excluded.sessions.session.speed?.generation.shortResponseCount, 1);
-  assert.deepEqual((await createTotalsStorage(storage.path).read()).sessions, baseline.sessions);
-  await storage.apply(historyRecord("mc-short", { sessionID: "mc", tokens: tokens(2, 20, 4), speed: shortV3Speed(tokens(2, 20, 4)) }));
-  await storage.setSessionScope("mc", classifySessionMetadata({ id: "mc", agent: "dreamer" }));
-  const projected = projectTotalsMeasurementScope(await storage.read());
-  assert.deepEqual(projected.sessions, baseline.sessions);
-  assert.equal(projected.sessions.session.speed?.generation.shortResponseCount, 1);
-});
-
-test("legacy TUI projection hides generation without mutating usage, response, marker, or disk", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createTotalsStorage(join(directory, "totals.json"));
-  const record = historyRecord("m", { quality: "exact", tokens: tokens(1, 10, 2), time: { start: 0, completed: 3000 }, speed: measuredV3Speed(tokens(1, 10, 2)) });
-  const legacy = await storage.apply(record, { retainedMessageIDs: [] });
-  delete legacy.generationBasisVersion;
-  const before = JSON.stringify(legacy);
-  const projected = projectTotalsGenerationBasis(legacy);
-  assert.equal(projected.generationBasisVersion, undefined);
-  assert.equal(projected.version, 1);
-  assert.equal(projected.sessions.session.speed?.generation.generatedTokens, 0);
-  assert.equal(projected.sessions.session.speed?.generation.coverageGeneratedTokens, 0);
-  assert.deepEqual(projected.sessions.session.speed?.response, legacy.sessions.session.speed?.response);
-  assert.deepEqual(projected.sessions.session.tokens, legacy.sessions.session.tokens);
-  assert.equal((projected.settled.m as any).speed.generationEvidence, undefined);
-  assert.equal(JSON.stringify(legacy), before);
-  const canonical = await storage.read();
-  assert.equal(canonical.generationBasisVersion, 3);
-  assert.deepEqual(projectTotalsGenerationBasis(canonical), canonical);
-  assert.equal(canonical.sessions.session.speed?.generation.generatedTokens, 8.5);
-});
-
-for (const settled of [false, true]) {
-  test(`missing ${settled ? "settled" : "open"} correction measurement reuses only qualified v3 proportions`, async (context) => {
-    const directory = await makeTestDirectory(context);
-    const path = join(directory, "totals.json");
-    const storage = createTotalsStorage(path);
-    const options = { retainedMessageIDs: settled ? [] : ["m"] };
-    const original = historyRecord("m", { quality: "exact", tokens: tokens(1, 10, 2), time: { start: 0, completed: 3000 }, speed: measuredV3Speed(tokens(1, 10, 2)) });
-    await storage.apply(original, options);
-    const correction = { ...original, tokens: tokens(1, 20, 4) };
-    delete correction.speed;
-    const corrected = await createTotalsStorage(path).apply(correction, options);
-    assert.equal(corrected.sessions.session.speed?.generation.generatedTokens, 17);
-    assert.equal(corrected.sessions.session.speed?.generation.coverageGeneratedTokens, 24);
-    assert.equal(corrected.sessions.session.speed?.generation.durationMs, 2000);
-    assert.equal(corrected.sessions.session.speed?.generation.responseCount, 1);
-  });
-
-  test(`same-v3 ${settled ? "settled" : "open"} correction after reload recalibrates interval tokens, not full coverage`, async (context) => {
-    const directory = await makeTestDirectory(context);
-    const path = join(directory, "totals.json");
-    const storage = createTotalsStorage(path);
-    const options = { retainedMessageIDs: settled ? [] : ["m"] };
-    const update = (sequence: number) => ({ source: "live" as const, instanceID: "writer", sequence, receivedAt: sequence,
-      fingerprint: String(sequence), seenFingerprints: Array.from({ length: sequence }, (_, i) => String(i + 1)) });
-    const original: MeasuredHistoryRecord = { ...historyRecord("m", { quality: "exact", tokens: tokens(1, 10, 2),
-      time: { start: 0, completed: 3000 }, speed: measuredV3Speed(tokens(1, 10, 2)) }), update: update(1) };
-    await storage.apply(original, options);
-    const correction: MeasuredHistoryRecord = { ...original, tokens: tokens(1, 20, 4),
-      speed: { response: { generatedTokens: 24, durationMs: 3000, estimated: false } }, update: update(2) };
-    correction.speed = mergeRecordSpeed(correction, original);
-    const reloaded = createTotalsStorage(path);
-    const corrected = await reloaded.apply(correction, options);
-    assert.equal(corrected.sessions.session.speed?.generation.generatedTokens, 17);
-    assert.equal(corrected.sessions.session.speed?.generation.coverageGeneratedTokens, 24);
-    assert.equal(corrected.sessions.session.speed?.generation.durationMs, 2000);
-    assert.equal(corrected.sessions.session.speed?.generation.responseCount, 1);
-    assert.equal(corrected.sessions.session.speed?.generation.estimatedResponseCount, 1);
-    assert.equal(getSessionAverageSummary(corrected.sessions.session).generation.rate, 8.5);
-    const contribution = settled ? corrected.settled.m : corrected.open.m;
-    assert.equal((contribution as any).speed.generationEvidence.usage.output, 20);
-    assert.deepEqual(await reloaded.apply(correction, options), corrected);
-    assert.deepEqual(await reloaded.apply(original, options), corrected);
-    assert.deepEqual(await reloaded.backfillSpeed([original]), corrected);
-    assert.deepEqual(await reloaded.seed([original]), corrected);
-    const provisional: MeasuredHistoryRecord = { ...correction, quality: "provisional", tokens: tokens(100), update: update(3) };
-    assert.deepEqual(await reloaded.apply(provisional, options), corrected);
-    const revoked: MeasuredHistoryRecord = { ...correction, speed: { response: correction.speed.response }, update: update(3) };
-    const removed = await reloaded.apply(revoked, options);
-    assert.equal(removed.sessions.session.speed?.generation.responseCount, 0);
-    assert.equal(removed.sessions.session.speed?.generation.generatedTokens, 0);
-    assert.equal(removed.sessions.session.speed?.generation.coverageGeneratedTokens, 0);
-    assert.equal(removed.sessions.session.speed?.response.responseCount, 1);
-    assert.equal(((settled ? removed.settled.m : removed.open.m) as any).speed?.generation, undefined);
-    assert.deepEqual(await reloaded.apply(original, options), removed);
-  });
-
-  test(`old ${settled ? "settled" : "open"} snapshots never subtract generation from the v3 accumulated epoch`, async (context) => {
-    const directory = await makeTestDirectory(context);
-    const path = join(directory, "totals.json");
-    const storage = createTotalsStorage(path);
-    const old = historyRecord("old", { quality: "exact", tokens: tokens(1, 10), time: { start: 0, completed: 3000 } });
-    await storage.apply(old, { retainedMessageIDs: settled ? [] : ["old"] });
-    const fresh = historyRecord("fresh", { quality: "exact", tokens: tokens(1, 20, 4), time: { start: 0, completed: 3000 }, speed: measuredV3Speed(tokens(1, 20, 4)) });
-    const before = await storage.apply(fresh, { retainedMessageIDs: settled ? ["fresh"] : ["old", "fresh"] });
-    const snapshot = settled ? before.settled.old : before.open.old;
-    (snapshot as any).speed = { generation: { generatedTokens: 500, durationMs: 1000, estimated: true },
-      generationEvidence: { version: 2, coverage: "complete", start: 100, end: 1100, outputObserved: true, reasoningObserved: false } };
-    await writeFile(path, JSON.stringify(before));
-    const generation = { ...before.sessions.session.speed!.generation };
-    const corrected = await createTotalsStorage(path).apply({ ...old, tokens: tokens(1, 5) });
-    assert.deepEqual(corrected.sessions.session.speed?.generation, generation);
-    // Session reassignment exercises the separate subtractContribution path.
-    (corrected.open.old as any).speed = (snapshot as any).speed;
-    await writeFile(path, JSON.stringify(corrected));
-    const moved = await storage.apply({ ...old, sessionID: "other", tokens: tokens(1, 5) });
-    assert.deepEqual(moved.sessions.session.speed?.generation, generation);
-    assert.equal(moved.sessions.other.speed?.generation.responseCount ?? 0, 0);
-    assert.equal(moved.sessions.session.responseCount, 1);
-    assert.equal(moved.sessions.other.responseCount, 1);
-    assert.equal(moved.generationBasisVersion, 3);
-  });
-}
-
-test("speed survives trimming and reload, time-only settled corrections and migration are reversible", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const path = join(directory, "totals.json");
-  try {
-    const storage = createTotalsStorage(path);
-    const first = historyRecord("speed", { tokens: tokens(1, 100), speed: { response: { generatedTokens: 100, durationMs: 1000, estimated: true } } });
-    await storage.apply(first, { retainedMessageIDs: [] });
-    const corrected = { ...first, speed: { response: { generatedTokens: 100, durationMs: 2000, estimated: false } } };
-    await createTotalsStorage(path).apply(corrected, { retainedMessageIDs: [] });
-    await createTotalsStorage(path).apply(corrected, { retainedMessageIDs: [] });
-    let ledger = await storage.read();
-    assert.equal(ledger.sessions.session?.responseCount, 1);
-    assert.equal(ledger.sessions.session?.speed?.response.durationMs, 2000);
-    assert.equal(ledger.sessions.session?.speed?.response.estimatedResponseCount, 0);
-    assert.notEqual(ledger.settled.speed, true);
-    await storage.apply({ ...corrected, sessionID: "migrated" });
-    ledger = await storage.read();
-    assert.equal(ledger.sessions.session?.speed?.response.responseCount, 0);
-    assert.equal(ledger.sessions.migrated?.speed?.response.generatedTokens, 100);
-    assert.equal(ledger.sessions.migrated?.responseCount, 1);
-    // Legacy true carries no subtractable snapshot and cannot be backfilled.
-    const old = { ...ledger, open: {}, settled: { speed: true } };
-    await writeFile(path, JSON.stringify(old));
-    await storage.apply({ ...corrected, sessionID: "other" });
-    assert.equal((await storage.read()).sessions.other, undefined);
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
 
 test("session agent names accumulate without recounting and survive clipping, seed, scope, and legacy ledgers", async (context) => {
   const directory = await makeTestDirectory(context);

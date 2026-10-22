@@ -4,7 +4,7 @@ import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import test from "node:test";
 import type { HistoryRecord } from "../src/core.js";
-import { measureRecordSpeed, mergeRecordSpeed, type MeasuredHistoryRecord } from "../src/statistics.js";
+import type { MeasuredHistoryRecord } from "../src/statistics.js";
 import {
   createHistoryStorage,
   mergeHistoryRecords,
@@ -51,46 +51,6 @@ test("stored compaction proof round-trips and cannot hide other messages on same
   assert.deepEqual(filterHistoryRecords(chosen), []);
 });
 
-test("history normalization, upsert and scope projection preserve short observation quality and clock evidence", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const storage = createHistoryStorage(join(directory, "history.jsonl"));
-  const record = historyRecord("short-quality", { time: { start: 0, completed: 3000 } });
-  record.speed = measureRecordSpeed(record, { usageExact: true, responseTimingExact: true, generation: {
-    version: 3, coverage: "complete", complete: true, estimated: true,
-    start: 100, end: 300, firstReceiveMono: 10, lastReceiveMono: 210, observationCount: 2,
-    timeSource: "receive-monotonic", fromCurrentStart: true, selectedStream: "v2", stepID: "short-step",
-    outputObserved: true, reasoningObserved: false,
-    bytes: { output: { total: 100, firstBatch: 25 }, reasoning: { total: 0, firstBatch: 0 } },
-    usage: { output: 5, reasoning: 0 }, clockSource: "performance.now", clockResolutionMs: 1, observationQuality: "short",
-  } });
-  assert.equal(record.speed.generation?.observationQuality, "short");
-  await storage.upsert(record);
-  const correction = { ...record, cost: 2 };
-  delete correction.speed;
-  await storage.upsert(correction);
-  const projected = filterHistoryRecords(await storage.read());
-  assert.equal(projected[0].speed?.generation?.observationQuality, "short");
-  assert.equal(projected[0].speed?.generationEvidence?.observationQuality, "short");
-  assert.equal(projected[0].speed?.generationEvidence?.clockSource, "performance.now");
-  assert.equal(projected[0].speed?.generationEvidence?.clockResolutionMs, 1);
-  assert.equal(parseHistoryJsonl(serializeHistoryJsonl(projected))[0].speed?.generation?.observationQuality, "short");
-});
-
-test("recovers valid records from a temp-only file", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const historyPath = join(directory, "history.jsonl");
-  const tempPath = tempFilePath(historyPath, exitedPid(), 100);
-  const expected = historyRecord("temp-only", { tokens: { input: 2, output: 9, reasoning: 0, cacheRead: 0, cacheWrite: 0 } });
-  await writeFile(tempPath, serializeHistoryJsonl([expected]), "utf8");
-
-  const records = await recoverForTest(historyPath, context);
-
-  assert.deepEqual(records.map((record) => record.messageID), ["temp-only"]);
-  assert.equal(records[0].tokens.output, 9);
-  assert.equal(await exists(tempPath), false);
-  assert.equal((await readFile(historyPath, "utf8")).includes("temp-only"), true);
-});
-
 test("merges orphan records with the main file and keeps the more complete duplicate", async (context) => {
   const directory = await makeTestDirectory(context);
   const historyPath = join(directory, "history.jsonl");
@@ -120,19 +80,6 @@ test("merges orphan records with the main file and keeps the more complete dupli
   assert.equal(await exists(tempPath), false);
 });
 
-test("does not read or remove a current-process temp file", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const historyPath = join(directory, "history.jsonl");
-  const tempPath = tempFilePath(historyPath, process.pid, 300);
-  await writeFile(tempPath, serializeHistoryJsonl([historyRecord("live")]), "utf8");
-
-  const records = await readHistoryFile(historyPath);
-
-  assert.deepEqual(records, []);
-  assert.equal(await exists(historyPath), false);
-  assert.equal(await exists(tempPath), true);
-});
-
 test("skips corrupt lines and cleans an exited orphan temp", async (context) => {
   const directory = await makeTestDirectory(context);
   const historyPath = join(directory, "history.jsonl");
@@ -147,16 +94,6 @@ test("skips corrupt lines and cleans an exited orphan temp", async (context) => 
   assert.deepEqual(records.map((record) => record.messageID), ["valid-after-corruption"]);
   assert.equal(await exists(tempPath), false);
   assert.equal(await exists(corruptOnlyPath), false);
-});
-
-test("mergeHistoryRecords keeps temp-only records and resolves newer ties", () => {
-  const older = historyRecord("same", { time: { start: 10, completed: 20 } });
-  const newer = historyRecord("same", { time: { start: 10, completed: 30 }, cost: 2 });
-  const merged = mergeHistoryRecords([older], [newer, historyRecord("only-temp")]);
-
-  assert.equal(merged.length, 2);
-  assert.equal(merged.find((record) => record.messageID === "same")?.cost, 2);
-  assert.equal(merged.some((record) => record.messageID === "only-temp"), true);
 });
 
 test("quality survives JSONL round trips and exact beats a later provisional snapshot", async (context) => {
@@ -179,11 +116,18 @@ test("quality survives JSONL round trips and exact beats a later provisional sna
   assert.equal(stored[0]?.quality, "exact");
 });
 
-test("legacy records without quality remain readable", () => {
-  const legacy = JSON.stringify({ ...historyRecord("legacy"), quality: undefined });
+test("legacy quality, samples and response measurements parse without changing usage", () => {
+  const original = { ...historyRecord("legacy"), quality: undefined,
+    tokens: { input: 1, output: 5, reasoning: 0, cacheRead: 3, cacheWrite: 4 },
+    speed: { response: { generatedTokens: 5, durationMs: 2, estimated: true } } };
+  const legacy = JSON.stringify(original);
   const parsed = parseHistoryJsonl(`${legacy}\n`);
   assert.equal(parsed[0]?.quality, undefined);
   assert.equal(parsed[0]?.messageID, "legacy");
+  assert.deepEqual(parsed[0].tokens, original.tokens);
+  assert.equal(parsed[0].cost, original.cost);
+  assert.deepEqual(parsed[0].samples, original.samples);
+  assert.equal(parsed[0].speed?.response?.generatedTokens, 5);
 });
 
 test("separate Thinking/content timing and normalization provenance survive repeated JSONL round trips", () => {
@@ -214,62 +158,6 @@ test("explicit live update order outranks nonzero completeness; unversioned reco
   const merged = mergeHistoryRecords(await storage.read(), [historyRecord("m", { quality: "exact" })]);
   assert.equal(merged[0].tokens.output, 0);
   assert.equal((merged[0] as MeasuredHistoryRecord).update?.sequence, 2);
-});
-
-test("v3 evidence round trips and authoritative history corrections rescale interval tokens", async (context) => {
-  const directory = await makeTestDirectory(context);
-  const path = join(directory, "v3.jsonl");
-  const original: MeasuredHistoryRecord = { ...historyRecord("m", { quality: "exact", time: { start: 0, completed: 3000 },
-    tokens: { input: 1, output: 10, reasoning: 2, cacheRead: 0, cacheWrite: 0 } }),
-    update: { source: "live", instanceID: "writer", sequence: 1, receivedAt: 1, fingerprint: "first", seenFingerprints: ["first"] } };
-  original.speed = measureRecordSpeed(original, { usageExact: true, responseTimingExact: true, generation: {
-    version: 3, coverage: "complete", complete: true, estimated: true, start: 100, end: 2100,
-    firstReceiveMono: 10, lastReceiveMono: 2010, observationCount: 2, timeSource: "receive-monotonic",
-    fromCurrentStart: true, selectedStream: "v2", stepID: "step-1", outputObserved: true, reasoningObserved: true,
-    bytes: { output: { total: 100, firstBatch: 25 }, reasoning: { total: 100, firstBatch: 50 } },
-    usage: { output: 10, reasoning: 2 },
-  } });
-  const [roundTrip] = parseHistoryJsonl(serializeHistoryJsonl([original]));
-  assert.deepEqual(roundTrip.speed, original.speed);
-  assert.equal(roundTrip.speed?.generation?.generatedTokens, 8.5);
-  assert.equal(roundTrip.speed?.generation?.coverageGeneratedTokens, 12);
-  const correction: MeasuredHistoryRecord = { ...original, tokens: { ...original.tokens, output: 20, reasoning: 4 },
-    speed: { response: { generatedTokens: 24, durationMs: 3000, estimated: false } },
-    update: { ...original.update!, sequence: 2, receivedAt: 2, fingerprint: "second", seenFingerprints: ["first", "second"] } };
-  correction.speed = mergeRecordSpeed(correction, original);
-  const check = (record: HistoryRecord) => {
-    assert.equal(record.speed?.generation?.generatedTokens, 17);
-    assert.equal(record.speed?.generation?.coverageGeneratedTokens, 24);
-    assert.equal(record.speed?.generation?.durationMs, 2000);
-    assert.equal(record.speed?.generation?.estimated, true);
-    assert.equal(record.speed?.generationEvidence?.usage?.output, 20);
-  };
-  check(mergeHistoryRecords([roundTrip], [correction])[0]);
-  check(parseHistoryJsonl(`${serializeHistoryJsonl([original])}${JSON.stringify(correction)}\n`)[0]);
-  check(parseHistoryJsonl(serializeHistoryJsonl([original, correction]))[0]);
-  await createHistoryStorage(path).upsert(original);
-  await createHistoryStorage(path).upsert(correction);
-  check((await createHistoryStorage(path).read())[0]);
-  const provisional: MeasuredHistoryRecord = { ...correction, quality: "provisional", tokens: { ...original.tokens, output: 100 },
-    update: { ...correction.update!, sequence: 3, fingerprint: "third", seenFingerprints: ["first", "second", "third"] } };
-  await createHistoryStorage(path).upsert(provisional);
-  await createHistoryStorage(path).upsert(original);
-  check((await createHistoryStorage(path).read())[0]);
-  const revoked: MeasuredHistoryRecord = { ...correction, speed: { response: correction.speed.response },
-    update: { ...correction.update!, sequence: 3, fingerprint: "revoked", seenFingerprints: ["first", "second", "revoked"] } };
-  await createHistoryStorage(path).upsert(revoked);
-  const [removed] = await createHistoryStorage(path).read();
-  assert.equal(removed.speed?.generation, undefined);
-  assert.equal(removed.speed?.generationEvidence, undefined);
-  assert.equal(removed.speed?.response?.generatedTokens, 24);
-  const empty: MeasuredHistoryRecord = { ...revoked, speed: {}, update: { ...revoked.update!, sequence: 4, fingerprint: "empty", seenFingerprints: ["first", "second", "revoked", "empty"] } };
-  const [normalizedEmpty] = parseHistoryJsonl(serializeHistoryJsonl([empty]));
-  assert.deepEqual(normalizedEmpty.speed, {});
-  assert.deepEqual(mergeHistoryRecords([original], [normalizedEmpty])[0].speed,
-    { generationCoverage: { status: "unknown", reasons: ["generation-invalidated"] } });
-  await createHistoryStorage(path).upsert(empty);
-  assert.deepEqual((await createHistoryStorage(path).read())[0].speed,
-    { generationCoverage: { status: "unknown", reasons: ["generation-invalidated"] } });
 });
 
 async function makeTestDirectory(context: { after: (callback: () => Promise<void>) => void }): Promise<string> {

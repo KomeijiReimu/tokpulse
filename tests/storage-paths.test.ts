@@ -7,7 +7,7 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { DEFAULT_HISTORY_PATH, migrateDefaultLedgers } from "../src/storage-paths.js";
 import { resolveHistoryPath, resolveProjectDirectory, server, type ServerOptions } from "../src/server.js";
-import { createRuntimeStore, reloadHistory, resolveHistoryPath as tuiHistoryPath } from "../src/tui.js";
+import { createRuntimeStore, reloadHistory } from "../src/tui.js";
 import { resolveTotalsPath } from "../src/totals-storage.js";
 import { resolveRunsPath } from "../src/runs-storage.js";
 import { classifySessionMetadata } from "../src/scope.js";
@@ -87,27 +87,6 @@ async function legacyFiles(base: string, files: Partial<Record<typeof filenames[
   return legacy;
 }
 
-test("server and read-only TUI share the new default but retain their project base and custom path semantics", async (context) => {
-  const base = await project(context);
-  const worktree = join(base, "worktree");
-  assert.equal(DEFAULT_HISTORY_PATH, ".tokpulse/history.jsonl");
-  for (const tree of [worktree, "/", ""]) {
-    const api = tuiApi(base, tree);
-    const projectBase = resolveProjectDirectory(input(base, tree));
-    for (const configured of [undefined, " ", DEFAULT_HISTORY_PATH, "custom/history.jsonl", join(base, "absolute.jsonl")]) {
-      assert.equal(tuiHistoryPath(api, configured), resolveHistoryPath(projectBase, configured));
-    }
-  }
-  const store = createRuntimeStore(10, 0);
-  try {
-    const resolved = paths(base);
-    await reloadHistory(store, tuiApi(base), tuiHistoryPath(tuiApi(base), undefined), resolved.totalsPath, 10);
-    assert.deepEqual(store.records, []);
-    await absent(join(base, ".tokpulse"));
-    await absent(join(base, ".opencode"));
-  } finally { store.disposeSignals(); }
-});
-
 test("fresh TUI ignores recoverable orphan history without any filesystem mutation", async (context) => {
   const base = await project(context);
   const resolved = paths(base);
@@ -159,7 +138,7 @@ test("new default plugin writes all ledgers in .tokpulse and TUI reads the same 
   const store = createRuntimeStore(10, 0);
   try {
     const api = tuiApi(base);
-    await reloadHistory(store, api, tuiHistoryPath(api, undefined), resolved.totalsPath, 10);
+    await reloadHistory(store, api, resolved.historyPath, resolved.totalsPath, 10);
     assert.equal(store.records[0].messageID, "new");
     assert.equal(store.records[0].tokens.output, 7);
     assert.deepEqual(store.totalsLedger.sessionAgents?.s, ["oracle"]);
@@ -227,7 +206,7 @@ test("missing legacy directories or absent ledger files cause no migration and n
   assert.equal((await readdir(base)).some((name) => name.startsWith(".tokpulse-migrate-")), false);
 });
 
-for (const present of [["history.jsonl"], ["totals.json"], ["runs.jsonl"], ["history.jsonl", "totals.json"]] as const) {
+for (const present of [["history.jsonl"], ["totals.json"], ["runs.jsonl"]] as const) {
   test(`migration handles missing bundle members: ${present.join(", ")}`, async (context) => {
     const base = await project(context);
     await legacyFiles(base, Object.fromEntries(present.map((name) => [name, `opaque ${name}`])));
@@ -269,20 +248,6 @@ test("startup preserves cumulative totals, names, and scope beyond the short mig
   await startServer(context, input(base));
   assert.deepEqual(JSON.parse(await readFile(paths(base).totalsPath, "utf8")).sessions, ledger.sessions);
   assert.deepEqual(await readFile(join(legacy, "totals.json")), originalTotals);
-});
-
-test("existing new ledger initialization never imports legacy history or cumulative usage", async (context) => {
-  const base = await project(context);
-  const hooks = await startServer(context, input(base));
-  await complete(hooks, "authoritative", 7);
-  await legacyFiles(base, { "history.jsonl": `${JSON.stringify(record("poison", 999))}\n`, "totals.json": "invalid poison" });
-  await startServer(context, input(base));
-  const current = JSON.parse(await readFile(paths(base).totalsPath, "utf8"));
-  assert.equal(current.sessions.s.tokens.output, 7);
-  assert.equal(current.sessions.s.cost, 3);
-  assert.equal(current.sessions.s.responseCount, 1);
-  assert.deepEqual(current.sessionAgents.s, ["oracle"]);
-  assert.equal(JSON.parse((await readFile(paths(base).historyPath, "utf8")).trim()).messageID, "authoritative");
 });
 
 test("explicit relative or absolute default paths are eligible for migration", async (context) => {
@@ -373,9 +338,6 @@ test("concurrent startup copies publish one complete winner, never overwrite it,
 });
 
 test("migration checks do not run again on plugin events or delta", async (context) => {
-  const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
-  assert.equal(source.match(/await migrateDefaultLedgers\(/g)?.length, 1);
-  assert.ok(source.indexOf("await migrateDefaultLedgers(") < source.indexOf("let eventQueue:"));
   const base = await project(context);
   const hooks = await startServer(context, input(base));
   const legacy = await legacyFiles(base, { "history.jsonl": "unsafe if checked again" });

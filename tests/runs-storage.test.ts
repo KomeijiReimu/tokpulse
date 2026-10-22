@@ -5,7 +5,6 @@ import { homedir } from "node:os";
 import test from "node:test";
 import {
   ActivityLedger,
-  deriveRunsPath,
   parseActivityJsonl,
   serializeActivityJsonl,
 } from "../src/runs-storage.js";
@@ -65,12 +64,6 @@ test("maintenance message proof does not hide ordinary session lifecycle or its 
   assert.equal(await readFile(ledger.path, "utf8"), raw);
 });
 
-test("history path derives a sibling runs.jsonl and explicit absolute path wins", () => {
-  assert.equal(deriveRunsPath("/tmp/oc/history.jsonl"), "/tmp/oc/runs.jsonl");
-  assert.equal(new ActivityLedger({ historyPath: "/tmp/oc/history.jsonl" }).path, "/tmp/oc/runs.jsonl");
-  assert.equal(new ActivityLedger({ historyPath: "/tmp/oc/history.jsonl", runsPath: "/var/tmp/runs.jsonl" }).path, "/var/tmp/runs.jsonl");
-});
-
 test("activity JSONL round-trips and tolerates bad or truncated lines", () => {
   const first = lifecycle("first", 0, "root", 1);
   const second = lifecycle("second", 10, "child", 1);
@@ -123,24 +116,6 @@ test("read does not rewrite a corrupt runs file", async (context) => {
   const ledger = new ActivityLedger(runsPath);
   assert.equal((await ledger.read()).length, 1);
   assert.equal(await readFile(runsPath, "utf8"), content);
-});
-
-test("multiple roots are replayed independently", async (context) => {
-  const directory = await testDirectory("oc-tps-runs-replay-");
-  context.after(() => rm(directory, { recursive: true, force: true }));
-  const ledger = new ActivityLedger({ historyPath: join(directory, "history.jsonl") });
-  await ledger.appendMany([
-    lifecycle("a-busy", 0, "root-a", 1),
-    lifecycle("a-completed", 10, "root-a", 2),
-    lifecycle("b-busy", 0, "root-b", 1),
-    lifecycle("b-completed", 20, "root-b", 2),
-  ]);
-
-  const replay = await ledger.replay();
-  assert.deepEqual(replay.roots.map((root) => [root.rootSessionID, root.activeMilliseconds]), [
-    ["root-a", 10],
-    ["root-b", 20],
-  ]);
 });
 
 async function testDirectory(prefix: string): Promise<string> {

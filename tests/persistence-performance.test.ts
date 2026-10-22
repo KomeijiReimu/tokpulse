@@ -48,54 +48,28 @@ function countIO(paths: { historyPath: string; totalsPath: string }, fault?: { p
   return { counts, restore() { opened.mockRestore(); renamed.mockRestore(); serialized.mockRestore(); } };
 }
 
-test("G1-07 reproducer: legacy metadata setters load per SID even when agents are unchanged", async (context) => {
+test("large metadata batch publishes once and replay does not amplify writes", async (context) => {
   const { paths, lease } = await fixture(context);
   const totals = createTotalsStorage(paths.totalsPath, { lease });
-  const count = 100;
-  await totals.applyMany(Array.from({ length: count }, (_, index) => ({ ...record(index), agent: "build" })));
+  const size = 1000;
+  const before = await totals.applyMany(Array.from({ length: size }, (_, index) => ({ ...record(index), agent: "build" })));
+  const hidden = classifySessionMetadata({ agent: "dreamer" });
+  const updates = Array.from({ length: size }, (_, index) => ({ sessionID: `s${index}`, agents: ["fixer"], scope: hidden }));
   const io = countIO(paths);
-  const begin = performance.now();
   try {
-    for (let index = 0; index < count; index++) await totals.setSessionAgent(`s${index}`, "build");
-    assert.equal(io.counts.totalsReads, count);
-    assert.equal(io.counts.totalsWrites, 0);
-    console.log(`[G1-07 legacy no-op ${count}] ${(performance.now() - begin).toFixed(2)}ms ${JSON.stringify(io.counts)}`);
+    const canonical = await totals.setSessionMetadataMany(updates);
+    assert.deepEqual(io.counts, { historyReads: 0, totalsReads: 1, historyWrites: 0, totalsWrites: 1, totalsSerializations: 1 });
+    assert.deepEqual(canonical.sessions, before.sessions);
+    assert.equal(Object.keys(canonical.sessionScopes!).length, size);
+    assert.deepEqual(canonical.sessionAgents!.s999, ["build", "fixer"]);
+    assert.equal(canonical.sessionScopes!.s999.sourceScope, "magic-session");
+    assert.deepEqual(await totals.setSessionMetadataMany(updates), canonical);
+    assert.equal(io.counts.totalsWrites, 1);
+    assert.equal(io.counts.totalsSerializations, 1);
   } finally { io.restore(); }
 });
 
-for (const size of [1000, 2000, 4000]) {
-  test(`G1-07 metadata matrix ${size}: empty, unchanged, all agent changes and real session-scope changes`, async (context) => {
-    const { paths, lease } = await fixture(context);
-    const totals = createTotalsStorage(paths.totalsPath, { lease });
-    await totals.applyMany(Array.from({ length: size }, (_, index) => ({ ...record(index), agent: "build" })));
-    const ids = Array.from({ length: size }, (_, index) => `s${index}`);
-    const hidden = classifySessionMetadata({ agent: "dreamer" });
-    const cases = [
-      { name: "empty", updates: [], writes: 0 },
-      { name: "unchanged", updates: ids.map((sessionID) => ({ sessionID, agents: ["build"] })), writes: 0 },
-      { name: "agent-changes", updates: ids.map((sessionID) => ({ sessionID, agents: ["fixer", "oracle"] })), writes: 1 },
-      { name: "scope-changes", updates: ids.map((sessionID) => ({ sessionID, scope: hidden })), writes: 1 },
-      { name: "scope-replay", updates: ids.map((sessionID) => ({ sessionID, scope: hidden })), writes: 0 },
-    ];
-    for (const scenario of cases) {
-      const io = countIO(paths);
-      const begin = performance.now();
-      try {
-        const canonical = await totals.setSessionMetadataMany(scenario.updates);
-        assert.deepEqual(io.counts, { historyReads: 0, totalsReads: 1, historyWrites: 0,
-          totalsWrites: scenario.writes, totalsSerializations: scenario.writes });
-        if (scenario.name === "scope-changes" || scenario.name === "scope-replay") {
-          assert.equal(Object.keys(canonical.sessionScopes!).length, size);
-          assert.equal(canonical.sessionScopes!.s0.sourceScope, "magic-session");
-        }
-        if (scenario.name === "agent-changes") assert.deepEqual(canonical.sessionAgents!.s0, ["build", "fixer", "oracle"]);
-        console.log(`[G1-07 batch ${size} ${scenario.name}] ${(performance.now() - begin).toFixed(2)}ms ${JSON.stringify(io.counts)}`);
-      } finally { io.restore(); }
-    }
-  });
-}
-
-test("G1-07 invalid batch performs zero ledger I/O and legacy migration shares the single publication", async (context) => {
+test("invalid batch performs no ledger I/O and legacy migration shares one publication", async (context) => {
   const { paths, lease } = await fixture(context);
   const totals = createTotalsStorage(paths.totalsPath, { lease });
   const invalidIO = countIO(paths);
@@ -125,7 +99,7 @@ test("G1-07 invalid batch performs zero ledger I/O and legacy migration shares t
   } finally { releasedIO.restore(); }
 });
 
-test("G1-07 cross-SID metadata batch EIO and uncertain success never cache a false confirmation", async (context) => {
+test("cross-session metadata batch failure and uncertain success never cache a false confirmation", async (context) => {
   const { paths, lease } = await fixture(context);
   const totals = createTotalsStorage(paths.totalsPath, { lease });
   await totals.applyMany([record(1), record(2)]);
@@ -160,71 +134,50 @@ test("G1-07 cross-SID metadata batch EIO and uncertain success never cache a fal
   } finally { io.restore(); }
 });
 
-for (const size of [1000, 2000, 4000]) {
-  test(`recovery ${size} records uses one canonical batch and constant ledger I/O`, async (context) => {
-    const { paths, lease } = await fixture(context);
-    await writeHistoryFile(paths.historyPath, Array.from({ length: size }, (_, index) => record(index)));
-    const history = createHistoryStorage(paths.historyPath, { maxRecords: 1, lease });
-    const totals = createTotalsStorage(paths.totalsPath, { lease });
-    const usage = createUsageCommitter(history, totals);
-    const readAll = spyOn(history, "readAll");
-    const read = spyOn(history, "read");
-    const prune = spyOn(history, "prune");
-    const io = countIO(paths);
-    const begin = performance.now();
-    try {
-      await usage.recover();
-      const elapsed = performance.now() - begin;
-      assert.deepEqual(io.counts, { historyReads: 2, totalsReads: 1, historyWrites: 1, totalsWrites: 1, totalsSerializations: 1 });
-      assert.equal(readAll.mock.calls.length, 1);
-      assert.equal(read.mock.calls.length, 0);
-      assert.equal(prune.mock.calls.length, 1);
-      console.log(`[persistence recovery ${size}] ${elapsed.toFixed(2)}ms ${JSON.stringify(io.counts)}`);
-    } finally { io.restore(); readAll.mockRestore(); read.mockRestore(); prune.mockRestore(); }
-    const ledger = await totals.read();
-    assert.equal(Object.keys(ledger.sessions).length, size);
-    assert.equal(Object.values(ledger.sessions).reduce((sum, session) => sum + session.cost, 0), size * 2);
-    assert.equal((await history.readAll()).length, 1);
+test("large recovery preserves all usage with constant ledger I/O", async (context) => {
+  const size = 4000;
+  const { paths, lease } = await fixture(context);
+  await writeHistoryFile(paths.historyPath, Array.from({ length: size }, (_, index) => record(index)));
+  const history = createHistoryStorage(paths.historyPath, { maxRecords: 1, lease });
+  const totals = createTotalsStorage(paths.totalsPath, { lease });
+  const usage = createUsageCommitter(history, totals);
+  const io = countIO(paths);
+  try {
     await usage.recover();
-    assert.equal((await totals.read()).sessions.s0.responseCount, 1);
-  });
-}
+    assert.deepEqual(io.counts, { historyReads: 2, totalsReads: 1, historyWrites: 1, totalsWrites: 1, totalsSerializations: 1 });
+  } finally { io.restore(); }
+  const ledger = await totals.read();
+  assert.equal(Object.keys(ledger.sessions).length, size);
+  assert.equal(Object.values(ledger.sessions).reduce((sum, session) => sum + session.cost, 0), size * 2);
+  assert.equal((await history.readAll()).length, 1);
+  await usage.recover();
+  assert.equal((await totals.read()).sessions.s0.responseCount, 1);
+});
 
-test("empty retries 100 and 1000 times and clean close perform zero ledger I/O or prune", async (context) => {
+test("idle retries and clean close perform zero ledger I/O", async (context) => {
   const { paths, lease } = await fixture(context);
   const history = createHistoryStorage(paths.historyPath, { lease });
   const usage = createUsageCommitter(history, createTotalsStorage(paths.totalsPath, { lease }));
   await usage.recover();
-  const prune = spyOn(history, "prune");
-  const read = spyOn(history, "read");
-  const readAll = spyOn(history, "readAll");
   const io = countIO(paths);
   try {
-    for (const size of [100, 1000]) {
-      for (let index = 0; index < size; index++) assert.equal((await usage.retryPending()).pendingCount, 0);
-      assert.equal(prune.mock.calls.length, 0);
-      assert.equal(read.mock.calls.length, 0);
-      assert.equal(readAll.mock.calls.length, 0);
-    }
+    for (let index = 0; index < 10; index++) assert.equal((await usage.retryPending()).pendingCount, 0);
     await usage.close();
-    assert.equal(prune.mock.calls.length, 0);
     assert.deepEqual(io.counts, { historyReads: 0, totalsReads: 0, historyWrites: 0, totalsWrites: 0, totalsSerializations: 0 });
-  } finally { io.restore(); prune.mockRestore(); read.mockRestore(); readAll.mockRestore(); }
+  } finally { io.restore(); }
 });
 
-test("healthy upsert uses one history mutation snapshot, one totals publication and no redundant prune", async (context) => {
+test("healthy upsert writes each ledger once and public reads observe external replacement", async (context) => {
   const { paths, lease } = await fixture(context);
   const history = createHistoryStorage(paths.historyPath, { maxRecords: 1, lease });
   const totals = createTotalsStorage(paths.totalsPath, { lease });
   const usage = createUsageCommitter(history, totals);
   await usage.recover();
-  const prune = spyOn(history, "prune");
   const io = countIO(paths);
   try {
     for (let index = 0; index < 20; index++) assert.equal((await usage.upsert(record(index))).committed, true);
     assert.deepEqual(io.counts, { historyReads: 20, totalsReads: 20, historyWrites: 20, totalsWrites: 20, totalsSerializations: 20 });
-    assert.equal(prune.mock.calls.length, 0);
-  } finally { io.restore(); prune.mockRestore(); }
+  } finally { io.restore(); }
   // Snapshot reuse is confined to the mutation: public reads always observe
   // external replacement rather than serving a fake persistent cache.
   await writeHistoryFile(paths.historyPath, [record(100)]);

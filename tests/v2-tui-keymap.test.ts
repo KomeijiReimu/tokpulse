@@ -1,17 +1,17 @@
+import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
+import type { KeymapCommand,ToastOptions } from "@opencode/plugin/tui/context";
+import { registerCommaBindings,registerEnabledFields } from "@opentui/keymap/addons";
+import { createTestKeymap } from "@opentui/keymap/testing";
 import assert from "node:assert/strict";
-import test from "node:test";
 import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { createComponent, createComputed, createContext, createRoot, createSignal, getOwner, onCleanup, runWithOwner, untrack, useContext } from "solid-js";
-import { createTestKeymap } from "@opentui/keymap/testing";
-import { registerCommaBindings, registerEnabledFields } from "@opentui/keymap/addons";
-import type { KeymapCommand, ToastOptions } from "@opencode/plugin/tui/context";
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { createRuntimeStore, registerTokenPulseCommands, resolveOptions, tokenPulseBindings } from "../src/tui.js";
-import { createV2TuiBridge, type V2TuiContext } from "../src/tui-v2.js";
+import { createComponent,createComputed,createContext,createRoot,createSignal,getOwner,onCleanup,runWithOwner,untrack,useContext } from "solid-js";
+import { createV2TuiBridge,type V2TuiContext } from "../src/tui-v2.js";
+import { createRuntimeStore,registerTokenPulseCommands,resolveOptions,tokenPulseBindings } from "../src/tui.js";
 
 type Binding = NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["bindings"]>[number];
 type HostBindings = Record<string, { key: string; cmd: string }[]>;
@@ -112,9 +112,22 @@ if (process.env.TOKPULSE_V2_KEYMAP_NATIVE !== "1") {
     const result = await promisify(execFile)(process.execPath, ["test", "--preload", "@opentui/solid/preload", fileURLToPath(import.meta.url)], {
       env: { ...process.env, TOKPULSE_V2_KEYMAP_NATIVE: "1", TMPDIR: cache },
     });
-    assert.match(result.stdout + result.stderr, /4 pass/);
+    assert.match(result.stdout + result.stderr, /5 pass/);
   });
 } else {
+  test("explicitly disabled shortcuts do not dispatch a native key but retain command discovery", async () => {
+    const f = host(); let calls = 0;
+    const installed = install(f, "none", () => { calls++; });
+    try {
+      f.native.host.press("t", { ctrl: true, shift: true });
+      assert.equal(calls, 0);
+      assert.equal(f.commands.get("oc-tps.history")?.bind, false);
+      assert.equal(f.native.keymap.runCommand("oc-tps.history").ok, true);
+      assert.equal(calls, 1);
+      assert.deepEqual(f.native.diagnostics.errors, []);
+    } finally { await installed.dispose(); f.disposeHost(); f.native.cleanup(); }
+  });
+
   test("V2 palette/slash discovery survives base bindings; native details default and host overrides stay base-only", async () => {
     const configurations: HostBindings[] = [{}, { "oc-tps.details": [{ key: "ctrl+g", cmd: "oc-tps.details" }] }];
     for (const configured of configurations) {

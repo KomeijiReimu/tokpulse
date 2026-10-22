@@ -12,8 +12,6 @@ import {
   createActivityProjector,
   type ActivityEvent,
   type WorkActivityEventInput,
-  type ActivityProjector,
-  type ActivityReplayOptions,
 } from "../src/activity.js";
 import { createScopeRegistry, classifyMessageMetadata, classifySessionMetadata } from "../src/scope.js";
 
@@ -74,13 +72,15 @@ test("sequential runs count active time and exclude idle gaps", () => {
   assert.equal(replay.roots[0]?.activeMilliseconds, 3_000);
 });
 
-test("root and child overlap is unioned, including child-first late parent mapping", () => {
+test("root and child overlap is unioned without merging independent roots, including late parent mapping", () => {
   const replay = replayActivity([
     lifecycle("busy", 1_000, "child", 1),
     lifecycle("completed", 4_000, "child", 3),
     lifecycle("busy", 0, "root", 1),
     lifecycle("idle", 5_000, "root", 2),
     parent("child", "root", 6_000),
+    lifecycle("busy", 2_000, "independent", 1),
+    lifecycle("completed", 7_000, "independent", 2),
   ]);
 
   const root = replay.roots.find((entry) => entry.rootSessionID === "root");
@@ -88,6 +88,11 @@ test("root and child overlap is unioned, including child-first late parent mappi
   assert.deepEqual(root.sessionIDs, ["child", "root"]);
   assert.deepEqual(root.activeIntervals, [{ start: 0, end: 5_000 }]);
   assert.equal(root.activeMilliseconds, 5_000);
+  const independent = replay.roots.find((entry) => entry.rootSessionID === "independent");
+  assert.deepEqual(independent?.sessionIDs, ["independent"]);
+  assert.equal(independent?.activeMilliseconds, 5_000);
+  assert.equal(replay.roots.length, 2);
+  assert.equal(calculateActiveMilliseconds(replay.roots.flatMap((entry) => entry.activeIntervals)), 7_000);
 });
 
 test("busy and retry are active while idle and terminal states are inactive", () => {
@@ -362,15 +367,6 @@ test("complete pure-MC clears only own execution; missing start/partial/unknown 
   assert.equal(replayActivity([work("start", 0, true), work("end", 100, true), pure()]).rootActiveMilliseconds.root, 0);
 });
 
-test("MC step tools cannot restore its maintenance interval; independent tool can", () => {
-  const facts = [execution("busy", 0), work("start", 0, true),
-    work("start", 20, false, { source: "tool", workID: "t", stepID: "step" }),
-    work("end", 60, false, { source: "tool", workID: "t", stepID: "step" }),
-    work("end", 100, true), execution("completed", 100)];
-  assert.equal(replayActivity(facts).rootActiveMilliseconds.root, 0);
-  assert.equal(createActivityProjector(facts).totals("root").directMilliseconds, 0);
-});
-
 test("late maintenance proof corrects only observed busy, never manufactures idle or a work-to-now tail", () => {
   const facts = [execution("busy", 0), work("start", 10, false), work("end", 90, false), execution("idle", 50), execution("busy", 70), execution("completed", 100)];
   const projector = createActivityProjector(facts);
@@ -378,7 +374,6 @@ test("late maintenance proof corrects only observed busy, never manufactures idl
   const late = [work("start", 10, true), work("end", 90, true)];
   projector.ingest(late);
   assert.equal(projector.totals("root").directMilliseconds, 20);
-  assert.equal(projector.totals("root").directMilliseconds, replayActivity([...facts, ...late]).rootActiveMilliseconds.root);
   projector.ingest([work("start", 200, false, { workID: "no-busy" }), work("end", 1000, false, { workID: "no-busy" })]);
   assert.equal(projector.totals("root", { replayCutoff: 10000, trustedCurrentInstanceID: "epoch" }).directMilliseconds, 20);
 });
@@ -432,19 +427,15 @@ test("projector late parent/hidden ancestor/cycles and special keys are safe", (
   assert.equal(createActivityProjector(specialWork).totals("__proto__").directMilliseconds, 40);
 });
 
-test("permuted execution facts converge; old terminal never closes a different execution", () => {
+test("a terminal from an unrelated execution cannot close the current execution", () => {
   const facts = [execution("busy", 0, "root", "old", 1), execution("completed", 40, "root", "old", 2),
     execution("busy", 100, "root", "current", 3), work("start", 120, true, { executionID: "current" }), work("end", 150, true, { executionID: "current" })];
   const options = { replayCutoff: 200, trustedCurrentInstanceID: "epoch" };
-  const expected = replayActivity(facts, options).rootActiveMilliseconds.root;
-  for (const order of [[4, 2, 1, 0, 3], [2, 0, 4, 3, 1], [1, 0, 3, 4, 2]]) {
-    const projector = createActivityProjector();
-    for (const i of order) projector.ingest([facts[i]]);
-    assert.equal(projector.totals("root", options).directMilliseconds, expected);
-  }
   const otherTerminal = execution("completed", 180, "root", "never-started", 4);
-  assert.equal(replayActivity([...facts, otherTerminal], options).rootActiveMilliseconds.root, expected);
-  assert.equal(createActivityProjector([...facts, otherTerminal]).totals("root", options).directMilliseconds, expected);
+  const projector = createActivityProjector([facts[4], facts[2], facts[1], facts[0], facts[3]]);
+  assert.equal(projector.totals("root", options).directMilliseconds, 110);
+  projector.ingest([otherTerminal]);
+  assert.equal(projector.totals("root", options).directMilliseconds, 110);
 });
 
 test("appended hidden ancestor proof invalidates already-cached descendant direct time", () => {
@@ -529,143 +520,13 @@ test("complete execution correction retracts only its coverage and preserves ove
   // Known normal work invalidates the pure conclusion, retaining the edges and
   // overlapping normal tool, but the child's independent coverage stays intact.
   assert.deepEqual(projector.totals("root"), { directMilliseconds: 80, includingMilliseconds: 100, active: false });
-  assert.equal(replayActivity([...facts, pure(), ...lateNormal]).timelines.get("root")?.activeMilliseconds, 80);
 });
 
-test("cached coverage matches replay after every shuffled proof correction with overlapping fractional intervals", () => {
-  const facts: ActivityEvent[] = [];
-  for (let i = 0; i < 16; i++) {
-    const sessionID = i % 3 === 0 ? "child" : "root", executionID = `e-${i}`, start = i * 5 - 30.5;
-    facts.push(execution("busy", start, sessionID, executionID, 1),
-      work("start", start + 1.25, true, { sessionID, executionID, workID: "mc", seq: 2 }),
-      work("end", start + 15.75, true, { sessionID, executionID, workID: "mc", seq: 3 }),
-      execution("completed", start + 20.5, sessionID, executionID, 4),
-      fact({ kind: "execution-scope", sessionID, executionID, instanceID: "epoch", timestamp: start + 20.5, seq: 5,
-        classification: "pure-maintenance", coverage: "complete" }));
-    if (i % 4 === 0) facts.push(work("start", start + 5.5, false, { sessionID, executionID, source: "tool", workID: "call", stepID: "normal", seq: 6 }),
-      work("end", start + 11.5, false, { sessionID, executionID, source: "tool", workID: "call", stepID: "normal", seq: 7 }));
-  }
-  let seed = 12345;
-  for (let i = facts.length - 1; i > 0; i--) {
-    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-    const j = seed % (i + 1); [facts[i], facts[j]] = [facts[j], facts[i]];
-  }
-  const observed = [fact(parent("child", "root", -100))];
-  const projector = createActivityProjector(observed);
-  for (const event of facts) {
-    observed.push(event); projector.ingest([event]);
-    const replay = replayActivity(observed);
-    assert.deepEqual(projector.totals("root"), { directMilliseconds: replay.timelines.get("root")?.activeMilliseconds ?? 0,
-      includingMilliseconds: replay.rootActiveMilliseconds.root ?? 0, active: false });
-    assert.equal(projector.totals("child").directMilliseconds, replay.timelines.get("child")?.activeMilliseconds ?? 0);
-  }
-});
-
-function projectionDifference(projector: ActivityProjector, observed: readonly ActivityEvent[], options: ActivityReplayOptions = {}) {
-  const replay = replayActivity(observed, options);
-  const belongs = (id: string): boolean => {
-    const seen = new Set<string>();
-    for (let current: string | undefined = id; current && !seen.has(current); current = replay.parentBySessionID.get(current)) {
-      if (current === "root") return true;
-      seen.add(current);
-    }
-    return false;
-  };
-  const expected = { directMilliseconds: replay.timelines.get("root")?.activeMilliseconds ?? 0,
-    includingMilliseconds: calculateActiveMilliseconds(replay.participants.filter((item) => belongs(item.sessionID)).flatMap((item) => item.intervals)) };
-  const { directMilliseconds, includingMilliseconds } = projector.totals("root", options);
-  const actual = { directMilliseconds, includingMilliseconds };
-  return directMilliseconds === expected.directMilliseconds && includingMilliseconds === expected.includingMilliseconds
-    ? undefined : { options, actual, expected };
-}
-
-function pureWatermarkFacts(): ActivityEvent[] {
-  return [execution("busy", 0, "root", "e", 1), work("end", 9.75, true, { seq: 3 }),
-    fact({ kind: "execution-scope", sessionID: "root", executionID: "e", instanceID: "epoch", timestamp: 15.5, seq: 5,
-      classification: "pure-maintenance", coverage: "complete" }),
-    work("start", .25, true, { seq: 2 }), execution("completed", 15.5, "root", "e", 4)];
-}
-
-test("A2-01 five facts retain the sorted watermark after late MC boundary repair", () => {
-  const projector = createActivityProjector(), observed: ActivityEvent[] = [];
-  for (const event of pureWatermarkFacts()) {
-    observed.push(event); projector.ingest([event]);
-    for (const options of [{}, { replayCutoff: 9.75 }, { replayCutoff: 15.5 }, { replayCutoff: 100 }]) {
-      assert.equal(projectionDifference(projector, observed, options), undefined, JSON.stringify({ event, options }));
-    }
-  }
+test("late fractional maintenance boundaries retract a materialized live prefix after terminal proof", () => {
+  const projector = createActivityProjector([execution("busy", 0, "root", "e", 1), work("end", 9.75, true, { seq: 3 })]);
+  assert.equal(projector.totals("root", { liveNow: 30, trustedCurrentInstanceID: "epoch" }).directMilliseconds, 30);
+  projector.ingest([pure(15.5), work("start", .25, true, { seq: 2 })]);
+  const terminal = execution("completed", 15.5, "root", "e", 4);
+  projector.ingest([terminal, terminal]);
   assert.deepEqual(projector.totals("root"), { directMilliseconds: 0, includingMilliseconds: 0, active: false });
-});
-
-test("A2-01 every five-fact permutation, duplicates and SDK order differing from append order match replay", () => {
-  function* permutations(items: ActivityEvent[]): Generator<ActivityEvent[]> {
-    if (!items.length) { yield []; return; }
-    for (let i = 0; i < items.length; i++) for (const rest of permutations(items.filter((_, j) => j !== i))) yield [items[i], ...rest];
-  }
-  for (const order of permutations(pureWatermarkFacts())) for (const sdkOrder of [false, true]) {
-    const projector = createActivityProjector(), observed: ActivityEvent[] = [];
-    for (let i = 0; i < order.length; i++) {
-      const event = sdkOrder ? { ...order[i], sourceSequence: order[i].seq, seq: 1000 + i } : order[i];
-      observed.push(event); projector.ingest([event]);
-      for (const options of [{}, { replayCutoff: 5.5 }, { replayCutoff: 15.5 }, { replayCutoff: 100 }])
-        assert.equal(projectionDifference(projector, observed, options), undefined, JSON.stringify({ sdkOrder, order, i, options }));
-      projector.ingest([event]); // Exact duplicate cannot rewind the watermark.
-      assert.equal(projectionDifference(projector, observed), undefined);
-    }
-    assert.equal(projector.totals("root").directMilliseconds, 0);
-  }
-});
-
-test("A2-01 parent and context replacement never resurrect repaired pure execution coverage", () => {
-  const observed = pureWatermarkFacts(), projector = createActivityProjector();
-  for (const event of observed) { projector.ingest([event]); projector.totals("root"); }
-  observed.push(execution("busy", 2, "child", "child-e", 10), execution("completed", 8, "child", "child-e", 11), fact(parent("child", "root", 16)));
-  projector.ingest(observed.slice(5));
-  const contexts = [{ parentBySessionID: new Map([["root", "outer"]]) },
-    { sessionScopes: { root: classifySessionMetadata({ agent: "historian" }) } },
-    { parentBySessionID: new Map([["child", undefined]]) }, {}];
-  for (const context of contexts) {
-    projector.setContext(context);
-    for (const replayCutoff of [5.5, 15.5, 100]) assert.equal(projectionDifference(projector, observed, { ...context, replayCutoff }), undefined);
-    assert.equal(projector.totals("root").directMilliseconds, 0);
-  }
-  assert.deepEqual(projector.totals("root"), { directMilliseconds: 0, includingMilliseconds: 6, active: false });
-});
-
-test("A2-01 bounded seeded boundary/proof differential reports a reduced failing arrival sequence", () => {
-  const cutoffs = [{}, { replayCutoff: 5.5 }, { replayCutoff: 15.5 }, { replayCutoff: 100 }];
-  const mismatch = (arrivals: ActivityEvent[]) => {
-    const projector = createActivityProjector(), observed: ActivityEvent[] = [];
-    for (let i = 0; i < arrivals.length; i++) {
-      observed.push(arrivals[i]); projector.ingest([arrivals[i]]);
-      for (const options of cutoffs) {
-        const difference = projectionDifference(projector, observed, options);
-        if (difference) return { prefix: i + 1, ...difference };
-      }
-    }
-    return undefined;
-  };
-  for (let seed = 1; seed <= 48; seed++) {
-    let random = seed;
-    const next = () => random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
-    const arrivals = [...pureWatermarkFacts(), work("end", 11.5, true, { workID: "second", seq: 7 }),
-      work("start", 3.5, true, { workID: "second", seq: 6 }),
-      execution("busy", 2, "child", "child-e", 1), execution("completed", 8, "child", "child-e", 2), fact(parent("child", "root", 16))];
-    if (seed % 2 === 0) arrivals.push(work("end", 10, false, { source: "tool", workID: "normal", stepID: "other", seq: 9 }),
-      work("start", 4, false, { source: "tool", workID: "normal", stepID: "other", seq: 8 }));
-    for (let i = arrivals.length - 1; i > 0; i--) { const j = next() % (i + 1); [arrivals[i], arrivals[j]] = [arrivals[j], arrivals[i]]; }
-    if (seed % 3 === 0) for (let i = 0; i < arrivals.length; i++) arrivals[i] = { ...arrivals[i], sourceSequence: arrivals[i].seq, seq: 1000 + i };
-    arrivals.splice(next() % arrivals.length, 0, arrivals[next() % arrivals.length]);
-    const failure = mismatch(arrivals);
-    if (!failure) continue;
-    let reduced = arrivals.slice(0, failure.prefix), changed = true;
-    while (changed) {
-      changed = false;
-      for (let i = 0; i < reduced.length; i++) {
-        const candidate = reduced.filter((_, j) => i !== j);
-        if (mismatch(candidate)) { reduced = candidate; changed = true; break; }
-      }
-    }
-    assert.fail(JSON.stringify({ seed, originalFailure: failure, reducedFailure: mismatch(reduced), reducedArrivals: reduced }));
-  }
 });

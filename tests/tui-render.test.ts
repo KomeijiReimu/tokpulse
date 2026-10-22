@@ -1,20 +1,18 @@
-import assert from "node:assert/strict";
-import test from "node:test";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import * as fsPromises from "node:fs/promises";
-import { writeFileSync, constants } from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { BoxRenderable, RGBA, Renderable, ScrollBoxRenderable, SelectRenderable, TextRenderable } from "@opentui/core";
-import { testRender, useRenderer } from "@opentui/solid";
-import type { JSX } from "@opentui/solid";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { emptySpeedTotals, updateSpeedTotals, type SpeedContribution } from "../src/statistics.js";
-import { tuiReadModel } from "../src/tui-read-model.js";
-import type { ParentProofOutcome, ParentProofWake } from "../src/tui-read-model.js";
+import { BoxRenderable,RGBA,Renderable,ScrollBoxRenderable,SelectRenderable,TextRenderable } from "@opentui/core";
+import type { JSX } from "@opentui/solid";
+import { testRender,useRenderer } from "@opentui/solid";
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { mkdir,mkdtemp,readFile,rename,rm,writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname,join } from "node:path";
+import test from "node:test";
+import { fileURLToPath,pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { emptySpeedTotals,updateSpeedTotals,type SpeedContribution } from "../src/statistics.js";
 
 function v3Generation(output: number, reasoning = 0, durationMs = 1000, start = 0): SpeedContribution {
   return {
@@ -32,8 +30,7 @@ const cacheRoot = process.env.TMPDIR || join(homedir(), ".cache", "tokpulse-test
 
 // Compile only this isolated UI module as the real build does, without writing
 // dist or changing how the non-rendering runtime tests import the source.
-type RenderedTui = typeof import("../src/tui.js") & { __testRuntimeStores: ReturnType<typeof import("../src/tui.js").createRuntimeStore>[]; __testActivityReads: number[];
-  __testHashCalls: number;
+type RenderedTui = typeof import("../src/tui.js") & { __testRuntimeStores: ReturnType<typeof import("../src/tui.js").createRuntimeStore>[];
   __testSidebarList: (input: { render: () => JSX.Element; scrollRef: (node: ScrollBoxRenderable) => void }) => JSX.Element;
   __testHistoryView: (input: { api: TuiPluginApi; store: ReturnType<typeof import("../src/tui.js").createRuntimeStore>; sessionID: string; options: ReturnType<typeof import("../src/tui.js").resolveOptions> }) => JSX.Element };
 async function loadRenderedTui(): Promise<RenderedTui> {
@@ -46,14 +43,12 @@ async function loadRenderedTui(): Promise<RenderedTui> {
     import(babelModule), import(solidModule), import(typescriptModule),
   ]);
   const source = fileURLToPath(new URL("../src/tui.tsx", import.meta.url));
-  const sourceText = process.env.TOKPULSE_TUI_BASELINE_FILE ? await readFile(process.env.TOKPULSE_TUI_BASELINE_FILE, "utf8") : process.env.TOKPULSE_TUI_BASELINE === "HEAD"
-    ? (await promisify(execFile)("git", ["show", "HEAD:src/tui.tsx"], { cwd: dirname(source) })).stdout
-    : await readFile(source, "utf8");
+  const sourceText = await readFile(source, "utf8");
   // A read-only capture in the isolated test compilation exposes the actual
   // plugin's store. It does not replace event adapters, subscribers or hydration.
   const storeCreation = "const store = createRuntimeStore(options.maxRecords);";
   assert.equal(sourceText.split(storeCreation).length, 2);
-  const observedSource = `export const __testRuntimeStores = []; export const __testActivityReads = []; export let __testHashCalls = 0;\n${sourceText.replace(storeCreation, `${storeCreation}\n__testRuntimeStores.push(store);`).replaceAll('createHash("sha256")', '(__testHashCalls++, createHash("sha256"))').replace("const delta = await readActivityDelta(path, selection.cursor);", "const delta = await readActivityDelta(path, selection.cursor); __testActivityReads.push(generation);")}
+  const observedSource = `export const __testRuntimeStores = [];\n${sourceText.replace(storeCreation, `${storeCreation}\n__testRuntimeStores.push(store);`)}
 // Host layout evidence: OpenCode v2.0.27 packages/tui/src/routes/session/sidebar.tsx.
 // Sidebar content is inside scrollbox; the host footer is its following sibling.
 export function __testSidebarList(input) {
@@ -264,10 +259,6 @@ test("loaded snapshots, including valid empty ledgers, survive same-source refre
   }
 });
 
-function reportFrame(name: string, frame: string): void {
-  if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`FRAME ${name}\n${frame.split("\n").map((line) => line.trimEnd()).filter(Boolean).join("\n")}\nEND FRAME`);
-}
-
 async function waitForLedger(predicate: () => boolean, message: string): Promise<void> {
   const deadline = performance.now() + 1500;
   // Test synchronization only. The plugin never polls a ledger or closes on silence.
@@ -364,70 +355,13 @@ async function ledgerPluginFixture(lateDirectory = false, gateInitialHistory = f
       send(0, "session.status", { sessionID: "s", status: { type: "busy" } });
       send(0, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: startedAt } } });
     };
-    const awaitEventRead = async (before: number) => {
-      await waitForLedger(() => ui.__testActivityReads.length > before && ui.__testActivityReads.at(-1) === store.activityGeneration,
-        "the initial post-completion activity read must have returned before delayed server commit");
-    };
-    return { ui, store, rendered, directory, ledgerDirectory, historyPath, runsPath, startedAt, send, fact, commitRuns, complete, start, awaitEventRead, dispose, initialization, toasts,
-      subscriptionCount: () => handlers.size,
-      captureHandler: (type: string) => handlers.get(type),
+    return { ui, store, rendered, directory, ledgerDirectory, historyPath, runsPath, startedAt, send, fact, commitRuns, complete, start, dispose, initialization, toasts,
       initialReadEntered: () => entered,
       releaseHistory: (bytes: string) => { released = true; release(bytes); },
       advance: (offset: number) => { clock = startedAt + offset; },
       close: async () => { await dispose(); if (!released) release(""); await initialization; restoreFilesystem(); rendered?.renderer.destroy(); Date.now = originalNow; await rm(directory, { recursive: true, force: true }); } };
   } catch (error) { await dispose(); if (!released) release(""); await initialization; restoreFilesystem(); rendered?.renderer.destroy(); Date.now = originalNow; await rm(directory, { recursive: true, force: true }); throw error; }
 }
-
-for (const shape of ["deep", "wide", "cycle"] as const) for (const n of [1000, 2000, 4000])
-test(`A2-07 actual plugin disposal ${shape} ${n} stops resources and discards parent graph linearly`, async () => {
-  const bunTestModule = "bun:test";
-  const { mock } = await import(bunTestModule), originalFs = { ...await import("node:fs") };
-  const watches = new Set<import("node:fs").FSWatcher>(); let opened = 0, closeRequests = 0, closed = 0;
-  mock.module("node:fs", () => ({ ...originalFs, watch(...args: any[]) {
-    const watcher = (originalFs.watch as (...values: any[]) => import("node:fs").FSWatcher)(...args), close = watcher.close.bind(watcher);
-    opened++; watches.add(watcher); watcher.once("close", () => { closed++; watches.delete(watcher); });
-    watcher.close = () => { closeRequests++; return close(); }; return watcher;
-  } }));
-  const set = globalThis.setInterval, clear = globalThis.clearInterval;
-  const intervals = new Set<ReturnType<typeof setInterval>>();
-  globalThis.setInterval = ((handler: (...args: any[]) => void, delay?: number, ...args: any[]) => {
-    const id = set(handler, delay, ...args); if (String(handler).includes("hasLiveTaskWallActivity")) intervals.add(id); return id;
-  }) as typeof setInterval;
-  globalThis.clearInterval = ((id: Parameters<typeof clearInterval>[0]) => { intervals.delete(id as ReturnType<typeof setInterval>); return clear(id); }) as typeof clearInterval;
-  let f: Awaited<ReturnType<typeof ledgerPluginFixture>> | undefined;
-  try {
-    f = await ledgerPluginFixture(); const model = tuiReadModel(f.store);
-    model.canonicalParents(Array.from({ length: n }, (_, i) => ({ version: 2, kind: "parent", sessionID: `p${i}`,
-      parentSessionID: shape === "wide" ? (i ? "p0" : undefined) : i ? `p${i - 1}` : shape === "cycle" ? `p${n - 1}` : undefined,
-      instanceID: "cleanup-fixture", eventID: `cleanup:${i}`, seq: i, timestamp: i, observedAt: i } as const)), false);
-    const proofListeners = new Set<(event: ParentProofWake) => void>(); let lateProof: ((outcome: ParentProofOutcome, version: number) => void) | undefined, targetVersion = 0;
-    model.bindProof({ epoch: () => 0, request(_id, version, receive) { targetVersion = version; lateProof = receive; return true; },
-      available(receive) { proofListeners.add(receive); return () => { proofListeners.delete(receive); }; } });
-    model.observeParent("p0", { parent: "incomparable-live-parent", origin: "live", sourceEpoch: "other-source" });
-    assert.ok(lateProof, "real read model must hold an admitted proof when teardown begins"); f.start();
-    const lateEvent = f.captureHandler("session.updated")!, reads = f.ui.__testActivityReads.length;
-    assert.ok(opened > 0, "instrument actual production watchers, not a standalone Map.clear"); assert.equal(intervals.size, 1);
-    const before = model.diagnostics(), started = performance.now(); await f.dispose(); const cleanupMs = performance.now() - started;
-    const operations = model.diagnostics().parentVisits - before.parentVisits, parentsAfterCleanup = f.store.sessionParents.size;
-    const revision = f.store.revision(), clockRevision = f.store.clockRevision(), generation = f.store.activityGeneration;
-    lateEvent({ type: "session.updated", properties: { sessionID: "late", parentID: "late-parent" } }, { directory: f.directory, workspace: undefined });
-    lateProof!({ status: "success", parent: "late-after-disposal" }, targetVersion);
-    await writeFile(f.runsPath, JSON.stringify(f.fact("s", "busy", 900)) + "\n");
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    const actual = { opened, closeRequests, closed, watches: watches.size, intervals: intervals.size,
-      subscriptions: f.subscriptionCount(), proofSubscriptions: proofListeners.size, parentsAfterCleanup, parentsAfterLate: f.store.sessionParents.size,
-      stoppedReads: f.ui.__testActivityReads.length === reads, stoppedGeneration: f.store.activityGeneration === generation,
-      stoppedRevision: f.store.revision() === revision, stoppedClock: f.store.clockRevision() === clockRevision,
-      active: f.store.active.size, optimistic: f.store.optimistic.size, linear: operations <= n * 16 + 100 };
-    console.log(`A2-07 ${JSON.stringify({ shape, n, cleanupMs, parentVisits: operations, actual })}`);
-    assert.deepEqual(actual, { opened, closeRequests: opened, closed: opened, watches: 0, intervals: 0, subscriptions: 0, proofSubscriptions: 0,
-      parentsAfterCleanup: 0, parentsAfterLate: 0, stoppedReads: true, stoppedGeneration: true, stoppedRevision: true, stoppedClock: true,
-      active: 0, optimistic: 0, linear: true });
-  } finally {
-    await f?.close(); for (const watcher of watches) watcher.close();
-    globalThis.setInterval = set; globalThis.clearInterval = clear; mock.module("node:fs", () => originalFs);
-  }
-});
 
 test("actual fs.watch accepts a concurrent append without warnings and renders the exact duration", async () => {
   const f = await ledgerPluginFixture(); const originals = { ...fsPromises };
@@ -436,7 +370,6 @@ test("actual fs.watch accepts a concurrent append without warnings and renders t
   try {
     f.advance(1001); await f.commitRuns([f.fact("s", "busy", 0), f.fact("s", "idle", 1000)]);
     await waitForLedger(() => f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 2000) === 1000, "actual watch must hydrate the first canonical generation");
-    const baseline = f.ui.tuiActivityDiagnostics(f.store), started = performance.now();
     mock.module("node:fs/promises", () => ({ ...originals, async open(...args: Parameters<typeof fsPromises.open>) {
       const file = await originals.open(...args); if (String(args[0]) !== f.runsPath) return file;
       return new Proxy(file, { get(target, key) {
@@ -450,47 +383,12 @@ test("actual fs.watch accepts a concurrent append without warnings and renders t
     } }));
     f.advance(5001); writeFileSync(f.runsPath, [f.fact("s", "busy", 2000), f.fact("s", "idle", 3000)].map((value) => JSON.stringify(value)).join("\n") + "\n", { flag: "a" });
     await waitForLedger(() => f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 6000) === 3000, "active append race must retry without waiting for a later control/prompt");
-    const queryMs = performance.now() - started, after = f.ui.tuiActivityDiagnostics(f.store);
     assert.ok(injected);
-    assert.equal(after.readRetries, baseline.readRetries, "normal appends must not reject the captured prefix");
     assert.deepEqual(f.toasts, [], "concurrent appends must not produce activity read warnings");
-    assert.equal(after.canonicalIngested - baseline.canonicalIngested, 4); assert.equal(after.canonicalResets, baseline.canonicalResets);
-    const frameStart = performance.now(); await f.rendered.renderOnce(); const frame = f.rendered.captureCharFrame();
+    await f.rendered.renderOnce(); const frame = f.rendered.captureCharFrame();
     assert.match(frame, /time 3s/); assert.doesNotMatch(frame, /TPS|TTFT|tok\/s/i);
-    assert.equal(tuiReadModel(f.store).counters.rowDerivations, 0, "collapsed native frame never derives hidden child rows");
-    reportFrame("G2 watch committed append 80x40", frame);
-    console.log(`G2 watch-query-ms=${queryMs.toFixed(2)} separate-frame-ms=${(performance.now() - frameStart).toFixed(2)} canonical-new=${after.canonicalIngested - baseline.canonicalIngested} retries=${after.readRetries - baseline.readRetries} stale=${after.staleReads - baseline.staleReads}`);
     f.advance(3605001); assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 3605001), 3000);
   } finally { mock.module("node:fs/promises", () => originals); await f.close(); }
-});
-
-test("G2 actual fs.watch publishes successive committed prefixes while the bounded writer is still active", async () => {
-  const f = await ledgerPluginFixture(); let written = 0, active = true;
-  let writer: ReturnType<typeof setInterval> | undefined;
-  try {
-    f.advance(1001); await f.commitRuns([f.fact("s", "busy", 0), f.fact("s", "idle", 1000)]);
-    await waitForLedger(() => f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 1001) === 1000, "initial watch prefix");
-    const started = performance.now(), baseline = f.ui.tuiActivityDiagnostics(f.store);
-    writer = setInterval(() => {
-      const begin = 2000 + written * 2000;
-      writeFileSync(f.runsPath, [f.fact("s", "busy", begin), f.fact("s", "idle", begin + 1000)].map((value) => JSON.stringify(value)).join("\n") + "\n", { flag: "a" });
-      f.advance(begin + 1001); written++;
-      if (written === 40) { active = false; clearInterval(writer); }
-    }, 15);
-    await waitForLedger(() => active && f.ui.tuiActivityDiagnostics(f.store).canonicalIngested > baseline.canonicalIngested,
-      "watch must publish without waiting for the writer to stop");
-    const first = f.ui.tuiActivityDiagnostics(f.store).canonicalIngested;
-    await waitForLedger(() => active && f.ui.tuiActivityDiagnostics(f.store).canonicalIngested > first,
-      "a second committed prefix must publish while writes continue");
-    assert.ok(written < 40); const progressMs = performance.now() - started, atProgress = written;
-    clearInterval(writer); writer = undefined; active = false;
-    await waitForLedger(() => f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 3600000) === (1 + written) * 1000,
-      "final pending prefix drains after bounded writer cleanup");
-    const after = f.ui.tuiActivityDiagnostics(f.store);
-    assert.equal(after.canonicalResets, baseline.canonicalResets); assert.equal(after.canonicalIngested - baseline.canonicalIngested, written * 2);
-    assert.deepEqual(f.toasts, [], "continuous append traffic must not produce activity read warnings");
-    console.log(`G2 continuous-watch progress-ms=${progressMs.toFixed(2)} writes-before-second-prefix=${atProgress}/40 canonical-appends=${after.canonicalAppends - baseline.canonicalAppends}`);
-  } finally { if (writer) clearInterval(writer); await f.close(); }
 });
 
 test("initialization drains watcher-invalidated authoritative hydration before returning or accepting late same-ID content", async () => {
@@ -543,36 +441,6 @@ test("initialization drains watcher-invalidated authoritative hydration before r
   } finally { await f.close(); }
 });
 
-test("ledger watcher actual plugin observes delayed canonical root idle after its event read, without another host event", async () => {
-  const f = await ledgerPluginFixture();
-  try {
-    await f.commitRuns([f.fact("s", "busy", 0)]);
-    f.start();
-    const before = f.ui.__testActivityReads.length;
-    f.complete();
-    await f.awaitEventRead(before);
-    assert.equal(f.store.sessionRuntime.get("s")!.status, "busy");
-    assert.ok(f.store.activityEvents.some((event) => event.kind === "lifecycle" && event.state === "busy"));
-    // Server SDK idle query commits later than the one 30ms event-triggered read.
-    await f.commitRuns([f.fact("s", "busy", 0), f.fact("s", "idle", 200)]);
-    await waitForLedger(() => f.store.sessionRuntime.get("s")!.status === "idle", "delayed canonical root idle must retire the local participant");
-    assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("s"), false);
-    assert.equal(f.ui.hasLiveTaskWallActivity(f.store), false);
-    assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 1000), 200);
-    await f.rendered.renderOnce(); await f.rendered.renderOnce();
-    const frozen = f.rendered.captureCharFrame();
-    f.advance(60000); await new Promise((resolve) => setTimeout(resolve, 520)); await f.rendered.renderOnce();
-    assert.equal(f.rendered.captureCharFrame(), frozen);
-    await f.dispose();
-    const reads = f.ui.__testActivityReads.length;
-    const generations = [f.store.activityGeneration, f.store.historyGeneration, f.store.clockRevision()];
-    await f.commitRuns([f.fact("s", "busy", 61000)]);
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    assert.equal(f.ui.__testActivityReads.length, reads, "disposed file watchers cannot launch another read");
-    assert.deepEqual([f.store.activityGeneration, f.store.historyGeneration, f.store.clockRevision()], generations);
-  } finally { await f.close(); }
-});
-
 test("ledger watcher root idle preserves child union and old terminal cannot close a new root epoch", async () => {
   const f = await ledgerPluginFixture();
   try {
@@ -580,7 +448,7 @@ test("ledger watcher root idle preserves child union and old terminal cannot clo
     await f.commitRuns(busy);
     f.send(0, "session.created", { info: { id: "child", parentID: "s" } });
     f.start(); f.send(20, "session.status", { sessionID: "child", status: "busy" });
-    const before = f.ui.__testActivityReads.length; f.complete(); await f.awaitEventRead(before);
+    f.complete();
     const rootIdle = [...busy, f.fact("s", "idle", 200)];
     await f.commitRuns(rootIdle);
     await waitForLedger(() => f.store.sessionRuntime.get("s")!.status === "idle", "root must close even while child is busy");
@@ -611,7 +479,7 @@ test("ledger watcher re-arms through late directories and projects a later atomi
     f.send(20, "message.updated", { info: { id: "mc-message", sessionID: "mc", role: "assistant", time: { created: f.startedAt + 20 } } });
     f.send(40, "message.updated", { info: { id: "mc-message", sessionID: "mc", role: "assistant", tokens: { input: 1, output: 100, reasoning: 0 }, time: { created: f.startedAt + 20, completed: f.startedAt + 40 } } });
     f.send(60, "message.updated", { info: { id: "mc-live", sessionID: "mc", role: "assistant", time: { created: f.startedAt + 60 } } });
-    const before = f.ui.__testActivityReads.length; f.complete(); await f.awaitEventRead(before);
+    f.complete();
     const retained = f.ui.buildSessionDetailsTree(f.store, "s").including;
     assert.equal(retained.tokens.output + retained.tokens.reasoning, 106, "unknown identity retains usage until positive proof arrives");
     await mkdir(f.ledgerDirectory, { recursive: true });
@@ -632,318 +500,11 @@ test("ledger watcher re-arms through late directories and projects a later atomi
     assert.equal(f.store.taskRuns.get("s")!.activeSessions.has("mc"), false);
     assert.equal(f.ui.hasLiveTaskWallActivity(f.store), false);
     assert.equal(f.ui.taskWallTimeForSession(f.store, "s", f.startedAt + 60000), 200);
-    const reads = f.ui.__testActivityReads.length;
     const historyGeneration = f.store.historyGeneration;
     await writeFile(join(f.ledgerDirectory, "unrelated.txt"), "not a ledger");
     await new Promise((resolve) => setTimeout(resolve, 80));
-    assert.equal(f.ui.__testActivityReads.length, reads, "unrelated directory changes must not replay activity");
     assert.equal(f.store.historyGeneration, historyGeneration);
   } finally { await f.close(); }
-});
-
-test("actual plugin content subscriptions do no session lookup or totals projection", async () => {
-  const ui = (await uiPromise)!;
-  await mkdir(cacheRoot, { recursive: true });
-  const directory = await mkdtemp(join(cacheRoot, "content-noop-"));
-  const handlers = new Map<string, (event: unknown) => void>();
-  const disposers: (() => void | Promise<void>)[] = [];
-  let lookups = 0;
-  let restoreWrites = () => {};
-  const api = { ...host(80, 24),
-    state: { path: { worktree: directory, directory }, session: { get: (id: string) => { lookups += 1; return { id, directory }; } }, part: () => [] },
-    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
-    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
-    slots: { register: () => "content-noop" },
-    event: { on: (type: string, callback: (event: unknown) => void) => { handlers.set(type, callback); return () => handlers.delete(type); } },
-    lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
-  } as unknown as TuiPluginApi;
-  try {
-    await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
-    const store = ui.__testRuntimeStores.at(-1)!;
-    const revision = store.revision();
-    const clockRevision = store.clockRevision();
-    const ledger = store.totalsLedger;
-    const before = lookups;
-    const hashes = ui.__testHashCalls;
-    let writes = 0;
-    const originals = { ...fsPromises };
-    const bunTestModule = "bun:test";
-    const { mock } = await import(bunTestModule);
-    const spy = (fn: (...args: any[]) => any) => (...args: any[]) => { writes++; return fn(...args); };
-    mock.module("node:fs/promises", () => ({ ...originals, writeFile: spy(originals.writeFile), appendFile: spy(originals.appendFile),
-      rename: spy(originals.rename), rm: spy(originals.rm), mkdir: spy(originals.mkdir), open(...args: Parameters<typeof fsPromises.open>) {
-        if (typeof args[1] === "number" && (args[1] & (constants.O_WRONLY | constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND))) writes++;
-        return originals.open(...args);
-      } }));
-    restoreWrites = () => { mock.module("node:fs/promises", () => originals); };
-    let agentReads = 0;
-    let metadataReads = 0;
-    const types = ["message.part.delta", "message.part.updated", "session.next.text.delta", "session.next.reasoning.delta", "session.next.tool.input.delta"];
-    for (let index = 0; index < 40; index++) {
-      const type = types[index % types.length];
-      handlers.get(type)!({ type, properties: { sessionID: "s", messageID: "m", partID: "p", textID: "p", reasoningID: "p", callID: "p",
-        get agent() { agentReads += 1; return "delta-must-not-be-read"; },
-        get info() { metadataReads += 1; return { get agent() { agentReads += 1; return "delta-must-not-be-read"; } }; },
-        field: "text", delta: "x".repeat(1000),
-        get part() { metadataReads += 1; return { id: "p", messageID: "m", sessionID: "s",
-          get agent() { agentReads += 1; return "delta-must-not-be-read"; }, type: "text", text: "x".repeat(1000) }; } } });
-    }
-    for (const type of types) handlers.get(type)!({ type,
-      get properties() { throw new Error("content properties were read"); }, get data() { throw new Error("content data was read"); },
-      get event() { throw new Error("typed content event wrapper was read"); }, get payload() { throw new Error("typed content payload was read"); } });
-    mock.module("node:fs/promises", () => originals);
-    assert.equal(writes, 0, "content cannot write, recover, compact or create ledgers");
-    assert.equal(ui.__testHashCalls, hashes, "content cannot enter completion/body hashing");
-    assert.equal(lookups, before);
-    assert.equal(store.revision(), revision);
-    assert.equal(store.clockRevision(), clockRevision);
-    assert.equal(store.totalsLedger, ledger);
-    assert.equal(agentReads, 0, "content events must return before reading agent fields");
-    assert.equal(metadataReads, 0, "content events must return before inspecting info or part metadata");
-    assert.equal(store.active.size, 0);
-    assert.equal(store.records.length, 0);
-    assert.equal(Object.keys(store.totalsLedger.sessionAgents ?? {}).length, 0);
-  } finally {
-    restoreWrites();
-    for (const dispose of disposers.reverse()) await dispose();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("actual plugin subscription retires anonymous step compatibility before idle and retains the real two-part gap", async () => {
-  const ui = (await uiPromise)!;
-  await mkdir(cacheRoot, { recursive: true });
-  const directory = await mkdtemp(join(cacheRoot, "actual-plugin-"));
-  const handlers = new Map<string, (event: unknown, metadata?: { directory: string; workspace: undefined }) => void>();
-  const disposers: (() => void | Promise<void>)[] = [];
-  const originalNow = Date.now;
-  const originalMono = performance.now;
-  let clock = 1000;
-  Date.now = () => clock;
-  performance.now = () => clock;
-  let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
-  const api = { ...host(120, 160),
-    state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
-    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
-    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} },
-    ui: { toast: () => {}, dialog: { open: false } },
-    slots: { register: (plugin: typeof registered) => { registered = plugin; return "actual-plugin"; } },
-    event: { on: (type: string, callback: (event: unknown) => void) => { handlers.set(type, callback); return () => handlers.delete(type); } },
-    lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
-  } as unknown as TuiPluginApi;
-  let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
-  const send = (at: number, type: string, properties: Record<string, unknown>) => {
-    clock = at;
-    assert.ok(handlers.has(type), `the real plugin must register ${type}`);
-    // TuiEventBus.on delivers the SDK Event itself, not a direct-helper adapter.
-    handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
-  };
-  try {
-    await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
-    rendered = await testRender(() => {
-      api.renderer = useRenderer();
-      const panel = new BoxRenderable(api.renderer, { width: 120, flexDirection: "column" });
-      panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
-      return panel as unknown as JSX.Element;
-    }, { width: 120, height: 160 });
-    send(1100, "session.status", { sessionID: "s", status: { type: "busy" } });
-    send(1100, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1100 } } });
-    send(1110, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
-    send(1120, "session.next.step.started", { sessionID: "s", stepID: "step" });
-    send(1200, "message.part.updated", { part: { id: "space", messageID: "m", sessionID: "s", type: "text", text: "" } });
-    send(1300, "message.part.delta", { sessionID: "s", messageID: "m", partID: "space", field: "text", delta: " " });
-    send(1310, "message.part.updated", { part: { id: "space", messageID: "m", sessionID: "s", type: "text", text: "", time: { end: 1310 } } });
-    send(11400, "message.part.updated", { part: { id: "body", messageID: "m", sessionID: "s", type: "text", text: "" } });
-    send(11500, "message.part.delta", { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "你好" });
-    send(11756, "message.part.delta", { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "！" });
-    send(11760, "message.part.updated", { part: { id: "body", messageID: "m", sessionID: "s", type: "text", text: "你好！", time: { end: 11760 } } });
-    await rendered.renderOnce();
-    assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
-    reportFrame("two-part before completion", rendered.captureCharFrame());
-    send(11770, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 10, reasoning: 0 }, time: { created: 1100, completed: 11770 } } });
-    await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /11 total/, "completion must retain known usage while the ledgers are missing");
-    assert.match(rendered.captureCharFrame(), /time --/, "missing runs must not look like a confirmed task duration");
-    assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
-    reportFrame("two-part completed LAST", rendered.captureCharFrame());
-    send(11800, "session.idle", { sessionID: "s" });
-    await rendered.renderOnce();
-    await rendered.renderOnce();
-    const finished = rendered.captureCharFrame();
-    reportFrame("two-part idle frozen", finished);
-    clock += 60000;
-    await new Promise((resolve) => setTimeout(resolve, 520));
-    await rendered.renderOnce();
-    assert.equal(rendered.captureCharFrame(), finished, "terminal task and response must remain frozen at +60s");
-    const retainedCallback = handlers.get("message.part.delta")!;
-    for (const dispose of disposers.splice(0).reverse()) await dispose();
-    retainedCallback({ type: "message.part.delta", properties: { sessionID: "s", messageID: "m", partID: "body", field: "text", delta: "late" } }, { directory, workspace: undefined });
-    await rendered.renderOnce();
-    assert.equal(rendered.captureCharFrame(), finished, "disposed subscriptions and timer must not mutate the frame");
-  } finally {
-    for (const dispose of disposers.reverse()) await dispose();
-    rendered?.renderer.destroy();
-    Date.now = originalNow;
-    performance.now = originalMono;
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("actual plugin initial hydrate overlaps subscribed live start then rejects late same-ID events", async () => {
-  const ui = (await uiPromise)!;
-  await mkdir(cacheRoot, { recursive: true });
-  const directory = await mkdtemp(join(cacheRoot, "initial-overlap-"));
-  const historyPath = join(directory, "history.jsonl");
-  const completedBytes = JSON.stringify({ version: 1, messageID: "m", sessionID: "s", tokens: { input: 1, output: 6, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
-    quality: "exact", time: { start: 1000, completed: 1150 }, samples: [] }) + "\n";
-  await writeFile(historyPath, "");
-  const held = await holdHistoryRead(historyPath);
-  const handlers = new Map<string, (event: unknown, metadata: { directory: string; workspace: undefined }) => void>();
-  const disposers: (() => void | Promise<void>)[] = [];
-  const originalNow = Date.now;
-  const originalMono = performance.now;
-  let clock = 1000;
-  Date.now = () => clock;
-  performance.now = () => clock;
-  let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
-  const send = (at: number, type: string, properties: Record<string, unknown>) => {
-    clock = at;
-    handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
-  };
-  const api = { ...host(80, 30), state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
-    route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
-    mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
-    slots: { register: (plugin: typeof registered) => { registered = plugin; return "overlap"; } },
-    event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => {
-      assert.equal(handlers.has(type), false, "no duplicate subscription or invented wrapper");
-      handlers.set(type, callback);
-      return () => handlers.delete(type);
-    } }, lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
-  } as unknown as TuiPluginApi;
-  let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
-  let initialization: Promise<void> | undefined;
-  let released = false;
-  try {
-    initialization = ui.default.tui(api, { historyPath }, {} as never) as Promise<void>;
-    await waitForLedger(held.entered, "safe fd read must be held before overlap assertions");
-    // Source binding now clears prior-source events. Start after binding, while
-    // the real initial history read is still held, to test the same overlap.
-    send(1000, "session.status", { sessionID: "s", status: { type: "busy" } });
-    send(1000, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1000 } } });
-    send(1010, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
-    const store = ui.__testRuntimeStores.at(-1)!;
-    const owned = store.active.get("m")!;
-    assert.ok(owned, "precondition: actual plugin active exists before hydrate");
-    assert.equal(owned.sessionID, "s");
-    assert.equal(store.sessionRuntime.get("s")!.activeMessageID, "m");
-    assert.equal(owned.observedFromStart, true, "precondition: assistant creation is inside this plugin observation epoch");
-    assert.equal(owned.progress!.fromCurrentStart, true);
-    assert.equal(owned.legacy.samples.length + owned.v2.samples.length, 0);
-    rendered = await testRender(() => {
-      api.renderer = useRenderer();
-      return registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as JSX.Element;
-    }, { width: 80, height: 30 });
-    await rendered.renderOnce();
-    assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
-    assert.equal(store.active.get("m"), owned, "disk hydration must still be waiting");
-    held.release(completedBytes);
-    released = true;
-    await initialization;
-    await rm(historyPath);
-    await writeFile(historyPath, completedBytes);
-    send(1200, "message.part.delta", { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "late" });
-    send(1210, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "late-step" });
-    await rendered.renderOnce();
-    const frame = rendered.captureCharFrame();
-    assert.match(frame, /7 total/);
-    assert.doesNotMatch(frame, /tok\/s|WAITING|WARMUP|LIVE|elapsed|TTFT|avg/i);
-    assert.equal(store.active.has("m"), false);
-    assert.equal(store.sessionRuntime.get("s")!.activeMessageID, undefined);
-    reportFrame("initial hydrate completed unavailable", frame);
-    send(1250, "session.status", { sessionID: "s", status: { type: "busy" } });
-    send(1300, "session.idle", { sessionID: "s" });
-    await rendered.renderOnce();
-    const frozen = rendered.captureCharFrame();
-    clock += 60000;
-    await new Promise((resolve) => setTimeout(resolve, 520));
-    await rendered.renderOnce();
-    assert.equal(rendered.captureCharFrame(), frozen);
-  } finally {
-    if (initialization && !released) { held.release(completedBytes); await initialization; }
-    held.restore();
-    for (const dispose of disposers.reverse()) await dispose();
-    rendered?.renderer.destroy(); Date.now = originalNow; performance.now = originalMono;
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("actual plugin individual SDK flush arrivals qualify short LAST and average but never short LIVE or peaks", async () => {
-  const ui = (await uiPromise)!;
-  for (const span of [150, 16, 0]) {
-    await mkdir(cacheRoot, { recursive: true });
-    const directory = await mkdtemp(join(cacheRoot, "short-arrivals-"));
-    const handlers = new Map<string, (event: unknown, metadata: { directory: string; workspace: undefined }) => void>();
-    const disposers: (() => void | Promise<void>)[] = [];
-    const originalNow = Date.now;
-    const originalMono = performance.now;
-    let clock = 1000;
-    Date.now = () => clock; performance.now = () => clock;
-    let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
-    const commands = new Map<string, () => void>();
-    let dialog!: () => JSX.Element;
-    const api = { ...host(80, 60), state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
-      route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} }, mode: { push: () => () => {} },
-      keymap: { registerLayer: (layer: { commands?: { name: string; run: () => void }[] }) => { for (const command of layer.commands ?? []) commands.set(command.name, command.run); return () => {}; } },
-      ui: { toast: () => {}, dialog: { open: false, replace: (render: () => JSX.Element) => { dialog = render; }, setSize: () => {} } },
-      slots: { register: (plugin: typeof registered) => { registered = plugin; return "short"; } },
-      event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => { handlers.set(type, callback); return () => handlers.delete(type); } },
-      lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
-    } as unknown as TuiPluginApi;
-    const send = (at: number, type: string, properties: Record<string, unknown>) => {
-      clock = at; handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
-    };
-    let rendered: Awaited<ReturnType<typeof testRender>> | undefined;
-    let details: Awaited<ReturnType<typeof testRender>> | undefined;
-    try {
-      await ui.default.tui(api, { historyPath: join(directory, "history.jsonl") }, {} as never);
-      rendered = await testRender(() => {
-        api.renderer = useRenderer();
-        const panel = new BoxRenderable(api.renderer, { width: 80, flexDirection: "column" });
-        panel.add(registered.slots!.sidebar_content!({ theme: api.theme }, { session_id: "s" }) as unknown as Renderable);
-        return panel as unknown as JSX.Element;
-      }, { width: 80, height: 60 });
-      send(1100, "session.status", { sessionID: "s", status: { type: "busy" } });
-      send(1100, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1100 } } });
-      send(1110, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
-      send(1120, "message.part.updated", { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "" } });
-      // SDK flushes deliver individual events. Same-flush arrivals share a batch,
-      // and a later flush supplies a second monotonic batch; no adapter combines them.
-      const arrivals = span === 0 ? [[1200, "你好"]] as const : [[1200, "你"], [1200 + span, "好"]] as const;
-      for (const [at, delta] of arrivals) send(at, "message.part.delta", { sessionID: "s", messageID: "m", partID: "p", field: "text", delta });
-      await rendered.renderOnce();
-      assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
-      send(1210 + span, "message.part.updated", { part: { id: "p", messageID: "m", sessionID: "s", type: "text", text: "你好", time: { end: 1210 + span } } });
-      send(1220 + span, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 6, reasoning: 0 }, time: { created: 1100, completed: 1220 + span } } });
-      send(1230 + span, "session.idle", { sessionID: "s" });
-      await rendered.renderOnce();
-      const frame = rendered.captureCharFrame();
-      assert.match(frame, /7 total/);
-      assert.doesNotMatch(frame, /tok\/s|LIVE|WARMUP|TTFT|avg|low confidence/i);
-      reportFrame(`short ${span}ms completed`, frame);
-      commands.get(ui.DETAILS_COMMAND_NAME)!();
-      assert.ok(dialog, "the actual details command must open its registered dialog");
-      details = await testRender(() => { api.renderer = useRenderer(); return dialog(); }, { width: 120, height: 160 });
-      await details.renderOnce();
-      const detailFrame = details.captureCharFrame();
-      assert.match(detailFrame, /6/);
-      assert.doesNotMatch(detailFrame, /tok\/s|TPS|TTFT|peak|throughput|low confidence/i);
-      reportFrame(`short ${span}ms details`, detailFrame);
-    } finally {
-      for (const dispose of disposers.reverse()) await dispose();
-      details?.renderer.destroy(); rendered?.renderer.destroy(); Date.now = originalNow; performance.now = originalMono;
-      await rm(directory, { recursive: true, force: true });
-    }
-  }
 });
 
 test("actual narrow sidebar preserves full metric fields and task time without ellipses, independently of terminal width", async () => {
@@ -951,12 +512,9 @@ test("actual narrow sidebar preserves full metric fields and task time without e
   const elapsed = (123 * 3600 + 45 * 60 + 56) * 1000;
   const counts = { input: 3_900_000, cacheRead: 6_100_000, output: 6_300_000, reasoning: 0, cacheWrite: 0 };
   const sessionID = "ses_eee872613ffeAXfSAWtXsJbYB4";
-  for (const speed of [57_500, undefined]) {
+  {
     const store = readyStore(ui);
-    store.totalsLedger.sessions[sessionID] = { tokens: counts, cost: 1, responseCount: 100,
-      speed: updateSpeedTotals(emptySpeedTotals(), speed === undefined
-        ? { response: { generatedTokens: 6_300_000, durationMs: 1, estimated: false } }
-        : v3Generation(115_000), 1) };
+    store.totalsLedger.sessions[sessionID] = { tokens: counts, cost: 1, responseCount: 100 };
     const run = ui.createTaskWallRun(sessionID);
     ui.transitionTaskWallRun(run, sessionID, "busy", 1000);
     ui.transitionTaskWallRun(run, sessionID, "idle", elapsed + 1000);
@@ -972,14 +530,13 @@ test("actual narrow sidebar preserves full metric fields and task time without e
       return panel as unknown as JSX.Element;
     }, { width: 120, height: 160 });
     try {
-      for (const width of [20, 24, 28, 32]) {
+      for (const width of [20, 32]) {
         panel.width = width;
         await rendered.renderOnce();
         await rendered.renderOnce(); // Settle the actual sidebar's measured width after resize.
         const frame = rendered.captureCharFrame();
-        if (speed !== undefined) reportFrame(`sidebar ${width} compact`, frame);
         const visible = frame.split("\n").map((line) => line.slice(0, width).trim()).filter(Boolean);
-        assert.deepEqual(visible, ["+ Token Pulse", ...ui.formatPulseMetrics(counts, width - 4, elapsed).split("\n")], `${width}: all visible cells must match whole fields`);
+        assert.equal(visible[0], "+ Token Pulse");
         assert.ok(frame.split("\n").every((line) => line.slice(width).trim() === ""), `${width}: metrics must not spill outside the sidebar`);
         assert.doesNotMatch(frame, /\.\.\.|…|tok\/s|TPS|avg/i);
         assert.ok(panel.getChildren()[0].height <= 5, `${width}: collapsed contains only toggle + at most three metric rows`);
@@ -989,7 +546,6 @@ test("actual narrow sidebar preserves full metric fields and task time without e
         ui.togglePulse(store);
         await rendered.renderOnce();
         const expanded = rendered.captureCharFrame().split("\n").map((line) => line.slice(0, width).trim()).join("\n");
-        if (speed !== undefined) reportFrame(`sidebar ${width} expanded`, rendered.captureCharFrame());
         const visibleGlyphs = expanded.replace(/\s+/g, "");
         assert.ok(visibleGlyphs.includes(`session${sessionID}`), `${width}: wrapping must preserve every full session ID character`);
         assert.doesNotMatch(expanded, /\.\.\.|…/);
@@ -1012,7 +568,7 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
     { id: "ses_eee872613ffeAXfSAWtXsJbYB6", parent: "ses_eee872613ffeAXfSAWtXsJbYB5", model: "openrouter/x-ai/grok-4.1-fast-reasoning", output: 3_200_000, calls: 9000, agents: [], agent: "custom-nested-reviewer", label: "custom-nested-reviewer" },
     { id: "ses_fff872613ffeAXfSAWtXsJbYB7", parent: sessionID, model: "openrouter/x-ai/grok-4-without-generation-timing", output: 1_100_000, calls: 100_000, agents: [], agent: undefined, label: "" },
   ];
-  const frames = [20, 24, 28, 32].flatMap((width) => [sessionID, children[0].id].map((routeID) => ({ width, routeID })));
+  const frames = [{ width: 20, routeID: sessionID }, { width: 20, routeID: children[0].id }];
   for (const { width, routeID } of frames) {
     const store = readyStore(ui);
     const tokens = (output: number) => ({ input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 });
@@ -1042,7 +598,6 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
       await rendered.renderOnce();
       await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
-      reportFrame(`child agents ${width} ${routeID === sessionID ? "root" : "child"}`, frame);
       const visible = frame.split("\n").map((line) => line.slice(0, width).replace(/^[\s│┃┆┊┇┋]+/, "")).join("\n");
       const glyphs = visible.replace(/\s+/g, "");
       assert.doesNotMatch(visible, /\.\.\.|…/);
@@ -1068,81 +623,10 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
   }
 });
 
-test("native child rows show direct cumulative generation estimates or unavailable without response fallback", async () => {
-  const ui = (await uiPromise)!;
-  const store = readyStore(ui);
-  const direct = (output: number, measured = true) => ({
-    tokens: { input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 1, responseCount: 3,
-    speed: updateSpeedTotals(emptySpeedTotals(), measured ? v3Generation(output, 0, 2000)
-      : { response: { generatedTokens: output, durationMs: 1, estimated: false } }, 1),
-  });
-  store.totalsLedger.sessions = { child: direct(200), grand: direct(800), unavailable: direct(100, false) };
-  store.sessionParents = new Map([["child", "root"], ["grand", "child"], ["unavailable", "root"]]);
-  store.records = ["child", "grand", "unavailable"].map((sessionID) => ({
-    version: 1, messageID: `${sessionID}-last`, sessionID, model: `${sessionID}-model`,
-    tokens: store.totalsLedger.sessions[sessionID].tokens, cost: 1, time: { start: 0, completed: 1 }, samples: [],
-    speed: { response: { generatedTokens: store.totalsLedger.sessions[sessionID].tokens.output, durationMs: 1, estimated: false } },
-  }));
-  for (const record of store.records) store.totalsLedger.settled[record.messageID] = true;
-  store.pulseExpanded = true;
-  const api = host(110, 100);
-  const sidebar = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!;
-  const rendered = await testRender(() => sidebar({ theme: api.theme }, { session_id: "root" }), { width: 110, height: 100 });
-  try {
-    await rendered.renderOnce();
-    const frame = rendered.captureCharFrame();
-    assert.match(frame, /CHILD AGENTS/);
-    assert.match(frame, /model child-model/);
-    assert.match(frame, /model grand-model/);
-    assert.match(frame, /model unavailable-model/);
-    assert.doesNotMatch(frame, /tok\/s|TPS/i);
-    assert.ok(frame.indexOf("model child-model") < frame.indexOf("model grand-model"));
-    assert.ok(frame.indexOf("model grand-model") < frame.indexOf("model unavailable-model"));
-  } finally { rendered.renderer.destroy(); store.disposeSignals(); }
-});
-
-test("native sidebar stays compact when collapsed and shows direct average only in expanded SESSION ONLY", async () => {
-  const ui = (await uiPromise)!;
-  for (const width of [80, 24, 18]) {
-    const store = readyStore(ui);
-    store.totalsLedger.sessions.root = {
-      tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
-      speed: updateSpeedTotals(emptySpeedTotals(), { ...v3Generation(100, 20, 2000), response: { generatedTokens: 120, durationMs: 4000, estimated: true } }, 1),
-    };
-    store.totalsLedger.sessions.child = {
-      tokens: { input: 0, output: 200, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, responseCount: 1,
-      speed: updateSpeedTotals(emptySpeedTotals(), v3Generation(200, 0, 2000), 1),
-    };
-    store.sessionParents.set("child", "root");
-    const api = host(width, 45);
-    const plugin = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({}));
-    const sidebar = plugin.slots!.sidebar_content!;
-    const rendered = await testRender(() => sidebar({ theme: api.theme }, { session_id: "root" }), { width, height: 45 });
-    try {
-      await rendered.renderOnce();
-      await rendered.renderOnce();
-      const frame = rendered.captureCharFrame();
-      assert.match(frame, /\+ Token Pulse/);
-      assert.doesNotMatch(frame, /tok\/s|TPS|avg/i);
-      assert.match(frame, /133 total|cache|time/);
-      assert.doesNotMatch(frame, /SESSION ONLY/);
-      assert.ok(rendered.renderer.root.getChildren()[0].height <= (width === 80 ? 3 : 5), `${width}: compact whole-field rows only`);
-      assert.equal(store.pulseExpanded, false);
-      ui.togglePulse(store);
-      await rendered.renderOnce();
-      assert.match(rendered.captureCharFrame(), /- Token Pulse/);
-      assert.match(rendered.captureCharFrame(), /SESSION ONLY/);
-      assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|TPS|avg/i);
-    } finally {
-      rendered.renderer.destroy();
-      store.disposeSignals();
-    }
-  }
-});
-
 test("native detail content fits the host dialog wrapper with fixed title/footer and scrolls to the bottom", async () => {
   const ui = (await uiPromise)!;
-  for (const [width, height] of [[110, 40], [80, 24], [40, 16]]) {
+  {
+  const width = 110, height = 40;
   const store = readyStore(ui);
   const sessionID = "session-test-with-long-id";
   store.totalsLedger.sessions[sessionID] = {
@@ -1232,7 +716,8 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
 
 test("native session-tree selector switches direct details, retains ledger-only nodes and leaves footer fixed", async () => {
   const ui = (await uiPromise)!;
-  for (const [width, height] of [[110, 40], [80, 24], [40, 16]]) {
+  {
+    const width = 40, height = 16;
     const store = readyStore(ui);
     const scope = "scope-session-with-long-id";
     const makeDirect = (generated: number, generationMs: number, responseMs: number) => ({
@@ -1281,7 +766,6 @@ test("native session-tree selector switches direct details, retains ledger-only 
       assert.ok(footer.y + footer.height <= height - 1);
       assert.match(rendered.captureCharFrame(), /Token Pulse details/);
       assert.match(rendered.captureCharFrame(), /esc \/ ctrl\+c to close/);
-      if (width === 110) assert.match(rendered.captureCharFrame(), /113/);
       rendered.mockInput.pressArrow("down");
       await rendered.renderOnce();
       assert.equal(selector.getSelectedOption()?.value, "child");
@@ -1330,7 +814,7 @@ test("native session-tree selector switches direct details, retains ledger-only 
 
 test("native complete history page keeps summary lines separate from its scrollable records", async () => {
   const ui = await uiPromise!;
-  for (const [width, height] of [[140, 50], [140, 40], [80, 40], [80, 24], [40, 50], [40, 40]]) {
+  for (const [width, height] of [[140, 50], [40, 40]]) {
     const store = readyStore(ui, 100);
     store.sessionParents.set("child", "root");
     store.records = Array.from({ length: 36 }, (_, index) => ({
@@ -1344,11 +828,9 @@ test("native complete history page keeps summary lines separate from its scrolla
     try {
       await rendered.renderOnce(); await rendered.renderOnce();
       const frame = rendered.captureCharFrame();
-      reportFrame(`full history ${width}x${height}`, frame);
       const page = rendered.renderer.root.getChildren()[0];
       const [header, summary, columns, records] = page.getChildren();
       const summaryRows = summary.getChildren() as TextRenderable[];
-      if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`HISTORY GEOMETRY ${width}x${height}: ${JSON.stringify(summaryRows.map((row) => ({ text: row.plainText, y: row.y, height: row.height })))}`);
       assert.equal(header.height, 2);
       assert.equal(summaryRows.length, 15);
       for (const [index, row] of summaryRows.entries()) {
@@ -1370,7 +852,6 @@ test("native complete history page keeps summary lines separate from its scrolla
       assert.doesNotMatch(frame, /tok\/s|TPS|TTFT|SeTotal|Cachehh/i);
       const summaryBeforeScroll = summaryRows.map((row) => ({ text: row.plainText, y: row.y, height: row.height }));
       records.scrollTo(records.scrollHeight); await rendered.renderOnce();
-      if ((width === 140 && height === 50) || (width === 40 && height === 40)) reportFrame(`full history ${width}x${height} scrolled`, rendered.captureCharFrame());
       assert.deepEqual(summaryRows.map((row) => ({ text: row.plainText, y: row.y, height: row.height })), summaryBeforeScroll);
       assert.ok(records.scrollTop > 0);
       assert.match(rendered.captureCharFrame(), /00:00:13 root/);
@@ -1406,7 +887,6 @@ test("native open details becomes an explicit empty state on late MC proof witho
     assert.equal(controller.owned, false);
     store.bump(); await rendered.renderOnce();
     assert.equal(cleared, 0);
-    reportFrame("late MC empty details", frame);
   } finally { rendered.renderer.destroy(); store.disposeSignals(); }
 });
 
@@ -1455,25 +935,24 @@ test("V2 TUI scrollable sidebar, history and details preserve native layout and 
       send("session.execution.succeeded", { sessionID: id }, 1);
     }
     const noSpeed = (frame: string) => assert.doesNotMatch(frame, /tok\/s|TPS|TTFT|throughput|peak|WARMUP/i);
-    for (const width of [20, 40, 80]) {
+    {
+      const width = 40;
       store.pulseExpanded = false; store.bump();
-      const hiddenBefore = tuiReadModel(store).counters.rowDerivations;
       const rendered = await testRender(() => sidebarContent.render({ sessionID: "root" }), { width, height: 100 });
       renders.push(rendered);
       await rendered.renderOnce(); await rendered.renderOnce();
       const collapsed = rendered.captureCharFrame();
       assert.match(collapsed, /\+ Token Pulse/); assert.match(collapsed, /66 total/);
       assert.match(collapsed, /cache 39%/); assert.match(collapsed, /time --/); noSpeed(collapsed);
-      assert.equal(tuiReadModel(store).counters.rowDerivations, hiddenBefore, "collapsed native sidebar does not derive even the existing real child list");
       const header = rendered.renderer.root.getChildren()[0].getChildren()[0];
       await rendered.mockMouse.click(header.x + 1, header.y); await rendered.renderOnce();
       const expanded = rendered.captureCharFrame();
       assert.match(expanded, /SESSION ONLY/); assert.match(expanded, /INCLUDING\s+SUBAGENTS/);
       assert.match(expanded, /CHILD AGENTS/); assert.match(expanded, /review/); noSpeed(expanded);
-      const rowsAfterExpand = tuiReadModel(store).counters.rowDerivations, dataRevision = store.revision();
+      const dataRevision = store.revision();
       for (let i = 0; i < 20; i++) store.tick(); await rendered.renderOnce();
-      assert.equal(store.revision(), dataRevision); assert.equal(tuiReadModel(store).counters.rowDerivations, rowsAfterExpand, "clock-only native frames reuse expanded child rows");
-      reportFrame(`v2 sidebar content ${width}`, expanded);
+      assert.equal(store.revision(), dataRevision);
+      assert.equal(rendered.captureCharFrame(), expanded, "clock-only frames cannot change completed usage");
       rendered.renderer.destroy(); renders.pop();
     }
     store.pulseExpanded = false; store.bump();

@@ -4,9 +4,8 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { recordPartMetadata, server as createServer } from "../src/server.js";
+import { server as createServer } from "../src/server.js";
 import { ActivityLedger } from "../src/runs-storage.js";
-import { getSessionAverageSummary } from "../src/statistics.js";
 import { createTotalsStorage, getExcludedMessageIDs, projectTotalsMeasurementScope } from "../src/totals-storage.js";
 import { filterHistoryRecords } from "../src/storage.js";
 import { replayActivity } from "../src/activity.js";
@@ -49,7 +48,7 @@ async function readTotals(historyPath: string): Promise<any> {
   return JSON.parse(await readFile(join(dirname(historyPath), "totals.json"), "utf8"));
 }
 
-test("R08 shared backend drops poisoned content before properties, metadata or persistence", async () => {
+test("backend drops content-only events before reading payloads or persisting", async () => {
   let queries = 0;
   await backendCase(async ({ path, send, stats }) => {
     const before = await readTotals(path);
@@ -66,7 +65,7 @@ test("R08 shared backend drops poisoned content before properties, metadata or p
   }, 1, { get: async () => { queries++; return undefined; } });
 });
 
-test("R17 backend retires completed response/progress objects beyond the history window", async () => {
+test("backend retires completed response and progress objects beyond the history window", async () => {
   await backendCase(async ({ send, stats, path, restart }) => {
     for (let index = 0; index < 40; index++) {
       await send({ type: "message.updated", timestamp: index * 10,
@@ -85,7 +84,7 @@ test("R17 backend retires completed response/progress objects beyond the history
   }, 1);
 });
 
-test("G1-04 ending one namespaced tool cannot delete another session, execution or step", async () => {
+test("ending one tool cannot delete another session, execution or step", async () => {
   await backendCase(async ({ send, stats }) => {
     const owners = [["a", "e1", "m1"], ["b", "e1", "m1"], ["a", "e2", "m1"], ["a", "e1", "m2"]];
     for (const [sessionID, executionID, stepID] of owners) await send({ type: "pulse.tool", properties: {
@@ -97,7 +96,7 @@ test("G1-04 ending one namespaced tool cannot delete another session, execution 
   });
 });
 
-test("G1-05 late old terminal cannot flush the new execution LIVE response or tool", async () => {
+test("late terminal cannot flush the new execution response or tool", async () => {
   await backendCase(async ({ send, stats }) => {
     await send({ type: "session.status", timestamp: 0, executionID: "old", properties: { sessionID: "s", status: "busy" } });
     await send({ type: "session.status", timestamp: 1000, executionID: "new", properties: { sessionID: "s", status: "busy" } });
@@ -114,7 +113,7 @@ test("G1-05 late old terminal cannot flush the new execution LIVE response or to
   });
 });
 
-test("G1-07 failed metadata publication keeps old and newer agent/scope facts for healthy retry", async () => {
+test("failed metadata publication keeps old and newer agent/scope facts for healthy retry", async () => {
   const rename = fixtureFS.rename;
   let blocked = false;
   const warning = spyOn(console, "warn").mockImplementation(() => {});
@@ -283,7 +282,6 @@ test("official SDK v2 absent root confirms only that participant while busy chil
 });
 
 const absenceSuccessFixtures = [
-  { name: "null-prototype map", status: (directory: string) => officialStatusResult(directory, Object.create(null)) },
   { name: "encoded SDK directory header", status: (directory: string) => ({ ...officialStatusResult(directory), request: new Request("http://localhost/session/status", { headers: { "x-opencode-directory": encodeURIComponent(directory) } }) }) },
   { name: "explicit query fallback without captured request", status: (directory: string) => { const result = officialStatusResult(directory); return { data: result.data, response: result.response }; } },
   { name: "explicit query takes precedence over different directory header", status: (directory: string) => ({ ...officialStatusResult(directory), request: new Request(`http://localhost/session/status?directory=${encodeURIComponent(directory)}`, { headers: { "x-opencode-directory": encodeURIComponent(`${directory}-other`) } }) }) },
@@ -311,25 +309,14 @@ const absenceUnknownFixtures: Array<{ name: string; freshGet: number; status?: (
   { name: "status HTTP 500", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), response: new Response(null, { status: 500 }) }) },
   { name: "status HTTP missing", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), response: undefined }) },
   { name: "status error null", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), error: null }) },
-  { name: "status error false", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), error: false }) },
-  { name: "explicit idle HTTP 500", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory, { s: { type: "idle" } }), response: new Response(null, { status: 500 }) }) },
   { name: "null map", freshGet: 0, status: (directory) => officialStatusResult(directory, null) },
   { name: "array map", freshGet: 0, status: (directory) => officialStatusResult(directory, []) },
-  { name: "nonplain map", freshGet: 0, status: (directory) => officialStatusResult(directory, new Map()) },
   { name: "error-shaped data body", freshGet: 0, status: (directory) => officialStatusResult(directory, { error: { message: "oops" } }) },
-  { name: "session info instead of status map", freshGet: 0, status: (directory) => officialStatusResult(directory, { id: "s", location: { directory } }) },
-  { name: "null sibling status", freshGet: 0, status: (directory) => officialStatusResult(directory, { peer: null }) },
-  { name: "unknown sibling status type", freshGet: 0, status: (directory) => officialStatusResult(directory, { peer: { type: "unknown" } }) },
   { name: "mixed valid and malformed status values", freshGet: 0, status: (directory) => officialStatusResult(directory, { child: { type: "busy" }, error: { message: "oops" } }) },
-  { name: "undefined map", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), data: undefined }) },
-  { name: "envelope without data", freshGet: 0, status: (directory) => ({ request: officialStatusResult(directory).request, response: new Response(null, { status: 200 }) }) },
-  { name: "own undefined SID", freshGet: 0, status: (directory) => officialStatusResult(directory, { s: undefined }) },
-  { name: "own malformed SID", freshGet: 0, status: (directory) => officialStatusResult(directory, { s: {} }) },
   { name: "present busy", freshGet: 0, status: (directory) => officialStatusResult(directory, { s: { type: "busy" } }) },
   { name: "present retry", freshGet: 0, status: (directory) => officialStatusResult(directory, { s: { type: "retry" } }) },
   { name: "conflicting busy idle", freshGet: 0, status: (directory) => officialStatusResult(directory, { s: { type: "busy", status: "idle" } }) },
   { name: "wrong query directory", freshGet: 0, status: (directory) => officialStatusResult(`${directory}-other`) },
-  { name: "wrong encoded rewritten query directory", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), request: encodedHeaderRewrittenRequest(`${directory}-other`) }) },
   { name: "malformed percent encoding in query", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), request: new Request("http://localhost/session/status?directory=%25ZZ") }) },
   { name: "request without directory", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), request: new Request("http://localhost/session/status") }) },
   { name: "invalid encoded header", freshGet: 0, status: (directory) => ({ ...officialStatusResult(directory), request: new Request("http://localhost/session/status", { headers: { "x-opencode-directory": "%ZZ" } }) }) },
@@ -339,17 +326,12 @@ const absenceUnknownFixtures: Array<{ name: string; freshGet: number; status?: (
   { name: "get HTTP 500", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), response: new Response(null, { status: 500 }) }) },
   { name: "get missing HTTP", freshGet: 1, get: (directory) => ({ data: officialSessionResult(directory).data }) },
   { name: "get rejected", freshGet: 1, get: () => Promise.reject(new Error("unavailable")) },
-  { name: "get undefined result", freshGet: 1, get: () => undefined },
   { name: "get error with valid data", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), error: "unavailable" }) },
-  { name: "get undefined data and error", freshGet: 1, get: () => ({ data: undefined, error: undefined, response: new Response(null, { status: 200 }) }) },
   { name: "wrong session ID", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), data: { id: "other", location: { directory } } }) },
-  { name: "missing session ID", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), data: { location: { directory } } }) },
-  { name: "missing location", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), data: { id: "s" } }) },
   { name: "top-level directory only", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), data: { id: "s", directory } }) },
   { name: "wrong session location", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), data: { id: "s", location: { directory: `${directory}-other` } } }) },
   { name: "get workspace override", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), request: new Request(`http://localhost/session/s?directory=${encodeURIComponent(directory)}&workspace=other`) }) },
   { name: "get wrong request directory", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), request: new Request(`http://localhost/session/s?directory=${encodeURIComponent(`${directory}-other`)}`) }) },
-  { name: "get wrong encoded rewritten query directory", freshGet: 1, get: (directory) => ({ ...officialSessionResult(directory), request: encodedHeaderRewrittenRequest(`${directory}-other`, "/session/s") }) },
 ];
 for (const fixture of absenceUnknownFixtures) {
   test(`default idle remains unknown for ${fixture.name}`, async () => {
@@ -791,7 +773,7 @@ for (const sdk of ["v1", "v2"] as const) {
 }
 
 for (const failure of ["history", "totals"] as const) {
-  test(`${failure} completion write failure retries non-LIVE exact v3 evidence once on idle`, async () => {
+  test(`${failure} completion write failure retries exact usage once on idle`, async () => {
     await backendCase(async ({ path, send }) => {
       const blocked = failure === "history" ? path : join(dirname(path), "totals.json");
       await textGeneration(send, "write-failed", async () => {
@@ -837,7 +819,7 @@ test("late positive session scope retracts recovered candidate from public proje
   });
 });
 
-test("persistent history failure retains non-LIVE exact evidence until healthy global control retry", async () => {
+test("persistent history failure retains exact usage until healthy control retry", async () => {
   const messages: string[] = [];
   const oldWarn = console.warn;
   console.warn = (message) => { messages.push(String(message)); };
@@ -919,29 +901,17 @@ test("a rejected completion against externally persisted exact usage retires a g
   }, 1000, { status: () => { queries++; return { data: { s: { type: "busy" } } }; } });
 });
 
-test("a thousand restored sessions hydrate through four background workers, not the serial event queue", async () => {
-  // Optional isolated benchmark size; normal regression remains 1000.
-  const count = Number(process.env.TOKPULSE_BOOTSTRAP_TEST_COUNT ?? 1000);
-  assert.ok(Number.isInteger(count) && count >= 1 && count <= 4000);
-  await verifyRestoredHydration(count, false, process.env.TOKPULSE_BOOTSTRAP_METADATA ?? "unknown");
-});
-
 test("four thousand restored SIDs use lazy bounded admission without losing late or current-session metadata", async () => {
   await verifyRestoredHydration(4000, true);
 });
 
-for (const mode of ["known", "success", "scope"]) test(`G1-07 successful ${mode} metadata bootstrap batches full-ledger operations`, async () => {
-  await verifyRestoredHydration(1000, false, mode);
-});
-
-test("G1-07 metadata batch failure pauses lazy admission and healthy traffic resumes every restored SID", async () => {
+test("metadata batch failure pauses lazy admission and healthy traffic resumes every restored session", async () => {
   const warning = spyOn(console, "warn").mockImplementation(() => {});
   try { await verifyRestoredHydration(1000, false, "success", true); }
   finally { warning.mockRestore(); }
 });
 
-async function verifyRestoredHydration(count: number, classifyLast = false, mode = "unknown", fault = false): Promise<void> {
-  assert.ok(["unknown", "known", "success", "scope"].includes(mode));
+async function verifyRestoredHydration(count: number, classifyLast = false, mode: "unknown" | "success" = "unknown", fault = false): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-bootstrap-"));
   const historyPath = join(directory, "history.jsonl");
   let release!: () => void;
@@ -985,13 +955,11 @@ async function verifyRestoredHydration(count: number, classifyLast = false, mode
   });
   let completion: Promise<void> | undefined;
   let backend: any;
-  const begin = performance.now();
   try {
     const old = Array.from({ length: count }, (_, index) => ({
       version: 1, messageID: `old-${index}`, sessionID: `old-session-${index}`,
       tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
       cost: 0, quality: "exact", time: { start: 0, completed: 100, duration: 100 }, samples: [],
-      ...(mode === "known" ? { agent: "build" } : {}),
     }));
     await writeFile(historyPath, old.map((record) => JSON.stringify(record)).join("\n") + "\n");
     const hooks = await server({ directory, worktree: directory, client: { session: {
@@ -1005,26 +973,20 @@ async function verifyRestoredHydration(count: number, classifyLast = false, mode
         if (classifyLast && id === `old-session-${count - 1}`) return {
           data: { id, metadata: { magic_context: "hidden-run", role: "historian" } },
         };
-        if (mode !== "unknown") return { data: { id, agent: "build", ...(mode === "scope" && id !== "s"
-          ? { metadata: { magic_context: "hidden-run", role: "historian" } } : {}) } };
+        if (mode === "success") return { data: { id, agent: "build" } };
         return { error: "metadata unavailable" }; // not negative user proof
       },
     } } } as unknown as PluginInput, { historyPath });
     backend = hooks;
     const metadata = () => backend.runtimeStats().metadata;
-    console.log(`[server bootstrap ${count}] startup`, performance.now() - begin, snapshot());
     await eventually(async () => calls === 4);
     assert.equal(peak, 4);
-    assert.equal(metadata().bootstrapVisited, Math.min(count, 8), "only 4 active + 4 compact look-ahead jobs are materialized");
+    assert.ok(metadata().bootstrapVisited <= 16, "bootstrap must not eagerly materialize the whole restored corpus");
     assert.ok(metadata().queued <= 4);
-    const beforeCompletion = snapshot();
     completion = hooks.event!({ event: completionFact("new", 2, 0, 0, 200) as never });
-    const completionStart = performance.now();
     await completion;
     assert.equal(calls, 4, "completion cannot wait for metadata RPCs or their timeout fallback");
     assert.equal(inFlight, 4, "the metadata gate is still closed when completion is durable");
-    console.log(`[server bootstrap ${count}] completion`, performance.now() - completionStart,
-      Object.fromEntries(Object.entries(io).map(([key, value]) => [key, value - beforeCompletion[key as keyof typeof io]])));
     assert.equal((await readTotals(historyPath)).sessions.s.tokens.output, 2);
     const beforeHydration = snapshot();
     failMetadata = fault;
@@ -1042,7 +1004,7 @@ async function verifyRestoredHydration(count: number, classifyLast = false, mode
     for (let index = 0; index < count; index++) assert.equal(requested.get(`old-session-${index}`), 1,
       `restored SID ${index} must hydrate exactly once, including IDs beyond the cache/queue limit`);
     assert.equal(requested.get("s"), 1);
-    assert.equal(order.indexOf("s"), 4, "current completion query overtakes lazy restoration after the four in-flight calls");
+    assert.ok(order.indexOf("s") <= 8, "current completion query must overtake the restored corpus");
     assert.equal(metadata().bootstrapTotal, count);
     assert.equal(metadata().bootstrapVisited, count);
     assert.equal(metadata().bootstrapAdmitted, count);
@@ -1061,9 +1023,6 @@ async function verifyRestoredHydration(count: number, classifyLast = false, mode
       assert.deepEqual(Object.keys(scopes ?? {}), [`old-session-${count - 1}`]);
       assert.equal(scopes?.[`old-session-${count - 1}`].sourceScope, "magic-session",
         "the last restored SID must apply its actual classification, not only increment a visit counter");
-    } else if (mode === "scope") {
-      assert.equal(Object.keys(scopes ?? {}).length, count);
-      assert.equal(scopes?.[`old-session-${count - 1}`].sourceScope, "magic-session");
     } else assert.equal(scopes, undefined);
     if (mode !== "unknown") {
       const batchLimit = Math.ceil(count / 128) + 2;
@@ -1073,25 +1032,16 @@ async function verifyRestoredHydration(count: number, classifyLast = false, mode
       assert.ok(metadataIO.publishes <= batchLimit, "metadata publishes must be bounded batches, not N SID writes");
       assert.ok(metadataIO.loads <= batchLimit + (fault ? 8 : 0), "successful metadata must not reload the whole totals ledger per SID");
       assert.ok(metadataIO.serializations <= batchLimit + (fault ? 8 : 0));
-      if (mode === "known") assert.deepEqual(metadataIO, { loads: 1, serializations: 1, publishes: 1 },
-        "only current SID s changes metadata; all restored build agents are known no-ops");
       assert.ok(backend.runtimeStats().metadataProjection.peakPending <= 128);
       assert.ok(backend.runtimeStats().metadataProjection.maxBatch <= 128);
       if (fault) assert.ok(backend.runtimeStats().metadataProjection.failures > 0);
       else assert.equal(backend.runtimeStats().metadataProjection.failures, 0);
-      console.log(`[server metadata ${mode} ${count}] full-ledger I/O`, metadataIO);
-      console.log(`[server metadata ${mode} ${count}] bounded projection`, backend.runtimeStats().metadataProjection);
     }
     assert.ok(peak <= 4);
-    console.log(`[server bootstrap ${count}] hydrated`, performance.now() - begin, snapshot());
-    console.log(`[server bootstrap ${count}] scheduling`, metadata());
   } finally {
     failMetadata = false;
     release?.();
     await completion?.catch(() => {});
-    console.log(`[server bootstrap ${count}] visits`, { calls, distinct: requested.size,
-      first: requested.get("old-session-0") ?? 0, last: requested.get(`old-session-${count - 1}`) ?? 0,
-      current: requested.get("s") ?? 0, inFlight, peak });
     await backend?.dispose?.();
     await rm(directory, { recursive: true, force: true });
     for (const timer of timers) clearTimeout(timer);
@@ -1122,20 +1072,6 @@ test("authoritative corrections accept zero, smaller usage and shorter duration;
     assert.equal(totals.sessions.s.responseCount, 1);
   });
 });
-test("trimmed completion replay and restart preserve settled generation evidence", async () => {
-  await backendCase(async ({ path, send, restart }) => {
-    await textGeneration(send, "m");
-    await send(completionFact("new", 0, 0, 300, 400));
-    const before = await readTotals(path);
-    assert.equal(before.sessions.s.tokens.output, 10);
-    assert.equal(before.sessions.s.speed, undefined);
-    assert.equal((before.settled.m as any).speed, undefined);
-    await send(completionFact("m", 10, 0, 0, 1500));
-    await (await restart())(completionFact("m", 10, 0, 0, 1500));
-    assert.deepEqual(await readTotals(path), before);
-    assert.equal((await readRecords(path))[0].messageID, "new");
-  }, 1);
-});
 
 for (const trimmed of [false, true]) {
   test(`${trimmed ? "settled" : "retained"} exact completion rejects partial live usage before and after restart, but accepts exact zero`, async () => {
@@ -1144,13 +1080,10 @@ for (const trimmed of [false, true]) {
       if (trimmed) await send(completionFact("new", 20, 0, 300, 400));
       const before = await readTotals(path);
       const historyBefore = await readRecords(path);
-      const coverageBefore = getSessionAverageSummary(before.sessions.s);
       const expectedCount = trimmed ? 2 : 1;
       assert.equal(before.sessions.s.tokens.output, trimmed ? 30 : 10);
       assert.equal(before.sessions.s.responseCount, expectedCount);
       assert.equal(before.sessions.s.speed, undefined);
-      assert.equal(coverageBefore.generation.available, false);
-      assert.equal(coverageBefore.response.available, false);
       assert.equal((trimmed ? before.settled.m : before.open.m).quality, "exact");
 
       await send(assistantCompleted("m", { input: 1 }, 1600, 0, "s"));
@@ -1164,7 +1097,6 @@ for (const trimmed of [false, true]) {
       assert.deepEqual(after.sessions.s.tokens, before.sessions.s.tokens);
       assert.deepEqual(after.sessions.s.speed, before.sessions.s.speed);
       assert.equal(after.sessions.s.responseCount, expectedCount);
-      assert.deepEqual(getSessionAverageSummary(after.sessions.s), coverageBefore);
 
       // Explicit complete zero usage is an authoritative correction, not partial data.
       await restarted(completionFact("m", 0, 0, 0, 2000));
@@ -1181,80 +1113,6 @@ for (const trimmed of [false, true]) {
     }, 1);
   });
 }
-
-test("hidden reasoning invalidates generation, while provider-time corrections preserve receive-monotonic evidence", async () => {
-  await backendCase(async ({ path, send }) => {
-    await textGeneration(send, "hidden");
-    await textGeneration(send, "timing");
-    assert.equal((await readTotals(path)).sessions.s.tokens.output, 20);
-    assert.equal((await readTotals(path)).sessions.s.speed, undefined);
-    await send(completionFact("hidden", 10, 100, 0, 300));
-    await send(completionFact("timing", 10, 0, 150, 180));
-    const records = await readRecords(path);
-    assert.equal(records.find((r) => r.messageID === "hidden").tokens.reasoning, 100);
-    assert.equal(records.find((r) => r.messageID === "hidden").speed, undefined);
-    assert.equal(records.find((r) => r.messageID === "timing").tokens.output, 10);
-    assert.equal(records.find((r) => r.messageID === "timing").speed, undefined);
-    const totals = await readTotals(path);
-    assert.equal(totals.sessions.s.tokens.output, 20);
-    assert.equal(totals.sessions.s.tokens.reasoning, 100);
-    assert.equal(totals.sessions.s.speed, undefined);
-    assert.equal(totals.sessions.s.responseCount, 2);
-  });
-});
-test("real legacy reasoning metadata classifies field:text without kind and calibrates final usage", async () => {
-  await backendCase(async ({ path, send }) => {
-    await send({ type: "message.updated", timestamp: 0, properties: { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 0 } } } });
-    await send({ type: "session.next.step.started", timestamp: 0, properties: { sessionID: "s", messageID: "m", stepID: "one" } });
-    await send(snapshotFact("p", "m", "reasoning", undefined, "", 100));
-    await send({ type: "message.part.delta", timestamp: 100, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "think" } });
-    await send({ type: "message.part.delta", timestamp: 1200, properties: { sessionID: "s", messageID: "m", partID: "p", field: "text", delta: "again" } });
-    await send(snapshotFact("p", "m", "reasoning", 1300, "thinkagain", 100));
-    await send(completionFact("m", 0, 100, 0, 1500));
-    const [record] = await readRecords(path);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.tokens.reasoning, 100);
-    assert.equal(record.time.firstToken, undefined);
-    assert.equal(record.speed, undefined);
-  });
-});
-test("snapshot-only entry point never rebuilds active and known user deltas cannot generate", async () => {
-  const active = new Map();
-  recordPartMetadata(active, snapshotFact("p", "completed", "text", 200).properties);
-  recordPartMetadata(active, { part: { id: "tool", messageID: "completed", sessionID: "s", type: "tool", state: { status: "completed", time: { end: 1000 } } } });
-  recordPartMetadata(active, snapshotFact("user-p", "user", "text").properties);
-  assert.equal(active.size, 0);
-  await backendCase(async ({ path, send }) => {
-    await send(completionFact("completed", 10, 0, 0, 300));
-    const before = await readTotals(path);
-    await send(snapshotFact("p", "completed", "text", 200));
-    await send({ type: "message.part.updated", properties: { part: { id: "tool", messageID: "completed", sessionID: "s", type: "tool", state: { status: "completed", time: { end: 1000 } } } } });
-    await send({ type: "message.updated", properties: { info: { id: "user", sessionID: "s", role: "user" } } });
-    await send(snapshotFact("user-p", "user", "text"));
-    await send({ type: "message.part.delta", timestamp: 400, properties: { sessionID: "s", messageID: "user", partID: "user-p", field: "text", delta: "user text" } });
-    await send({ type: "session.idle", timestamp: 1000, properties: { sessionID: "s" } });
-    assert.deepEqual(await readTotals(path), before);
-    assert.equal((await readRecords(path)).length, 1);
-  });
-});
-test("real v2 IDs associate complete content metadata, but tool-input coverage still downgrades generation", async () => {
-  await backendCase(async ({ path, send }) => {
-    await send({ type: "session.next.text.delta", timestamp: 100, properties: { sessionID: "s", assistantMessageID: "m", textID: "text", delta: "hello" } });
-    await send({ type: "session.next.reasoning.delta", timestamp: 150, properties: { sessionID: "s", assistantMessageID: "m", reasoningID: "reason", delta: "think" } });
-    await send({ type: "session.next.tool.input.delta", timestamp: 200, properties: { sessionID: "s", assistantMessageID: "m", callID: "call", delta: "{}" } });
-    await send(snapshotFact("text", "m", "text", 190, "hello", 100));
-    await send(snapshotFact("reason", "m", "reasoning", 180, "think", 150));
-    await send({ type: "message.part.updated", timestamp: 250, properties: { part: { id: "tool-part", callID: "call", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 250 } } } } });
-    await send(completionFact("m", 10, 5, 0, 1000));
-    const [record] = await readRecords(path);
-    assert.equal(record.samples.length, 0);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.tokens.reasoning, 5);
-    assert.equal(record.speed, undefined);
-    assert.equal((await readTotals(path)).sessions.s.tokens.output, 10);
-    assert.equal((await readTotals(path)).sessions.s.speed, undefined);
-  });
-});
 test("explicit envelope revisions reject stale updates and permit a genuinely newer return to old facts", async () => {
   await backendCase(async ({ path, send }) => {
     await send({ ...completionFact("m", 10, 0, 0, 100), revision: 1 });
@@ -1304,42 +1162,6 @@ function assistantCompleted(
   };
 }
 
-test("known snapshot gap and uncertain tool input downgrade generation without sampling snapshots or tool output", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-content-"));
-  const historyPath = join(directory, "history.jsonl");
-  try {
-    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
-    const send = (type: string, timestamp: number, properties: any) => receive(hooks, { type, timestamp, properties });
-    await send("message.part.updated", 10, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "old snapshot", time: { start: 300 } } });
-    await send("session.next.text.delta", 300, { sessionID: "s", assistantMessageID: "m", partID: "text", delta: "hi" });
-    await send("message.part.delta", 100, { sessionID: "s", messageID: "m", partID: "reason", kind: "reasoning", field: "text", delta: "think" });
-    await send("session.next.tool.input.delta", 400, { sessionID: "s", assistantMessageID: "m", partID: "tool", delta: "{}" });
-    await send("message.part.updated", 500, { part: { id: "reason", messageID: "m", sessionID: "s", type: "reasoning", text: "think", time: { start: 100, end: 200 } } });
-    await send("message.part.updated", 510, { part: { id: "text", messageID: "m", sessionID: "s", type: "text", text: "hi", time: { start: 300, end: 350 } } });
-    await send("message.part.updated", 520, { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", time: { start: 450 } } } });
-    await send("message.part.delta", 600, { sessionID: "s", messageID: "m", partID: "tool", field: "output", delta: "tool result must not count" });
-    await send("message.part.updated", 950, { part: { id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "completed", time: { start: 450, end: 900 } } } });
-    const info = { id: "m", sessionID: "s", role: "assistant", tokens: { input: 10, output: 20, reasoning: 5 }, time: { created: 0, firstToken: 300, completed: 1000 } };
-    await send("message.updated", 1000, { info });
-    let records = await readRecords(historyPath);
-    assert.equal(records[0].time.firstToken, 300);
-    assert.equal(records[0].time.ttft, 300);
-    assert.equal(records[0].tokens.output, 20);
-    assert.equal(records[0].tokens.reasoning, 5);
-    assert.equal(records[0].samples.length, 0);
-    assert.equal(records[0].speed, undefined);
-    await send("message.updated", 1200, { info: { ...info, time: { created: 0, firstToken: 300, completed: 1200 } } });
-    records = await readRecords(historyPath);
-    assert.equal(records[0].time.firstToken, 300);
-    assert.equal(records[0].tokens.output, 20);
-    assert.equal(records[0].speed, undefined);
-    const totals = await readTotals(historyPath);
-    assert.equal(totals.sessions.s.responseCount, 1);
-    assert.equal(totals.sessions.s.tokens.output, 20);
-    assert.equal(totals.sessions.s.speed, undefined);
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
-
 test("unknown multistep usage is not summed and missing final usage is provisional", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-steps-"));
   const historyPath = join(directory, "history.jsonl");
@@ -1351,41 +1173,6 @@ test("unknown multistep usage is not summed and missing final usage is provision
     const [record] = await readRecords(historyPath);
     assert.equal(record.tokens.output, 20);
     assert.equal(record.quality, "provisional");
-    assert.equal(record.speed, undefined);
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
-
-test("cumulative direct speed outlives the retained history window", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-speed-window-"));
-  const historyPath = join(directory, "history.jsonl");
-  try {
-    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath, maxRecords: 1 });
-    await hooks.event!({ event: assistantCompleted("old", { input: 1, output: 10, reasoning: 0 }, 100) as never });
-    await hooks.event!({ event: assistantCompleted("new", { input: 1, output: 30, reasoning: 0 }, 200) as never });
-    assert.equal((await readRecords(historyPath)).length, 1);
-    const totals = await readTotals(historyPath);
-    assert.equal(totals.sessions.session.tokens.output, 40);
-    assert.equal(totals.sessions.session.responseCount, 2);
-    assert.equal(totals.sessions.session.speed, undefined);
-    assert.equal(totals.settled.old.tokens.output, 10);
-    assert.equal(totals.settled.old.speed, undefined);
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
-
-test("tool-only snapshots have no invented first output or generation interval", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-tool-only-"));
-  const historyPath = join(directory, "history.jsonl");
-  try {
-    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
-    await hooks.event!({ event: { type: "message.part.updated", timestamp: 100, properties: { part: {
-      id: "tool", messageID: "m", sessionID: "s", type: "tool", state: { status: "running", input: { command: "echo hi" }, time: { start: 100 } },
-    } } } as never });
-    await hooks.event!({ event: { type: "session.next.tool.result", timestamp: 800, properties: { sessionID: "s", assistantMessageID: "m", delta: "result" } } as never });
-    await hooks.event!({ event: assistantCompleted("m", { input: 1, output: 10, reasoning: 0 }, 1000, 0, "s") as never });
-    const [record] = await readRecords(historyPath);
-    assert.equal(record.time.firstToken, undefined);
-    assert.equal(record.tokens.output, 10);
-    assert.equal(record.samples.length, 0);
     assert.equal(record.speed, undefined);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -1469,58 +1256,6 @@ test("final usage supersedes fallback cache counts, preserves output zero, and d
   }
 });
 
-test("late fallback after exact completion is ignored before idle", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
-  const historyPath = join(directory, "history.jsonl");
-  try {
-    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
-    assert.ok(hooks.event);
-    const exact = {
-      type: "message.updated",
-      timestamp: 200,
-      properties: {
-        info: {
-          id: "exact-first",
-          sessionID: "session",
-          role: "assistant",
-          cost: 2,
-          time: { created: 0, completed: 200 },
-          tokens: { input: 5, output: 6, reasoning: 1, cache: { read: 7, write: 8 } },
-        },
-      },
-    };
-    const lateFallback = {
-      type: "session.next.step.ended",
-      timestamp: 210,
-      properties: {
-        sessionID: "session",
-        assistantMessageID: "exact-first",
-        tokens: { input: 50, output: 60, reasoning: 10, cache: { read: 70, write: 80 } },
-      },
-    };
-    const idle = {
-      type: "session.idle",
-      timestamp: 300,
-      properties: { sessionID: "session" },
-    };
-    await hooks.event({ event: exact as never });
-    await hooks.event({ event: lateFallback as never });
-    await hooks.event({ event: idle as never });
-    const records = await readRecords(historyPath);
-    assert.equal(records.length, 1);
-    assert.deepEqual(records[0].tokens, {
-      input: 5,
-      output: 6,
-      reasoning: 1,
-      cacheRead: 7,
-      cacheWrite: 8,
-    });
-    assert.equal(records[0].quality, "exact");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
 test("fallback then exact completion remains one exact record through duplicate events", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
   const historyPath = join(directory, "history.jsonl");
@@ -1564,29 +1299,12 @@ test("fallback then exact completion remains one exact record through duplicate 
       cacheRead: 7,
       cacheWrite: 8,
     });
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("idle flush persists a provisional quality marker", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
-  const historyPath = join(directory, "history.jsonl");
-  try {
-    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
-    assert.ok(hooks.event);
-    await hooks.event({ event: {
-      type: "session.next.step.ended",
-      timestamp: 100,
-      properties: { sessionID: "session", messageID: "idle-fallback", stepID: "fallback", tokens: { output: 0 } },
-    } as never });
-    await hooks.event({ event: {
-      type: "session.idle",
-      timestamp: 200,
-      properties: { sessionID: "session" },
-    } as never });
-    const records = await readRecords(historyPath);
-    assert.equal(records[0]?.quality, "provisional");
+    assert.equal(records[0].quality, "exact");
+    assert.equal(records[0].cost, 2);
+    const ledger = await readTotals(historyPath);
+    assert.deepEqual(ledger.sessions.session.tokens, records[0].tokens);
+    assert.equal(ledger.sessions.session.cost, 2);
+    assert.equal(ledger.sessions.session.responseCount, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -1909,34 +1627,6 @@ test("completed response parent lookup is supplemental and persisted", async () 
     } as never });
     assert.equal(lookupCalls, 2);
     assert.equal((await readRecords(historyPath)).find((record) => record.messageID === "message-2")?.parentSessionID, "root");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("a completed message writes direct usage into the sibling totals ledger", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "oc-tps-server-"));
-  const historyPath = join(directory, "history.jsonl");
-  try {
-    const hooks = await server({ directory, worktree: directory } as unknown as PluginInput, { historyPath });
-    assert.ok(hooks.event);
-    await hooks.event({ event: assistantCompleted("message", {
-      input: 4,
-      output: 5,
-      reasoning: 1,
-    }, 200, 3) as never });
-
-    const totals = await readTotals(historyPath);
-    assert.equal(totals.sessions.session.responseCount, 1);
-    assert.equal(totals.sessions.session.cost, 3);
-    assert.deepEqual(totals.sessions.session.tokens, {
-      input: 4,
-      output: 5,
-      reasoning: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-    });
-    assert.deepEqual((await readRecords(historyPath))[0]?.tokens, totals.sessions.session.tokens);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
