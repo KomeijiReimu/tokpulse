@@ -560,9 +560,15 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
   const ui = (await uiPromise)!;
   const sessionID = "ses_eee872613ffeAXfSAWtXsJbYB4";
   const children = [
-    { id: "ses_eee872613ffeAXfSAWtXsJbYB5", parent: sessionID, model: "openai/gpt-5.4-thinking-extended", output: 4_200_000, calls: 1200, agents: ["oracle", "fixer"], agent: "fixer", label: "fixer / oracle" },
-    { id: "ses_eee872613ffeAXfSAWtXsJbYB6", parent: "ses_eee872613ffeAXfSAWtXsJbYB5", model: "openrouter/x-ai/grok-4.1-fast-reasoning", output: 3_200_000, calls: 9000, agents: [], agent: "custom-nested-reviewer", label: "custom-nested-reviewer" },
-    { id: "ses_fff872613ffeAXfSAWtXsJbYB7", parent: sessionID, model: "openrouter/x-ai/grok-4-without-generation-timing", output: 1_100_000, calls: 100_000, agents: [], agent: undefined, label: "" },
+    { id: "ses_eee872613ffeAXfSAWtXsJbYB5", parent: sessionID, model: "openai/gpt-5.4-thinking-extended",
+      tokens: { input: 100_000, cacheRead: 200_000, cacheWrite: 30_000, output: 4_200_000, reasoning: 70_000 },
+      generated: 4_270_000, total: 4_600_000, calls: 1200, agents: ["oracle", "fixer"], agent: "fixer", label: "fixer / oracle", ledgerOnly: false },
+    { id: "ses_eee872613ffeAXfSAWtXsJbYB6", parent: "ses_eee872613ffeAXfSAWtXsJbYB5", model: "openrouter/x-ai/grok-4.1-fast-reasoning",
+      tokens: { input: 210_000, cacheRead: 320_000, cacheWrite: 40_000, output: 3_200_000, reasoning: 80_000 },
+      generated: 3_280_000, total: 3_850_000, calls: 9000, agents: [], agent: "custom-nested-reviewer", label: "custom-nested-reviewer", ledgerOnly: false },
+    { id: "ses_fff872613ffeAXfSAWtXsJbYB7", parent: sessionID, model: "-",
+      tokens: { input: 50_000, cacheRead: 60_000, cacheWrite: 7_000, output: 1_100_000, reasoning: 8_000 },
+      generated: 1_108_000, total: 1_225_000, calls: 100_000, agents: [], agent: undefined, label: "", ledgerOnly: true },
   ];
   const frames = [{ width: 20, routeID: sessionID }, { width: 20, routeID: children[0].id }];
   for (const { width, routeID } of frames) {
@@ -572,14 +578,14 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
       speed: updateSpeedTotals(emptySpeedTotals(), v3Generation(115_000), 1) };
     store.totalsLedger.sessionAgents = { [sessionID]: ["root-only"] };
     for (const child of children) {
-      store.totalsLedger.sessions[child.id] = { tokens: tokens(child.output), cost: 1, responseCount: child.calls };
+      store.totalsLedger.sessions[child.id] = { tokens: child.tokens, cost: 1, responseCount: child.calls };
       store.totalsLedger.sessionAgents[child.id] = child.agents;
       store.sessionParents.set(child.id, child.parent);
       store.totalsLedger.settled[`${child.id}-last`] = true;
     }
-    store.records = children.map((child) => ({ version: 1, messageID: `${child.id}-last`, sessionID: child.id,
-      model: child.model, agent: child.agent, tokens: tokens(child.output), cost: 1, time: { start: 0, completed: 1 }, samples: [],
-      speed: { response: { generatedTokens: child.output, durationMs: 1, estimated: false } } }));
+    store.records = children.filter((child) => !child.ledgerOnly).map((child) => ({ version: 1, messageID: `${child.id}-last`, sessionID: child.id,
+      model: child.model, agent: child.agent, tokens: child.tokens, cost: 1, time: { start: 0, completed: 1 }, samples: [],
+      speed: { response: { generatedTokens: child.generated, durationMs: 1, estimated: false } } }));
     store.pulseExpanded = true;
     const api = host(120, 180);
     const sidebar = ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!;
@@ -603,7 +609,7 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
       const childGlyphs = glyphs.slice(glyphs.indexOf("CHILDAGENTS") + "CHILDAGENTS".length);
       const expected = routeID === sessionID ? children : [children[1]];
       for (const child of expected) {
-        assert.ok(glyphs.includes(`${child.id}${child.calls.toLocaleString("en-US")}responses${child.output.toLocaleString("en-US")}generated`), `${width}: full child ID, exact counts and units must survive wrapping`);
+        assert.ok(childGlyphs.includes(`${child.id}${child.calls.toLocaleString("en-US")}responses${child.generated.toLocaleString("en-US")}generated${child.total.toLocaleString("en-US")}total`), `${width}: full child ID, direct generated and all-token totals must survive wrapping without including descendants`);
         assert.ok(glyphs.includes(`model${child.model}`), `${width}: full model must survive wrapping`);
         assert.ok(childGlyphs.includes(`${child.label.replace(/\s+/g, "")}${child.id}`), `${width}: actual names appear before their own full SID`);
       }

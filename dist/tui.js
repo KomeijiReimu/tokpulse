@@ -2976,7 +2976,7 @@ function ChildAgentRows(props) {
       })(), _el$10);
       _$setProp(_el$10, "wrapMode", "word");
       _$setProp(_el$10, "flexShrink", 0);
-      _$insert(_el$10, () => `${"  ".repeat(row.depth)}${row.sessionID}  ${formatFullNumber(row.responseCount)} responses  ${formatFullNumber(row.generated)} generated`);
+      _$insert(_el$10, () => `${"  ".repeat(row.depth)}${row.sessionID}  ${formatFullNumber(row.responseCount)} responses  ${formatFullNumber(row.generated)} generated  ${formatFullNumber(row.total)} total`);
       _$setProp(_el$11, "wrapMode", "word");
       _$setProp(_el$11, "flexShrink", 0);
       _$insert(_el$11, () => `model ${row.model}`);
@@ -3983,6 +3983,7 @@ export function childRows(records, sessionID, store) {
         agents: normalizeAgentNames([...normalizeAgentNames(ownValue(store.totalsLedger.sessionAgents, childID)), ...directRecords.map(record => record.agent)]),
         responseCount: rollup.direct.responseCount,
         generated: generatedTokens(rollup.direct.tokens),
+        total: totalTokens(rollup.direct.tokens),
         model: modelRecord?.model ?? "-"
       });
     }

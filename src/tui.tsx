@@ -725,6 +725,7 @@ interface ChildRow {
   agents: string[];
   responseCount: number;
   generated: number;
+  total: number;
   model: string;
 }
 
@@ -3915,7 +3916,7 @@ function ChildAgentRows(props: {
             </text>
           )}
           <text fg={props.theme.current.info} wrapMode="word" flexShrink={0}>
-            {`${"  ".repeat(row.depth)}${row.sessionID}  ${formatFullNumber(row.responseCount)} responses  ${formatFullNumber(row.generated)} generated`}
+            {`${"  ".repeat(row.depth)}${row.sessionID}  ${formatFullNumber(row.responseCount)} responses  ${formatFullNumber(row.generated)} generated  ${formatFullNumber(row.total)} total`}
           </text>
           <text fg={props.theme.current.textMuted} wrapMode="word" flexShrink={0}>
             {`model ${row.model}`}
@@ -4660,6 +4661,7 @@ export function childRows(
         ]),
         responseCount: rollup.direct.responseCount,
         generated: generatedTokens(rollup.direct.tokens),
+        total: totalTokens(rollup.direct.tokens),
         model: modelRecord?.model ?? "-",
       });
     }
