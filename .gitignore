@@ -2,6 +2,7 @@ node_modules/
 .opencode/
 .tokpulse/
 .tokpulse-writer-locks/
+.tokpulse-migrate-*/
 .cortexkit/
 .slim/
 .codegraph/

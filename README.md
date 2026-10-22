@@ -118,9 +118,9 @@ History is JSONL, one record per completed response, kept to the most recent
 **1,000 records** by default.
 
 The server owns ledger recovery and writes; opening the TUI only reads them.
-Exclusive writer locks prevent two backends from writing the same ledger. Lock
-metadata lives in `.tokpulse-writer-locks/` beside the ledger directory; do not
-remove it while the server is running.
+It also creates `.tokpulse-writer-locks/` beside the ledger directory (in the
+project root with default paths). Its SQLite lock files prevent two backends
+from writing the same ledger. Do not remove it while the server is running.
 
 Successfully written facts survive closing the frontend and restarting the
 process. Facts that could not be written cannot be recovered after that process
@@ -139,18 +139,30 @@ not automatically migrated. If your configs explicitly use the old path, update
 | `runsPath` | same directory as `historyPath`, file `runs.jsonl` | Activity ledger path. |
 | `maxRecords` | `1000` | Number of response records to keep. |
 
-For Git repositories, keep project-local ledgers out of version control. You can
-add this reusable rule to your global `AGENTS.md`:
+For Git repositories, keep project-local ledger and writer-lock directories out
+of version control. You can add this reusable rule to your global `AGENTS.md`:
 
 ```text
-In Git repositories, add the project's .tokpulse/ directory to .gitignore.
+In Git repositories, ignore Token Pulse's local .tokpulse/ and
+.tokpulse-writer-locks/ directories, .tokpulse-migrate-*/ staging directories,
+and any retained legacy data in .opencode/oc-tps/.
 ```
 
-Add this directory line to the project's `.gitignore`:
+Add these directory lines to the project's `.gitignore`:
 
 ```gitignore
 .tokpulse/
+.tokpulse-writer-locks/
+.tokpulse-migrate-*/
+.opencode/oc-tps/
 ```
+
+The first two rules also cover temporary ledger writes, corrupt-ledger backups,
+and SQLite lock files. Migration staging directories are normally removed after
+migration, but can remain after abrupt process termination. The legacy directory
+contains data retained from older versions. For custom ledger paths inside the
+repository, also ignore those files or their dedicated data directories and the
+adjacent `.tokpulse-writer-locks/` directory.
 
 ## Development
 

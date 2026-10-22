@@ -107,9 +107,9 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 `historyPath`，server 和 TUI 要用同一个路径。历史是 JSONL，每条完成的响应对应
 一条记录，默认保留最近 **1000 条**。
 
-账本恢复和写入仅由 server 执行，打开 TUI 只会读取数据。排他锁防止两个后台同时
-写入同一账本；锁元数据位于账本目录旁的 `.tokpulse-writer-locks/`，后台运行时
-不要删除它。
+账本恢复和写入仅由 server 执行，打开 TUI 只会读取数据。server 还会在账本目录旁
+自动创建 `.tokpulse-writer-locks/`（默认位于项目根目录），其中的 SQLite 锁文件
+用于防止两个后台同时写入同一账本。后台运行时不要删除该目录。
 
 已成功写入的事实会保留到前台关闭、进程重启之后。未能写入的事实无法在原进程
 退出后恢复；突然断电和不可靠的网络文件系统不在此恢复保证内。历史缺失的开始
@@ -126,18 +126,27 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 | `runsPath` | 与 `historyPath` 同目录的 `runs.jsonl` | 活动账本路径。 |
 | `maxRecords` | `1000` | 保留的响应记录数。 |
 
-对于 Git 仓库，建议将项目本地账本排除在版本控制之外。可以在全局 `AGENTS.md`
-中加入以下可复用规则：
+对于 Git 仓库，将项目本地账本和写入锁目录排除在版本控制之外。可以在全局
+`AGENTS.md` 中加入以下可复用规则：
 
 ```text
-对于 Git 仓库，将项目下的 .tokpulse/ 目录加入 .gitignore。
+对于 Git 仓库，将 Token Pulse 的本地目录 .tokpulse/、.tokpulse-writer-locks/、
+迁移临时目录 .tokpulse-migrate-*/，以及仍保留的旧版数据 .opencode/oc-tps/ 加入 .gitignore。
 ```
 
-在项目的 `.gitignore` 中加入这一目录行：
+在项目的 `.gitignore` 中加入以下目录行：
 
 ```gitignore
 .tokpulse/
+.tokpulse-writer-locks/
+.tokpulse-migrate-*/
+.opencode/oc-tps/
 ```
+
+前两条规则也覆盖账本写入临时文件、损坏账本的备份以及 SQLite 锁文件。迁移临时
+目录正常会自动清理，但进程被强制终止时可能残留。旧版目录中保留的是历史数据。
+如果在仓库内自定义账本路径，还应忽略实际账本文件或其专用数据目录，以及相邻的
+`.tokpulse-writer-locks/` 目录。
 
 ## 开发
 
