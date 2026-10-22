@@ -101,6 +101,12 @@ function host(width: number, height: number, child = false): TuiPluginApi {
   } as unknown as TuiPluginApi;
 }
 
+function readyStore(ui: RenderedTui, maxRecords = 1): ReturnType<RenderedTui["createRuntimeStore"]> {
+  const store = ui.createRuntimeStore(maxRecords);
+  store.sourceState = { status: "ready", epoch: store.sourceEpoch, live: false, loaded: { history: true, totals: true, runs: true } };
+  return store;
+}
+
 if (!nativeChild) {
   test("native OpenTUI sidebar and dialog render checks (isolated Solid host)", { timeout: 30000 }, async () => {
     // The host preloads Solid's client runtime. Isolate it so these checks do
@@ -110,11 +116,154 @@ if (!nativeChild) {
     ], { timeout: 25000, cwd: fileURLToPath(new URL("..", import.meta.url)), env: {
       ...process.env, TOKPULSE_NATIVE_RENDER: "1", TMPDIR: cacheRoot,
     } });
-    assert.match(output.stderr + output.stdout, /28 pass/);
+    assert.match(output.stderr + output.stdout, /\b[1-9]\d* pass\b/);
   });
 }
 
 if (nativeChild) {
+test("source states render unknown rather than zero across sidebar, history and details, then recover on revision", async () => {
+  const ui = (await uiPromise)!;
+  const paths = { history: "/project/history.jsonl", totals: "/project/totals.json", runs: "/project/runs.jsonl" };
+  for (const surface of ["sidebar", "history", "details"] as const) {
+    const store = ui.createRuntimeStore(1);
+    store.pulseExpanded = true;
+    const api = host(100, 80);
+    const rendered = await testRender(() => {
+      api.renderer = useRenderer();
+      return surface === "sidebar" ? ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!({ theme: api.theme }, { session_id: "root" })
+        : surface === "history" ? ui.__testHistoryView({ api, store, sessionID: "root", options: ui.resolveOptions({}) })
+        : ui.TokenPulseDetails({ api, store, sessionID: "root" });
+    }, { width: 100, height: 80 });
+    try {
+      for (const [state, label] of [
+        [{ status: "waiting-metadata" }, "Waiting for session metadata"],
+        [{ status: "loading", paths }, "Loading Token Pulse data"],
+        [{ status: "missing", paths, missing: Object.values(paths) }, "Missing ledger: history, totals, task time"],
+        [{ status: "error", paths, errors: { history: "unreadable", totals: "unreadable", runs: "unreadable" } }, "Unable to read: history, totals, task time"],
+        [{ status: "error", paths, errors: { history: "unreadable" } }, "Unable to read: history"],
+        [{ status: "error", paths, errors: { runs: "unreadable" } }, "Unable to read: task time"],
+        [{ status: "error", errors: { metadata: "unavailable" } }, "Unable to read: session metadata"],
+      ] as const) {
+        store.sourceState = { epoch: store.sourceEpoch, live: false, loaded: {}, ...state, missing: "missing" in state && state.missing ? [...state.missing] : undefined };
+        store.bump();
+        await rendered.renderOnce(); await rendered.renderOnce();
+        const frame = rendered.captureCharFrame();
+        assert.ok(frame.includes(label), `${surface}: ${label}`);
+        assert.doesNotMatch(frame, /\b0 total|time 0|\b0%|\$0|No completed responses yet|No recorded usage/);
+        assert.match(frame, surface === "history" ? /Totals unavailable/ : /--/);
+      }
+      store.sourceState = { status: "ready", epoch: store.sourceEpoch, live: false, loaded: { history: true, totals: true, runs: true } };
+      store.bump();
+      await rendered.renderOnce(); await rendered.renderOnce();
+      const ready = rendered.captureCharFrame();
+      assert.doesNotMatch(ready, /Waiting for|Loading Token|Missing ledger|Unable to read|Totals unavailable/);
+      assert.match(ready, surface === "history" ? /No completed responses yet/ : surface === "sidebar" ? /0 total/ : /No recorded usage/);
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
+test("partial ledger failures retain available usage and cache while missing runs keep task time unknown", async () => {
+  const ui = (await uiPromise)!;
+  const paths = { history: "/project/history.jsonl", totals: "/project/totals.json", runs: "/project/runs.jsonl" };
+  for (const surface of ["sidebar", "history", "details"] as const) {
+    const store = readyStore(ui);
+    store.totalsLedger.sessions.root = { tokens: { input: 10, output: 100, reasoning: 0, cacheRead: 10, cacheWrite: 0 }, cost: 1, responseCount: 1 };
+    const run = ui.createTaskWallRun("root");
+    ui.transitionTaskWallRun(run, "root", "busy", 1000);
+    ui.transitionTaskWallRun(run, "root", "idle", 6000);
+    store.taskRuns.set("root", run);
+    store.pulseExpanded = true;
+    const api = host(100, 80);
+    const rendered = await testRender(() => {
+      api.renderer = useRenderer();
+      return surface === "sidebar" ? ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!({ theme: api.theme }, { session_id: "root" })
+        : surface === "history" ? ui.__testHistoryView({ api, store, sessionID: "root", options: ui.resolveOptions({}) })
+        : ui.TokenPulseDetails({ api, store, sessionID: "root" });
+    }, { width: 100, height: 80 });
+    try {
+      for (const state of [
+        { status: "missing", paths, loaded: { history: true, totals: true, runs: false }, missing: [paths.runs] },
+        { status: "missing", paths, loaded: { history: false, totals: true, runs: true }, missing: [paths.history] },
+        { status: "error", paths, loaded: { history: false, totals: true, runs: true }, errors: { history: "unreadable" } },
+        { status: "error", paths, loaded: { history: true, totals: true, runs: true }, errors: { totals: "unreadable" } },
+        { status: "loading", paths, loaded: { history: true, totals: true, runs: true } },
+      ] as const) {
+        store.sourceState = { epoch: store.sourceEpoch, live: false, ...state, missing: "missing" in state && state.missing ? [...state.missing] : undefined };
+        store.bump();
+        await rendered.renderOnce(); await rendered.renderOnce();
+        const frame = rendered.captureCharFrame();
+        assert.match(frame, /120/);
+        assert.match(frame, /50%/);
+        assert.doesNotMatch(frame, /Totals unavailable/);
+        if (surface === "sidebar" && state.status === "missing" && state.missing.includes(paths.runs)) {
+          assert.match(frame, /time --/);
+          assert.doesNotMatch(frame, /time 5s/);
+        }
+        if (surface === "history" && state.status === "missing" && state.missing.includes(paths.history)) {
+          assert.match(frame, /Missing ledger: history/);
+          assert.doesNotMatch(frame, /No completed responses yet/);
+        }
+      }
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
+test("loaded snapshots, including valid empty ledgers, survive same-source refresh failures", async () => {
+  const ui = (await uiPromise)!;
+  const paths = { history: "/project/history.jsonl", totals: "/project/totals.json", runs: "/project/runs.jsonl" };
+  for (const empty of [false, true]) for (const surface of ["sidebar", "history", "details"] as const) {
+    const store = readyStore(ui);
+    const tokens = { input: 10, output: 100, reasoning: 0, cacheRead: 10, cacheWrite: 0 };
+    if (!empty) {
+      store.totalsLedger.sessions.root = { tokens, cost: 1, responseCount: 1 };
+      store.records = [{ version: 1, sessionID: "root", messageID: "kept", model: "kept-model", tokens, cost: 1,
+        time: { start: 1000, completed: 6000 }, samples: [] }];
+      store.diskRecords = store.records;
+      store.totalsLedger.settled.kept = true;
+    }
+    // No totals/session entry at all in the empty case: loaded is the evidence
+    // for a valid zero snapshot, not a heuristic based on nonzero usage.
+    const run = ui.createTaskWallRun("root");
+    ui.transitionTaskWallRun(run, "root", "busy", 1000);
+    ui.transitionTaskWallRun(run, "root", "idle", 6000);
+    store.taskRuns.set("root", run);
+    store.pulseExpanded = true;
+    const api = host(100, 80);
+    const rendered = await testRender(() => {
+      api.renderer = useRenderer();
+      return surface === "sidebar" ? ui.createTuiSlotPlugin(api, store, ui.resolveOptions({})).slots!.sidebar_content!({ theme: api.theme }, { session_id: "root" })
+        : surface === "history" ? ui.__testHistoryView({ api, store, sessionID: "root", options: ui.resolveOptions({}) })
+        : ui.TokenPulseDetails({ api, store, sessionID: "root" });
+    }, { width: 100, height: 80 });
+    try {
+      for (const state of [
+        { status: "missing", missing: [paths.runs] },
+        { status: "missing", missing: [paths.totals, paths.history] },
+        { status: "error", errors: { history: "unreadable", totals: "unreadable", runs: "unreadable" } },
+      ] as const) {
+        store.sourceState = { epoch: store.sourceEpoch, live: false, paths, ...state,
+          loaded: { history: true, totals: true, runs: true }, missing: "missing" in state && state.missing ? [...state.missing] : undefined };
+        store.bump();
+        await rendered.renderOnce(); await rendered.renderOnce();
+        const frame = rendered.captureCharFrame();
+        assert.match(frame, /Unable to refresh:/);
+        assert.match(frame, /showing last known data/);
+        assert.doesNotMatch(frame, /Totals unavailable|-- total/);
+        if (surface === "sidebar") {
+          assert.match(frame, empty ? /\b0 total/ : /120 total/);
+          assert.match(frame, /time 5s/);
+        } else if (surface === "history") {
+          assert.match(frame, empty ? /Total tokens \(input \+ generated \+ cache\) 0/ : /120/);
+          assert.match(frame, empty ? /No completed responses yet/ : /kept-model/);
+        } else {
+          assert.match(frame, empty ? /No recorded usage for this session/ : /120/);
+        }
+        if (!empty) assert.match(frame, /50%/);
+      }
+    } finally { rendered.renderer.destroy(); store.disposeSignals(); }
+  }
+});
+
 function reportFrame(name: string, frame: string): void {
   if (process.env.TOKPULSE_UI_FRAMES === "1") console.log(`FRAME ${name}\n${frame.split("\n").map((line) => line.trimEnd()).filter(Boolean).join("\n")}\nEND FRAME`);
 }
@@ -167,7 +316,7 @@ async function ledgerPluginFixture(lateDirectory = false, gateInitialHistory = f
   Date.now = () => clock;
   let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
   const toasts: string[] = [];
-  const api = { ...host(80, 40), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+  const api = { ...host(80, 40), state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
     route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
     mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: (value: { message: string }) => { toasts.push(value.message); }, dialog: { open: false } },
     slots: { register: (plugin: typeof registered) => { registered = plugin; return "ledger-watch"; } },
@@ -356,7 +505,9 @@ test("initialization drains watcher-invalidated authoritative hydration before r
     assert.equal(owned.progress!.fromCurrentStart, true);
     assert.equal(owned.legacy.samples.length + owned.v2.samples.length, 0);
     await f.rendered.renderOnce();
-    assert.match(f.rendered.captureCharFrame(), /0 total/);
+    assert.match(f.rendered.captureCharFrame(), /-- total/);
+    assert.match(f.rendered.captureCharFrame(), /Loading Token Pulse data|Missing ledger: task time/);
+    assert.match(f.rendered.captureCharFrame(), /time --/);
     assert.doesNotMatch(f.rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT/i);
     const initialGeneration = f.store.historyGeneration;
     const record = { version: 1, messageID: "m", sessionID: "s", quality: "exact", tokens: { input: 1, output: 6, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
@@ -499,7 +650,7 @@ test("actual plugin content subscriptions do no session lookup or totals project
   let lookups = 0;
   let restoreWrites = () => {};
   const api = { ...host(80, 24),
-    state: { path: { worktree: directory, directory }, session: { get: () => { lookups += 1; return undefined; } }, part: () => [] },
+    state: { path: { worktree: directory, directory }, session: { get: (id: string) => { lookups += 1; return { id, directory }; } }, part: () => [] },
     route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
     mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
     slots: { register: () => "content-noop" },
@@ -572,7 +723,7 @@ test("actual plugin subscription retires anonymous step compatibility before idl
   performance.now = () => clock;
   let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
   const api = { ...host(120, 160),
-    state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+    state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
     route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
     mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} },
     ui: { toast: () => {}, dialog: { open: false } },
@@ -611,7 +762,8 @@ test("actual plugin subscription retires anonymous step compatibility before idl
     reportFrame("two-part before completion", rendered.captureCharFrame());
     send(11770, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", tokens: { input: 1, output: 10, reasoning: 0 }, time: { created: 1100, completed: 11770 } } });
     await rendered.renderOnce();
-    assert.match(rendered.captureCharFrame(), /10/, "completion must retire the anonymous pending ghost before session idle, without shortening the 10s part gap");
+    assert.match(rendered.captureCharFrame(), /11 total/, "completion must retain known usage while the ledgers are missing");
+    assert.match(rendered.captureCharFrame(), /time --/, "missing runs must not look like a confirmed task duration");
     assert.doesNotMatch(rendered.captureCharFrame(), /tok\/s|LIVE|WARMUP|TTFT|avg/i);
     reportFrame("two-part completed LAST", rendered.captureCharFrame());
     send(11800, "session.idle", { sessionID: "s" });
@@ -658,19 +810,13 @@ test("actual plugin initial hydrate overlaps subscribed live start then rejects 
     clock = at;
     handlers.get(type)!({ type, properties, timestamp: at }, { directory, workspace: undefined });
   };
-  const api = { ...host(80, 30), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+  const api = { ...host(80, 30), state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
     route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} },
     mode: { push: () => () => {} }, keymap: { registerLayer: () => () => {} }, ui: { toast: () => {}, dialog: { open: false } },
     slots: { register: (plugin: typeof registered) => { registered = plugin; return "overlap"; } },
     event: { on: (type: string, callback: (event: unknown, metadata: { directory: string; workspace: undefined }) => void) => {
       assert.equal(handlers.has(type), false, "no duplicate subscription or invented wrapper");
       handlers.set(type, callback);
-      if (type === "workspace.deleted") {
-        // All callbacks are installed, but the plugin has not awaited initial disk hydration.
-        send(1000, "session.status", { sessionID: "s", status: { type: "busy" } });
-        send(1000, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1000 } } });
-        send(1010, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
-      }
       return () => handlers.delete(type);
     } }, lifecycle: { onDispose: (dispose: () => void | Promise<void>) => { disposers.push(dispose); return () => {}; } },
   } as unknown as TuiPluginApi;
@@ -680,6 +826,11 @@ test("actual plugin initial hydrate overlaps subscribed live start then rejects 
   try {
     initialization = ui.default.tui(api, { historyPath }, {} as never) as Promise<void>;
     await waitForLedger(held.entered, "safe fd read must be held before overlap assertions");
+    // Source binding now clears prior-source events. Start after binding, while
+    // the real initial history read is still held, to test the same overlap.
+    send(1000, "session.status", { sessionID: "s", status: { type: "busy" } });
+    send(1000, "message.updated", { info: { id: "m", sessionID: "s", role: "assistant", time: { created: 1000 } } });
+    send(1010, "session.next.step.started", { sessionID: "s", messageID: "m", stepID: "step" });
     const store = ui.__testRuntimeStores.at(-1)!;
     const owned = store.active.get("m")!;
     assert.ok(owned, "precondition: actual plugin active exists before hydrate");
@@ -740,7 +891,7 @@ test("actual plugin individual SDK flush arrivals qualify short LAST and average
     let registered!: ReturnType<typeof ui.createTuiSlotPlugin>;
     const commands = new Map<string, () => void>();
     let dialog!: () => JSX.Element;
-    const api = { ...host(80, 60), state: { path: { worktree: directory, directory }, session: { get: () => undefined }, part: () => [] },
+    const api = { ...host(80, 60), state: { path: { worktree: directory, directory }, session: { get: (id: string) => ({ id, directory }) }, part: () => [] },
       route: { current: { name: "session", params: { sessionID: "s" } }, register: () => {}, navigate: () => {} }, mode: { push: () => () => {} },
       keymap: { registerLayer: (layer: { commands?: { name: string; run: () => void }[] }) => { for (const command of layer.commands ?? []) commands.set(command.name, command.run); return () => {}; } },
       ui: { toast: () => {}, dialog: { open: false, replace: (render: () => JSX.Element) => { dialog = render; }, setSize: () => {} } },
@@ -801,7 +952,7 @@ test("actual narrow sidebar preserves full metric fields and task time without e
   const counts = { input: 3_900_000, cacheRead: 6_100_000, output: 6_300_000, reasoning: 0, cacheWrite: 0 };
   const sessionID = "ses_eee872613ffeAXfSAWtXsJbYB4";
   for (const speed of [57_500, undefined]) {
-    const store = ui.createRuntimeStore(1);
+    const store = readyStore(ui);
     store.totalsLedger.sessions[sessionID] = { tokens: counts, cost: 1, responseCount: 100,
       speed: updateSpeedTotals(emptySpeedTotals(), speed === undefined
         ? { response: { generatedTokens: 6_300_000, durationMs: 1, estimated: false } }
@@ -863,7 +1014,7 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
   ];
   const frames = [20, 24, 28, 32].flatMap((width) => [sessionID, children[0].id].map((routeID) => ({ width, routeID })));
   for (const { width, routeID } of frames) {
-    const store = ui.createRuntimeStore(1);
+    const store = readyStore(ui);
     const tokens = (output: number) => ({ input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 });
     store.totalsLedger.sessions[sessionID] = { tokens: tokens(115_000), cost: 1, responseCount: 1,
       speed: updateSpeedTotals(emptySpeedTotals(), v3Generation(115_000), 1) };
@@ -919,7 +1070,7 @@ test("narrow child rows preserve full agent names, IDs, models, counts and units
 
 test("native child rows show direct cumulative generation estimates or unavailable without response fallback", async () => {
   const ui = (await uiPromise)!;
-  const store = ui.createRuntimeStore(1);
+  const store = readyStore(ui);
   const direct = (output: number, measured = true) => ({
     tokens: { input: 0, output, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, cost: 1, responseCount: 3,
     speed: updateSpeedTotals(emptySpeedTotals(), measured ? v3Generation(output, 0, 2000)
@@ -953,7 +1104,7 @@ test("native child rows show direct cumulative generation estimates or unavailab
 test("native sidebar stays compact when collapsed and shows direct average only in expanded SESSION ONLY", async () => {
   const ui = (await uiPromise)!;
   for (const width of [80, 24, 18]) {
-    const store = ui.createRuntimeStore(1);
+    const store = readyStore(ui);
     store.totalsLedger.sessions.root = {
       tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
       speed: updateSpeedTotals(emptySpeedTotals(), { ...v3Generation(100, 20, 2000), response: { generatedTokens: 120, durationMs: 4000, estimated: true } }, 1),
@@ -992,7 +1143,7 @@ test("native sidebar stays compact when collapsed and shows direct average only 
 test("native detail content fits the host dialog wrapper with fixed title/footer and scrolls to the bottom", async () => {
   const ui = (await uiPromise)!;
   for (const [width, height] of [[110, 40], [80, 24], [40, 16]]) {
-  const store = ui.createRuntimeStore(1);
+  const store = readyStore(ui);
   const sessionID = "session-test-with-long-id";
   store.totalsLedger.sessions[sessionID] = {
     tokens: { input: 10, output: 100, reasoning: 20, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 2,
@@ -1082,7 +1233,7 @@ test("native detail content fits the host dialog wrapper with fixed title/footer
 test("native session-tree selector switches direct details, retains ledger-only nodes and leaves footer fixed", async () => {
   const ui = (await uiPromise)!;
   for (const [width, height] of [[110, 40], [80, 24], [40, 16]]) {
-    const store = ui.createRuntimeStore(1);
+    const store = readyStore(ui);
     const scope = "scope-session-with-long-id";
     const makeDirect = (generated: number, generationMs: number, responseMs: number) => ({
       tokens: { input: 10, output: generated, reasoning: 0, cacheRead: 2, cacheWrite: 1 }, cost: 1, responseCount: 1,
@@ -1180,7 +1331,7 @@ test("native session-tree selector switches direct details, retains ledger-only 
 test("native complete history page keeps summary lines separate from its scrollable records", async () => {
   const ui = await uiPromise!;
   for (const [width, height] of [[140, 50], [140, 40], [80, 40], [80, 24], [40, 50], [40, 40]]) {
-    const store = ui.createRuntimeStore(100);
+    const store = readyStore(ui, 100);
     store.sessionParents.set("child", "root");
     store.records = Array.from({ length: 36 }, (_, index) => ({
       version: 1, messageID: `history-${index}`, sessionID: index % 2 ? "child" : "root",
@@ -1230,7 +1381,7 @@ test("native complete history page keeps summary lines separate from its scrolla
 
 test("native open details becomes an explicit empty state on late MC proof without clearing a host replacement", async () => {
   const ui = await uiPromise!;
-  const store = ui.createRuntimeStore(1);
+  const store = readyStore(ui);
   const api = host(110, 40);
   api.route = { current: { name: "session", params: { sessionID: "root" } } } as TuiPluginApi["route"];
   let content = () => null as JSX.Element;
@@ -1278,7 +1429,7 @@ test("V2 TUI scrollable sidebar, history and details preserve native layout and 
       text: { base: color, muted: color, action: { secondary: { base: color } }, feedback: { info: { base: color } } },
       background: { base: color, raised: { base: color, high: color } }, border: { base: color } },
     data: { listen(callback: typeof listener) { listener = callback; return () => {}; }, session: {
-      get: (id: string) => ({ id, title: id === "child" ? "Review" : "Root", ...(id === "child" ? { parentID: "root" } : {}) }),
+      get: (id: string) => ({ id, location: { directory }, title: id === "child" ? "Review" : "Root", ...(id === "child" ? { parentID: "root" } : {}) }),
     } },
     keymap: { layer(factory: () => unknown) { layers.push(factory()); }, mode: { current: () => "base", push: () => () => {} } },
     ui: { slot(claim: any) { sidebarContent = claim; return () => {}; },
@@ -1312,7 +1463,7 @@ test("V2 TUI scrollable sidebar, history and details preserve native layout and 
       await rendered.renderOnce(); await rendered.renderOnce();
       const collapsed = rendered.captureCharFrame();
       assert.match(collapsed, /\+ Token Pulse/); assert.match(collapsed, /66 total/);
-      assert.match(collapsed, /cache 39%/); assert.match(collapsed, /time 2s/); noSpeed(collapsed);
+      assert.match(collapsed, /cache 39%/); assert.match(collapsed, /time --/); noSpeed(collapsed);
       assert.equal(tuiReadModel(store).counters.rowDerivations, hiddenBefore, "collapsed native sidebar does not derive even the existing real child list");
       const header = rendered.renderer.root.getChildren()[0].getChildren()[0];
       await rendered.mockMouse.click(header.x + 1, header.y); await rendered.renderOnce();

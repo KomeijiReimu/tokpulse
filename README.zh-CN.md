@@ -60,6 +60,9 @@ V2 请按下方配置加载构建后的 `dist` 目录。
 侧栏总量计入有效的子 agent。展开 Token Pulse 可以分开查看当前会话自身的用量
 和其子孙会话。
 
+折叠侧栏的 `cache` 百分比表示缓存命中率，计算方式为 cache read 除以
+input、cache read 和 cache write 之和。会话详情分别显示缓存读取和写入的 token 数。
+
 Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 token、费用、
 调用次数和任务耗时，也不进入用户 agent 列表。用户会话内的维护摘要只按消息排除，
 该会话的其余内容继续统计。旧数据无法核实来源或缺少可安全撤销的原始贡献时，
@@ -97,7 +100,7 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 
 ## 历史记录与配置项
 
-默认历史文件相对于当前项目工作目录：
+默认历史文件相对于会话所属目录：
 
 ```text
 .tokpulse/history.jsonl
@@ -106,6 +109,9 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 活动时间和累计总量分别记在同目录的 `runs.jsonl` 和 `totals.json`。如果覆盖
 `historyPath`，server 和 TUI 要用同一个路径。历史是 JSONL，每条完成的响应对应
 一条记录，默认保留最近 **1000 条**。
+
+从其他目录打开会话时，TUI 读取该会话所属目录的账本。相对 `historyPath` 跟随
+会话目录，绝对路径保持固定。浏览会话只读取已有账本。
 
 账本恢复和写入仅由 server 执行，打开 TUI 只会读取数据。server 还会在账本目录旁
 自动创建 `.tokpulse-writer-locks/`（默认位于项目根目录），其中的 SQLite 锁文件
@@ -122,7 +128,7 @@ Magic Context 的 historian、dreamer 等维护任务及其后代，不计入 to
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `historyPath` | `.tokpulse/history.jsonl` | 项目工作目录下的相对路径，也可以是绝对路径。 |
+| `historyPath` | `.tokpulse/history.jsonl` | 会话所属目录下的相对路径，也可以是绝对路径。 |
 | `runsPath` | 与 `historyPath` 同目录的 `runs.jsonl` | 活动账本路径。 |
 | `maxRecords` | `1000` | 保留的响应记录数。 |
 

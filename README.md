@@ -63,6 +63,10 @@ Totals include input, output, reasoning, cache read, cache write, and cost.
 The sidebar total includes eligible child-agent sessions. Expand Token Pulse
 to see the current session's own usage separately from its descendants.
 
+The collapsed sidebar's `cache` percentage is the cache hit rate:
+cache read divided by the sum of uncached input, cache read, and cache write.
+Session details show the cache read and write token counts separately.
+
 Magic Context maintenance runs, including historian, dreamer and their descendants,
 are excluded from token, cost, call, and task-time statistics and from agent
 views. Maintenance summaries inside a user session are excluded per message;
@@ -106,7 +110,7 @@ remain available. Keep this setting inside the plugin options, not the top-level
 
 ## History and options
 
-Default history file, relative to the current project working directory:
+Default history file, relative to the session's directory:
 
 ```text
 .tokpulse/history.jsonl
@@ -116,6 +120,10 @@ Activity timing and cumulative totals are stored beside it as `runs.jsonl` and
 `totals.json`. Separate server and TUI entries must use the same `historyPath`.
 History is JSONL, one record per completed response, kept to the most recent
 **1,000 records** by default.
+
+Opening a session from another directory uses that session's ledger directory.
+Relative `historyPath` values follow the session directory; absolute paths stay
+fixed. Browsing a session only reads its existing ledgers.
 
 The server owns ledger recovery and writes; opening the TUI only reads them.
 It also creates `.tokpulse-writer-locks/` beside the ledger directory (in the
@@ -135,7 +143,7 @@ not automatically migrated. If your configs explicitly use the old path, update
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `historyPath` | `.tokpulse/history.jsonl` | Relative path under the project working directory, or an absolute path. |
+| `historyPath` | `.tokpulse/history.jsonl` | Relative path under the session directory, or an absolute path. |
 | `runsPath` | same directory as `historyPath`, file `runs.jsonl` | Activity ledger path. |
 | `maxRecords` | `1000` | Number of response records to keep. |
 

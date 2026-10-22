@@ -4,13 +4,14 @@ import { readLedgerText } from "./persistence-files.js";
 import { watch, statSync, type FSWatcher } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
+import { createEffect, createMemo, createRoot, createSignal, onCleanup, onMount, untrack } from "solid-js";
 import type { MouseEvent, ScrollBoxRenderable, SelectRenderable } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
 import type { BindingConfig, BindingValue } from "@opencode-ai/plugin/tui";
 import { Plugin } from "@opencode/plugin/tui";
 import { createV2TuiBridge } from "./tui-v2.js";
-import { tuiReadModel, parentProofPort, RevisionMap, TuiActivitySelection, activitySemanticIdentity, type ParentProofPort, type DisplayTerm } from "./tui-read-model.js";
+import { tuiReadModel, disconnectTuiReadModel, parentProofPort, RevisionMap, TuiActivitySelection, activitySemanticIdentity, type ParentProofPort, type DisplayTerm } from "./tui-read-model.js";
+import { sessionSourcePort, sessionSourceDirectory, sessionSourcePaths, type SourceApi, type TuiSourceState, type TuiSourcePaths } from "./tui-source.js";
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -51,15 +52,15 @@ import { completeContentMetadata, retireContentMetadata, disposeContentMetadata 
 import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, isMeasurementScopeEligible, isSessionScopeExcluded, mergeScopeEvidence, type CompactScopeEvidence, type ScopeRegistry } from "./scope.js";
 import {
   DEFAULT_MAX_RECORDS,
-  readHistoryFile,
+  parseHistoryJsonl,
   filterHistoryRecords,
 } from "./storage.js";
-import { readActivityDelta, resolveRunsPath } from "./runs-storage.js";
+import { readActivityDelta } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
 import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import type { TotalsRollup } from "./totals-aggregate.js";
-import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope, resolveTotalsPath } from "./totals-storage.js";
+import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope } from "./totals-storage.js";
 import type {
   OpenContribution,
   SessionDirectTotals,
@@ -681,6 +682,8 @@ export interface TuiOptions {
 }
 
 export interface RuntimeStore {
+  sourceEpoch: number;
+  sourceState: TuiSourceState;
   maxRecords: number;
   diskRecords: HistoryRecord[];
   records: HistoryRecord[];
@@ -3341,18 +3344,23 @@ export async function reloadHistory(
   generation = store.historyGeneration,
 ): Promise<void> {
   if (store.disposed) return;
-  let diskRecords: HistoryRecord[];
+  const sourceEpoch = store.sourceEpoch;
+  let diskRecords: HistoryRecord[] | undefined;
   try {
-    diskRecords = (await readHistoryFile(path)).slice(-maxRecords);
+    // Keep ENOENT distinct from an actually empty, successfully opened ledger.
+    diskRecords = parseHistoryJsonl(await readLedgerText(path)).slice(-maxRecords);
   } catch (error) {
-    warnWithToast(api, "history read failed", error);
-    return;
+    if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
+    if (generation === store.historyGeneration) {
+      sourceReadError(store, "history", error);
+      if (!isNodeError(error) || error.code !== "ENOENT") warnWithToast(api, "history read failed", error);
+    }
   }
-  if (store.disposed) return;
+  if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
   // Completion ownership is independent of the usage snapshot's generation.
   // Once disk supplied an authoritative same-ID completion, late content must
   // not revive it while the latest history/totals read is still draining.
-  for (const record of diskRecords) {
+  for (const record of diskRecords ?? []) {
     if (record.time.completed !== undefined && record.quality !== "provisional") {
       finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch,
         { completedAt: record.time.completed, authoritative: true });
@@ -3361,16 +3369,25 @@ export async function reloadHistory(
   if (generation !== store.historyGeneration) return;
 
   let totalsLedger: TotalsLedger | undefined;
+  let totalsReadFailed = false;
   try {
     totalsLedger = await readTotalsSnapshot(totalsPath);
   } catch (error) {
-    if (store.disposed || generation !== store.historyGeneration) return;
+    if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.historyGeneration) return;
+    totalsReadFailed = true;
+    sourceReadError(store, "totals", error);
     warnWithToast(api, "totals read failed", error);
   }
-  if (store.disposed || generation !== store.historyGeneration) return;
+  if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.historyGeneration) return;
 
-  if (totalsLedger) store.totalsLedger = totalsLedger;
-  store.diskRecords = diskRecords.map((record) => withCanonicalLedgerSpeed(store.totalsLedger, record));
+  if (totalsLedger) {
+    store.totalsLedger = totalsLedger;
+  } else if (!totalsReadFailed) sourceReadResult(store, "totals", "missing");
+  // Each successful ledger remains independently useful. A failed history read
+  // cannot block fresh totals, and a missing/failed totals read cannot erase the
+  // same source's cumulative snapshot or its history detail window.
+  if (diskRecords === undefined && !totalsLedger) return;
+  store.diskRecords = (diskRecords ?? store.diskRecords).map((record) => withCanonicalLedgerSpeed(store.totalsLedger, record));
   tuiReadModel(store).syncScopes();
   store.sourceScopes = createScopeRegistry(collectSessionScopeEvidence(store.diskRecords, tuiReadModel(store).scopes));
   for (const [id, record] of store.optimistic) {
@@ -3390,6 +3407,8 @@ export async function reloadHistory(
     store.optimisticOrder,
   ));
   refreshScopeProjection(store);
+  if (diskRecords !== undefined) sourceReadSuccess(store, "history");
+  if (totalsLedger) sourceReadSuccess(store, "totals");
 }
 
 export async function reloadActivity(
@@ -3399,6 +3418,7 @@ export async function reloadActivity(
   generation = store.activityGeneration,
 ): Promise<boolean> {
   if (store.disposed) return false;
+  const sourceEpoch = store.sourceEpoch;
   const value = tuiActivity(store), selection = value.selection;
   const token = ++selection.readToken;
   selection.retryNeeded = false;
@@ -3408,11 +3428,15 @@ export async function reloadActivity(
     const delta = await readActivityDelta(path, selection.cursor);
     if (
       store.disposed
+      || sourceEpoch !== store.sourceEpoch
       || generation !== store.activityGeneration
       || token !== selection.readToken
     ) { selection.counters.staleReads++; return false; }
-    if (delta.mode === "unchanged") { selection.cursor = delta.cursor; return true; }
-    if (delta.mode === "reset" && !delta.events.length && !store.activityEvents.length && !selection.cursor && !delta.cursor) return true;
+    if (delta.mode === "reset" && !delta.cursor) {
+      sourceReadResult(store, "runs", "missing");
+      return false;
+    }
+    if (delta.mode === "unchanged") { selection.cursor = delta.cursor; sourceReadSuccess(store, "runs"); return true; }
     model.canonicalParents(delta.events, delta.mode === "reset");
     let accepted: readonly ActivityEvent[];
     if (delta.mode === "reset") {
@@ -3454,10 +3478,11 @@ export async function reloadActivity(
     }
     // Commit the stateless cursor only after all current-generation application.
     selection.cursor = delta.cursor;
+    sourceReadSuccess(store, "runs");
     if (accepted.length || delta.mode === "reset") store.bump();
     return true;
   } catch (error) {
-    if (store.disposed || generation !== store.activityGeneration || token !== selection.readToken) { selection.counters.staleReads++; return false; }
+    if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.activityGeneration || token !== selection.readToken) { selection.counters.staleReads++; return false; }
     selection.retryNeeded = error instanceof Error && /(?:Activity ledger (?:changed|truncated)|Ledger identity changed)/.test(error.message);
     if (selection.retryNeeded) {
       // Replacement/truncation is retried by the existing reload drain with
@@ -3465,6 +3490,7 @@ export async function reloadActivity(
       selection.counters.readRetries++;
       return false;
     }
+    sourceReadError(store, "runs", error);
     warnWithToast(api, "activity read failed", error);
     return false;
   }
@@ -3548,6 +3574,8 @@ export function createRuntimeStore(maxRecords: number, observedSince = Date.now(
     const [revision, setRevision] = createSignal(0);
     const [clockRevision, setClockRevision] = createSignal(0);
     const store: RuntimeStore = {
+      sourceEpoch: 0,
+      sourceState: { status: "waiting-metadata", epoch: 0, live: false },
       maxRecords,
       diskRecords: [],
       records: [],
@@ -3754,6 +3782,34 @@ function emptySummaryLines(): string[] {
   ];
 }
 
+// Presentation only: a missing ledger is not an empty, successfully read ledger.
+function sourcePartAvailable(store: RuntimeStore, part: "history" | "totals" | "runs"): boolean {
+  const source = store.sourceState;
+  // Same-source refresh failures retain successful reads, including valid zero
+  // snapshots. An omitted part in an explicit loaded map is still unknown.
+  return source.loaded ? source.loaded[part] === true : source.status === "ready";
+}
+
+function sourceStatusLabel(store: RuntimeStore): string | undefined {
+  const source = store.sourceState;
+  if (source.status === "ready") return undefined;
+  if (source.status === "waiting-metadata") return "Waiting for session metadata";
+  if (source.status === "loading") return Object.values(source.loaded ?? {}).some(Boolean)
+    ? "Refreshing Token Pulse data" : "Loading Token Pulse data";
+  const labels = { history: "history", totals: "totals", runs: "task time", metadata: "session metadata" };
+  const failed = (Object.keys(labels) as (keyof typeof labels)[]).filter((part) =>
+    source.errors?.[part] || (part !== "metadata" && source.paths && source.missing?.includes(source.paths[part])));
+  if (failed.some((part) => part !== "metadata" && source.loaded?.[part])) {
+    return `Unable to refresh: ${failed.map((part) => labels[part]).join(", ")} · showing last known data`;
+  }
+  return `${source.status === "error" ? "Unable to read" : "Missing ledger"}: ${failed.map((part) => labels[part]).join(", ") || "Token Pulse data"}`;
+}
+
+function usageIsKnown(store: RuntimeStore, totals: SessionDirectTotals | undefined, sessionID?: string): boolean {
+  return sourcePartAvailable(store, "totals") || totalsHaveUsage(totals)
+    || (!!sessionID && ownValue(store.totalsLedger.sessions, sessionID) !== undefined);
+}
+
 interface PulseMetric {
   label: string;
   value: string;
@@ -3770,8 +3826,9 @@ function pulseMetricRows(
   tokens: TokenCounts,
   cost: number,
   responseCount: number,
+  known = true,
 ): PulseMetric[] {
-  return [
+  const metrics = [
     { label: "Total tokens (input + generated + cache)", value: formatFullNumber(totalTokens(tokens)) },
     { label: "Uncached input", value: formatFullNumber(tokens.input) },
     { label: "Cache read (reused)", value: formatFullNumber(tokens.cacheRead) },
@@ -3783,6 +3840,7 @@ function pulseMetricRows(
     { label: "Model calls", value: formatFullNumber(responseCount) },
     { label: "Estimated cost", value: formatCost(cost) },
   ];
+  return known ? metrics : metrics.map((metric) => ({ ...metric, value: "--" }));
 }
 
 function PulseMetricGrid(props: {
@@ -3812,8 +3870,9 @@ function PulseMetricGrid(props: {
 function PulseSection(props: {
   theme: TuiPluginApi["theme"];
   section: PulseSectionData;
+  known?: boolean;
 }): JSX.Element {
-  const metrics = pulseMetricRows(props.section.tokens, props.section.cost, props.section.responseCount);
+  const metrics = createMemo(() => pulseMetricRows(props.section.tokens, props.section.cost, props.section.responseCount, props.known ?? true));
   return (
     <box flexDirection="column" width="100%" paddingTop={1}>
       <text fg={props.theme.current.accent} wrapMode="word" flexShrink={0}>
@@ -3822,12 +3881,12 @@ function PulseSection(props: {
       <PulseMetricGrid
         theme={props.theme}
         rows={[
-          [metrics[0]],
-          [metrics[1], metrics[2]],
-          [metrics[3], metrics[4]],
-          [metrics[5], metrics[6]],
-          [metrics[7], metrics[8]],
-          [metrics[9]],
+          [metrics()[0]],
+          [metrics()[1], metrics()[2]],
+          [metrics()[3], metrics()[4]],
+          [metrics()[5], metrics()[6]],
+          [metrics()[7], metrics()[8]],
+          [metrics()[9]],
         ]}
       />
     </box>
@@ -4010,6 +4069,9 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
     return buildSessionDetailsTree(props.store, props.sessionID, parents);
   });
   const details = createMemo(() => selectSessionDetails(tree(), selectedID(), props.store.lastCompletedBySession));
+  const sourceLabel = createMemo(() => { props.store.revision(); return sourceStatusLabel(props.store); });
+  const directKnown = createMemo(() => { props.store.revision(); return usageIsKnown(props.store, details().direct, details().sessionID); });
+  const includingKnown = createMemo(() => { props.store.revision(); return usageIsKnown(props.store, tree().including, props.sessionID); });
   const sessionTitle = (id: string): string | undefined => {
     try { return props.api.state.session.get(id)?.title; } catch { return undefined; }
   };
@@ -4046,17 +4108,18 @@ export function TokenPulseDetails(props: { api: TuiPluginApi; store: RuntimeStor
         </box>
       </box>}
       <scrollbox flexGrow={1} flexShrink={1} minHeight={0} paddingTop={compact() ? 0 : 1} focusable scrollY scrollX={false} viewportOptions={{ minHeight: 0, overflow: "hidden" }} contentOptions={{ flexDirection: "column", flexShrink: 0 }} onKeyDown={(key) => { if (key.name === "tab" && selector) { key.preventDefault(); key.stopPropagation(); selector.focus(); } }} ref={(scroll) => { body = scroll; onMount(() => { if (tree().nodes.length === 1) scroll.focus(); }); }}>
+        {sourceLabel() && <text fg={theme.textMuted} wrapMode="word" flexShrink={0}>{sourceLabel()}</text>}
         {tree().nodes.length ? <box flexDirection="column" flexShrink={0} width="100%">
         <text fg={theme.accent}>SELECTED SESSION · direct only</text>
         <text fg={theme.textMuted} wrapMode="word">{`${sessionTitle(details().sessionID) ? `${sessionTitle(details().sessionID)} · ` : ""}${details().sessionID}`}</text>
-        {details().direct.responseCount === 0 && <text fg={theme.textMuted} wrapMode="word">No recorded usage for this session</text>}
+        {directKnown() && details().direct.responseCount === 0 && <text fg={theme.textMuted} wrapMode="word">No recorded usage for this session</text>}
         <text fg={theme.accent}>SESSION USAGE</text>
-        <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount).map((metric) => [metric])} />
+        <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(details().direct.tokens, details().direct.cost, details().direct.responseCount, directKnown()).map((metric) => [metric])} />
         {details().last?.record.model && <text fg={theme.textMuted} wrapMode="word">{`Last model: ${details().last!.record.model}`}</text>}
         {tree().nodes.length > 1 ? <>
           <text fg={theme.accent} paddingTop={1}>INCLUDING SUBAGENTS · entire scope</text>
           <text fg={theme.textMuted} wrapMode="word">Includes every descendant once.</text>
-          <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount).map((metric) => [metric])} />
+          <PulseMetricGrid theme={props.api.theme} rows={pulseMetricRows(tree().including.tokens, tree().including.cost, tree().including.responseCount, includingKnown()).map((metric) => [metric])} />
         </> : <text fg={theme.textMuted} paddingTop={1} wrapMode="word">No known subagents in this scope</text>}
         </box> : <text fg={theme.textMuted} flexShrink={0}>Maintenance session excluded</text>}
       </scrollbox>
@@ -4430,14 +4493,14 @@ function emptyTotalsLedger(): TotalsLedger {
   };
 }
 
-async function readTotalsSnapshot(path: string): Promise<TotalsLedger> {
+async function readTotalsSnapshot(path: string): Promise<TotalsLedger | undefined> {
   // createTotalsStorage().read() keeps a process-local cache, so a ledger
   // written by the server process would stay stale. Reload from disk instead.
   let content: string;
   try {
     content = await readLedgerText(path);
   } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") return emptyTotalsLedger();
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
     throw error;
   }
   return coerceTotalsSnapshot(JSON.parse(content));
@@ -4662,14 +4725,18 @@ function SummaryBlock(props: {
     props.store.revision();
     const rollup = totalsForSession(props.store, props.sessionID);
     const aggregate = aggregateForSession(props.store.records, props.sessionID, props.store);
-    if (!rollup || (!totalsHaveUsage(rollup.including) && !aggregate)) return emptySummaryLines();
+    const status = sourceStatusLabel(props.store);
+    const prefix = status ? [status] : [];
+    if (!usageIsKnown(props.store, rollup?.including, props.sessionID)) return [...prefix, "Totals unavailable"];
+    if (!rollup || (!totalsHaveUsage(rollup.including) && !aggregate)) return [...prefix, ...emptySummaryLines()];
     return [
-      ...summaryLines(
+      ...prefix,
+      ...(usageIsKnown(props.store, rollup.direct, props.sessionID) ? summaryLines(
         "Session only",
         rollup.direct.tokens,
         rollup.direct.cost,
         rollup.direct.responseCount,
-      ),
+      ) : ["Session only: totals unavailable"]),
       ...summaryLines(
         "Including subagents",
         rollup.including.tokens,
@@ -4698,6 +4765,11 @@ function HistoryView(props: {
     props.store.revision();
     return recentRecords(props.store.records, props.sessionID, props.store);
   });
+  const emptyLabel = createMemo(() => {
+    props.store.revision();
+    return sourcePartAvailable(props.store, "history") ? "No completed responses yet"
+      : sourceStatusLabel(props.store) ?? "History unavailable";
+  });
   return (
     <box flexDirection="column" flexGrow={1} backgroundColor={props.api.theme.current.background}>
       <Header theme={props.api.theme} sessionID={props.sessionID} />
@@ -4717,7 +4789,7 @@ function HistoryView(props: {
         backgroundColor={props.api.theme.current.background}
       >
         {rows().length === 0 ? (
-          <text fg={props.api.theme.current.textMuted}>No completed responses yet</text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="word">{emptyLabel()}</text>
         ) : rows().map((record) => (
           <text fg={props.api.theme.current.text} truncate wrapMode="none">
             {formatHistoryRow(record)}
@@ -4769,8 +4841,11 @@ function BottomContent(props: {
   const taskWallTime = createMemo(() => {
     props.store.revision();
     props.store.clockRevision();
+    if (!sourcePartAvailable(props.store, "runs")) return undefined;
     return taskWallTimeForSession(props.store, sessionID());
   });
+  const sourceLabel = createMemo(() => { props.store.revision(); return sourceStatusLabel(props.store); });
+  const usageKnown = createMemo(() => { props.store.revision(); return usageIsKnown(props.store, view().totals?.including, sessionID()); });
   const rows = createMemo(() => { props.store.revision(); return props.store.pulseExpanded ? childRows(view().records, sessionID(), props.store) : []; });
   const sections = createMemo((): PulseSectionData[] => {
     const totals = view().totals;
@@ -4789,13 +4864,14 @@ function BottomContent(props: {
       },
     ];
   });
-  const metricLabel = createMemo(() => {
-    const tokens = view().totals?.including.tokens ?? emptyTokenCounts();
-    return formatPulseMetrics(tokens, metricWidth(), taskWallTime());
-  });
   const taskWallTimeLabel = createMemo(() => {
     const wallTime = taskWallTime();
     return wallTime === undefined ? "--" : formatDuration(wallTime);
+  });
+  const metricLabel = createMemo(() => {
+    if (!usageKnown()) return wrapMetricFields(["-- total", "cache --", `time ${taskWallTimeLabel().replace(/\s+/g, "")}`], metricWidth());
+    const tokens = view().totals?.including.tokens ?? emptyTokenCounts();
+    return formatPulseMetrics(tokens, metricWidth(), taskWallTime());
   });
   const expanded = createMemo(() => {
     props.store.revision();
@@ -4833,6 +4909,7 @@ function BottomContent(props: {
           {metricLabel()}
         </text>
       </box>
+      {sourceLabel() && <text fg={props.api.theme.current.textMuted} paddingX={1} width="100%" wrapMode="word" flexShrink={0}>{sourceLabel()}</text>}
       {expanded() && (!sessionID() ? (
         <text fg={props.api.theme.current.textMuted} paddingTop={1} truncate wrapMode="none">
           No active session
@@ -4843,9 +4920,9 @@ function BottomContent(props: {
             session {sessionID()}
           </text>
           {sections().map((section, index) => (<>
-            <PulseSection theme={props.api.theme} section={section} />
+            <PulseSection theme={props.api.theme} section={section} known={usageIsKnown(props.store, section, sessionID())} />
           </>))}
-          {!view().aggregate && !totalsHaveUsage(view().totals?.including) && (
+          {usageKnown() && !view().aggregate && !totalsHaveUsage(view().totals?.including) && (
             <text fg={props.api.theme.current.textMuted} paddingTop={1} truncate wrapMode="none">
               No completed responses yet
             </text>
@@ -4869,13 +4946,18 @@ export function createTuiSlotPlugin(
   api: TuiPluginApi,
   store: RuntimeStore,
   options: TuiOptions,
+  selectSession?: (id: string | undefined) => unknown,
 ): TuiSlotPlugin {
   return {
     order: 1_000_000,
     slots: {
-      sidebar_content: (_context, props) => (
-        <BottomContent api={api} store={store} sessionID={props.session_id} />
-      ),
+      sidebar_content: (_context, props) => {
+        if (selectSession) {
+          createEffect(() => { void selectSession(props.session_id); });
+          onCleanup(() => { void selectSession(undefined); });
+        }
+        return <BottomContent api={api} store={store} sessionID={props.session_id} />;
+      },
     },
   };
 }
@@ -5026,17 +5108,77 @@ function watchLedgerPaths(paths: readonly { path: string; changed: () => void }[
   };
 }
 
-const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<void> => {
+function sourceReadError(store: RuntimeStore, ledger: keyof TuiSourcePaths, error: unknown): void {
+  sourceReadResult(store, ledger, isNodeError(error) && error.code === "ENOENT" ? "missing"
+    : { error: error instanceof Error ? error.message : String(error) });
+}
+
+function sourceReadSuccess(store: RuntimeStore, ledger: keyof TuiSourcePaths): void {
+  sourceReadResult(store, ledger, "loaded");
+}
+
+/** Only an actual safe-FD read can establish availability. Keep prior knowledge
+ * on the same source, but let every new result clear that ledger's older error. */
+function sourceReadResult(store: RuntimeStore, ledger: keyof TuiSourcePaths, result: "loaded" | "missing" | { error: string }): void {
+  const state = store.sourceState, path = state.paths?.[ledger] ?? ledger;
+  if (result === "loaded" && state.loaded?.[ledger] && !state.errors?.[ledger] && !state.missing?.includes(path)) return;
+  const errors = { ...state.errors }; delete errors[ledger];
+  const missing = (state.missing ?? []).filter((entry) => entry !== path);
+  if (result === "missing") missing.push(path);
+  else if (typeof result === "object") errors[ledger] = result.error;
+  const loaded = { ...state.loaded, [ledger]: result === "loaded" || !!state.loaded?.[ledger] };
+  store.sourceState = { ...state, loaded, missing, errors,
+    status: Object.keys(errors).length ? "error" : missing.length ? "missing"
+      : loaded.history && loaded.totals && loaded.runs ? "ready" : "loading" };
+  store.bump();
+}
+
+/** Keep the signal/store identity mounted views own; discard every source-derived
+ * cache together. sourceEpoch fences readers independently of same-source edits. */
+function clearRuntimeSource(store: RuntimeStore): void {
+  store.sourceEpoch++;
+  disconnectTuiReadModel(store);
+  const activity = tuiActivities.get(store);
+  activity?.selection.dispose();
+  tuiActivities.delete(store);
+  const observation = observationRuntimes.get(store);
+  if (observation) disposeContentMetadata(observation.metadata);
+  observationRuntimes.delete(store);
+  visibleHistory.delete(store);
+  store.active.clear();
+  if (store.optimistic instanceof RevisionMap) store.optimistic.discard(); else store.optimistic.clear();
+  store.optimisticQuality.clear(); store.optimisticOrder.clear(); store.nextOptimisticOrder = 1;
+  store.diskRecords = []; store.records = [];
+  store.completedMessageIDs.clear(); store.sessionRuntime.clear(); store.taskRuns.clear();
+  store.sessionParents = new Map(); store.messageScopes.clear(); store.sourceScopes = createScopeRegistry();
+  store.totalsLedger = emptyTotalsLedger(); store.activityEvents = [];
+  store.lastCompletedBySession.clear(); store.focusSessionID = undefined;
+}
+
+export interface TuiRuntimeHandle {
+  store: RuntimeStore;
+  selectSession(id: string | undefined): Promise<void>;
+  settled(): Promise<void>;
+}
+
+export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<TuiRuntimeHandle | undefined> => {
   const options = resolveOptions(rawOptions);
   if (!options.enabled) return;
 
   const store = createRuntimeStore(options.maxRecords);
-  const historyPath = resolveHistoryPath(api, options.historyPath);
-  const runsPath = resolveRunsPath(historyPath, options.runsPath);
-  const totalsPath = resolveTotalsPath({
-    historyPath,
-    totalsPath: options.totalsPath,
-  });
+  const [sidebarSessionID, setSidebarSessionID] = createSignal<string>();
+  const launchDirectory = api.state.path.worktree && api.state.path.worktree !== "/"
+    ? api.state.path.worktree : api.state.path.directory;
+  let historyPath: string | undefined;
+  let runsPath: string | undefined;
+  let totalsPath: string | undefined;
+  let sourceKey: string | undefined;
+  let selectedSessionID: string | undefined;
+  let selectionSerial = 0;
+  let metadataJob: { id: string; promise: Promise<void> } | undefined;
+  let sourceSettled = Promise.resolve();
+  let stopLedgerWatchers = () => {};
+  let stopSourceEffect = () => {};
   let disposed = false;
   let reloadTimer: ReturnType<typeof setTimeout> | undefined;
   let activityReloadTimer: ReturnType<typeof setTimeout> | undefined;
@@ -5050,7 +5192,7 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
   const drainHistory = (): Promise<void> => {
     if (historyDrain) return historyDrain;
     historyDrain = (async () => {
-      while (!disposed) {
+      while (!disposed && historyPath && totalsPath) {
         const generation = reloadGeneration;
         if (reloadTimer !== undefined) clearTimeout(reloadTimer);
         reloadTimer = undefined;
@@ -5065,7 +5207,7 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
   const drainActivity = (): Promise<void> => {
     if (activityDrain) return activityDrain;
     activityDrain = (async () => {
-      while (!disposed) {
+      while (!disposed && runsPath) {
         const generation = activityReloadGeneration;
         if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
         activityReloadTimer = undefined;
@@ -5085,15 +5227,18 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
   };
 
   const scheduleReload = (): void => {
-    if (disposed) return;
+    if (disposed || !historyPath) return;
     reloadGeneration += 1;
     const generation = reloadGeneration;
     store.historyGeneration = generation;
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     const run = async (attempt: number, expectedGeneration: number): Promise<void> => {
       if (disposed || expectedGeneration !== reloadGeneration) return;
+      const sourceEpoch = store.sourceEpoch;
       reloadTimer = undefined;
       await drainHistory();
+      if (disposed || sourceEpoch !== store.sourceEpoch) return;
+      await probeSource(sourceEpoch);
       if (
         !disposed
         && attempt < 3
@@ -5112,14 +5257,107 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
   };
 
   const scheduleActivityReload = (): void => {
-    if (disposed) return;
+    if (disposed || !runsPath) return;
     activityReloadGeneration += 1;
     store.activityGeneration = activityReloadGeneration;
     if (activityReloadTimer !== undefined || activityDrain) return;
+    const sourceEpoch = store.sourceEpoch;
     activityReloadTimer = setTimeout(() => {
       activityReloadTimer = undefined;
-      if (!disposed) void drainActivity();
+      if (!disposed && sourceEpoch === store.sourceEpoch) void drainActivity().then(() => probeSource(sourceEpoch));
     }, 30);
+  };
+
+  const probeSource = async (epoch: number): Promise<void> => {
+    const paths = store.sourceState.paths;
+    if (!paths || disposed || epoch !== store.sourceEpoch) return;
+    // Publish current read outcomes, not a pre/post-stat guess or an older
+    // captured error map that could overwrite a successful concurrent read.
+    const { missing, errors } = store.sourceState;
+    const loading = historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration;
+    store.sourceState = { ...store.sourceState,
+      status: Object.keys(errors ?? {}).length ? "error" : loading ? "loading" : missing?.length ? "missing" : "ready" };
+    store.bump();
+  };
+
+  const settleSource = async (epoch: number): Promise<void> => {
+    do {
+      await Promise.all([
+        historyAppliedGeneration < reloadGeneration ? drainHistory() : Promise.resolve(),
+        activityAppliedGeneration < activityReloadGeneration ? drainActivity() : Promise.resolve(),
+      ]);
+    } while (!disposed && epoch === store.sourceEpoch
+      && (historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration));
+    await probeSource(epoch);
+  };
+
+  const bindSource = (sessionID: string | undefined, directory: string | undefined): Promise<void> => {
+    if (disposed) return Promise.resolve();
+    const paths = directory ? sessionSourcePaths(directory, options) : undefined;
+    const key = paths ? JSON.stringify([directory, paths.history, paths.runs, paths.totals]) : "waiting-metadata";
+    if (key === sourceKey) {
+      if (store.sourceState.sessionID !== sessionID) {
+        store.sourceState = { ...store.sourceState, sessionID }; store.focusSessionID = sessionID; store.bump();
+      }
+      return sourceSettled;
+    }
+    sourceKey = key;
+    selectionSerial++; metadataJob = undefined;
+    stopLedgerWatchers(); stopLedgerWatchers = () => {};
+    if (reloadTimer !== undefined) clearTimeout(reloadTimer); reloadTimer = undefined;
+    if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer); activityReloadTimer = undefined;
+    clearRuntimeSource(store);
+    store.historyGeneration = ++reloadGeneration;
+    store.activityGeneration = ++activityReloadGeneration;
+    historyPath = paths?.history; runsPath = paths?.runs; totalsPath = paths?.totals;
+    const port = (api as SourceApi)[sessionSourcePort];
+    port?.bind(directory);
+    store.sourceState = { status: paths ? "loading" : "waiting-metadata", epoch: store.sourceEpoch,
+      sessionID, directory, paths, loaded: { history: false, totals: false, runs: false },
+      live: !!directory && (!!port || directory === launchDirectory) };
+    store.focusSessionID = sessionID; store.bump();
+    if (!paths) {
+      historyAppliedGeneration = reloadGeneration; activityAppliedGeneration = activityReloadGeneration;
+      sourceSettled = Promise.resolve(); return sourceSettled;
+    }
+    const epoch = store.sourceEpoch;
+    stopLedgerWatchers = watchLedgerPaths([
+      { path: paths.history, changed: () => { if (epoch === store.sourceEpoch) scheduleReload(); } },
+      { path: paths.runs, changed: () => { if (epoch === store.sourceEpoch) scheduleActivityReload(); } },
+      { path: paths.totals, changed: () => { if (epoch === store.sourceEpoch) scheduleReload(); } },
+    ]);
+    sourceSettled = settleSource(epoch);
+    return sourceSettled;
+  };
+
+  const selectSession = (sessionID: string | undefined, fetchMetadata = true): Promise<void> => {
+    if (disposed) return Promise.resolve();
+    if (sessionID !== selectedSessionID) { selectedSessionID = sessionID; selectionSerial++; metadataJob = undefined; }
+    let directory: string | undefined;
+    let metadataError: unknown;
+    try {
+      directory = sessionID ? sessionSourceDirectory(api, sessionID)
+        : launchDirectory;
+    } catch (error) { metadataError = error; }
+    const bound = untrack(() => bindSource(sessionID, directory));
+    const serial = selectionSerial;
+    const port = (api as SourceApi)[sessionSourcePort];
+    if (!directory && sessionID && port && fetchMetadata) {
+      if (metadataJob?.id === sessionID) return metadataJob.promise;
+      const promise = Promise.resolve().then(() => port.sync(sessionID)).then(() => {
+        if (!disposed && serial === selectionSerial) return selectSession(sessionID, false);
+      }).catch((error: unknown) => {
+        if (disposed || serial !== selectionSerial) return;
+        store.sourceState = { ...store.sourceState, status: "error", errors: { metadata: error instanceof Error ? error.message : String(error) } };
+        store.bump();
+      }).finally(() => { if (metadataJob?.promise === promise) metadataJob = undefined; });
+      metadataJob = { id: sessionID, promise };
+      return promise;
+    }
+    if (metadataError) {
+      store.sourceState = { ...store.sourceState, status: "error", errors: { metadata: String(metadataError) } }; store.bump();
+    }
+    return bound;
   };
 
   const openHistory = (): void => {
@@ -5173,7 +5411,7 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
     registerLegacyCommand(api, openHistory, () => { details.open(); }, options);
   }
 
-  api.slots.register(createTuiSlotPlugin(api, store, options));
+  api.slots.register(createTuiSlotPlugin(api, store, options, (id) => { setSidebarSessionID(id); }));
 
   // The generated SDK union can lag runtime legacy/v2 event names; keep this cast local.
   const eventOn = api.event.on as unknown as CompatibleEventOn;
@@ -5199,6 +5437,9 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
     if (type === "message.part.delta" || type === "message.part.updated"
       || type === "session.next.text.delta" || type === "session.next.reasoning.delta"
       || type === "session.next.tool.input.delta") return;
+    if (!store.sourceState.paths || !store.sourceState.live) return;
+    const eventDirectory = readString(event.sourceDirectory) ?? _metadata?.directory;
+    if (eventDirectory && eventDirectory !== store.sourceState.directory) return;
     const receivedAt = Date.now();
     try {
       const properties = eventProperties(event);
@@ -5212,6 +5453,10 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
         return;
       }
       const eventSessionID = readSessionID(properties, event);
+      if (!(api as SourceApi)[sessionSourcePort] && eventSessionID && !eventDirectory) {
+        const directory = sessionSourceDirectory(api, eventSessionID);
+        if (directory && directory !== store.sourceState.directory) return;
+      }
       if (type === "session.created" || type === "session.updated") {
         const mapped = cacheSessionParentFromEvent(store, event);
         const sessionID = readSessionID(properties, event);
@@ -5276,11 +5521,6 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
   subscribe("workspace.disposed", handleEvent);
   subscribe("workspace.deleted", handleEvent);
 
-  const stopLedgerWatchers = watchLedgerPaths([
-    { path: runsPath, changed: scheduleActivityReload },
-    { path: totalsPath, changed: scheduleReload },
-  ]);
-
   const interval = setInterval(() => {
     if (!disposed && hasLiveTaskWallActivity(store)) store.tick();
   }, 500);
@@ -5289,46 +5529,30 @@ const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Promise<vo
     disposed = true;
     store.disposed = true;
     store.activityGeneration++; store.historyGeneration++;
+    stopSourceEffect(); selectionSerial++; metadataJob = undefined;
     stopLedgerWatchers();
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
     clearInterval(interval);
-    // Stop proof delivery before discarding either model's large state.
-    tuiReadModel(store).dispose();
-    const activity = tuiActivities.get(store);
-    activity?.selection.dispose();
-    if (activity) {
-      activity.canonical = []; activity.executions.clear(); activity.runtimeEpochs.clear(); activity.currentExecutions.clear();
-      activity.candidates.clear(); activity.partialSessions.clear(); activity.registry = undefined; activity.ledgerScopes = undefined; activity.parents = undefined;
-    }
-    store.active.clear();
-    if (store.optimistic instanceof RevisionMap) store.optimistic.discard(); else store.optimistic.clear();
-    store.optimisticQuality.clear();
-    store.optimisticOrder.clear();
-    store.diskRecords = [];
-    store.records = [];
-    store.completedMessageIDs.clear();
-    store.sessionRuntime.clear();
-    store.taskRuns.clear();
-    store.messageScopes.clear(); store.sourceScopes = createScopeRegistry(); store.totalsLedger = emptyTotalsLedger();
-    store.activityEvents = [];
-    tuiActivities.delete(store);
-    store.lastCompletedBySession.clear();
-    disposeContentMetadata(observationRuntime(store).metadata);
-    observationRuntimes.delete(store);
-    store.focusSessionID = undefined;
+    clearRuntimeSource(store);
     store.disposeSignals();
   });
 
-  store.historyGeneration = ++reloadGeneration;
-  // Watcher/host requests received during an in-flight initial read are part of
-  // initialization, not fire-and-forget work after a stale promise has returned.
-  do {
-    await Promise.all([
-      historyAppliedGeneration < reloadGeneration ? drainHistory() : Promise.resolve(),
-      activityAppliedGeneration < activityReloadGeneration ? drainActivity() : Promise.resolve(),
-    ]);
-  } while (!disposed && (historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration));
+  createRoot((dispose) => {
+    stopSourceEffect = dispose;
+    createEffect(() => {
+      const sidebar = sidebarSessionID();
+      const route = sidebar ? undefined : api.route.current;
+      void selectSession(sidebar ?? routeSessionID(route && "params" in route ? route.params : undefined));
+    });
+  });
+  const initialSidebar = sidebarSessionID();
+  const initialRoute = initialSidebar ? undefined : api.route.current;
+  const initialSelection = selectSession(initialSidebar ?? routeSessionID(initialRoute && "params" in initialRoute ? initialRoute.params : undefined));
+  // Unknown metadata must not block plugin registration or make an empty launch
+  // directory look authoritative. A later fenced sync can bind the first source.
+  if (store.sourceState.paths) await initialSelection;
+  return { store, selectSession, settled: () => metadataJob?.promise ?? sourceSettled };
 };
 
 const plugin = {

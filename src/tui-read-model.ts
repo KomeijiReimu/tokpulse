@@ -535,6 +535,7 @@ export class TuiReadModel {
 }
 const models = new WeakMap<RuntimeStore, TuiReadModel>();
 export function tuiReadModel(store: RuntimeStore): TuiReadModel { let value = models.get(store); if (!value) { value = new TuiReadModel(store); models.set(store, value); } return value; }
+export function disconnectTuiReadModel(store: RuntimeStore): void { models.get(store)?.dispose(); models.delete(store); }
 const tokenFields = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 const speedFields = ["generatedTokens", "durationMs", "responseCount", "estimatedResponseCount", "coverageGeneratedTokens", "shortResponseCount"] as const;
 function zeroSpeed() { return { generation: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0, coverageGeneratedTokens: 0, shortResponseCount: 0 }, response: { generatedTokens: 0, durationMs: 0, responseCount: 0, estimatedResponseCount: 0, coverageGeneratedTokens: 0 } }; }

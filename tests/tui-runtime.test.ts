@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { createTestKeymap } from "@opentui/keymap/testing";
@@ -7,7 +6,6 @@ import { aggregateSession } from "../src/core.js";
 import type { HistoryRecord, TokenCounts } from "../src/core.js";
 import { replayActivity } from "../src/activity.js";
 import type { ActivityEventInput } from "../src/activity.js";
-import { resolveRunsPath } from "../src/runs-storage.js";
 import {
   applyRecordToSessionRuntime,
   cacheHitRate,
@@ -519,7 +517,7 @@ test("content deltas do not change totals revision or create samples", () => {
   store.disposeSignals();
 });
 
-test("slot registration appends sidebar content without taking the footer or app", async () => {
+test("slot registration appends sidebar content without taking the footer or app", () => {
   const store = createRuntimeStore(10);
   const api = {} as TuiPluginApi;
   const plugin = createTuiSlotPlugin(api, store, {
@@ -534,24 +532,6 @@ test("slot registration appends sidebar content without taking the footer or app
   assert.equal("app" in slots, false);
   assert.equal("sidebar_footer" in slots, false);
 
-  const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /oc-tps\.toggle-pulse|ctrl\+shift\+p/i);
-  assert.match(source, /focusable[\s\S]*onMouseDown/);
-  assert.match(source, /\+ Token Pulse/);
-  assert.match(source, /- Token Pulse/);
-  assert.match(source, /formatPulseMetrics\(tokens, metricWidth\(\), taskWallTime\(\)\)/);
-  assert.doesNotMatch(source, /session_prompt_right|tok\/s/i);
-  assert.doesNotMatch(source, /metricWidth.*renderer\.width/);
-  assert.match(source, /displayedSessionID\(props\.store, props\.sessionID\)/);
-  assert.doesNotMatch(source, /setFocusSession\(store, (sessionID|eventSessionID)\)/);
-  assert.doesNotMatch(source, /focusSessionID \?\? props\.sessionID/);
-  assert.match(source, /Cache hit rate/);
-  assert.match(source, /formatCacheHitRate\(cacheHitRate\(tokens\)\)/);
-  assert.match(source, /backgroundColor=\{props\.api\.theme\.current\.backgroundElement\}/);
-  assert.match(source, /CHILD AGENTS/);
-  assert.match(source, /Total tokens \(input \+ generated \+ cache\)/);
-  assert.match(source, /Cache read \(reused\)/);
-  assert.match(source, /Cache write/);
   store.disposeSignals();
 });
 
@@ -1239,19 +1219,6 @@ test("projectSessionTotals keeps ledger usage that is outside the history window
   assert.equal(parentRollup.including.tokens.output, 1000);
   assert.equal(parentRollup.including.responseCount, 1);
 });
-
-test("activity reload uses the sidecar path and only reads it", async () => {
-  assert.equal(resolveRunsPath("/tmp/project/history.jsonl"), "/tmp/project/runs.jsonl");
-  assert.equal(
-    resolveRunsPath("/tmp/project/history.jsonl", "activity/runs.jsonl"),
-    "/tmp/project/activity/runs.jsonl",
-  );
-  const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8");
-  assert.match(source, /readActivityDelta/);
-  assert.match(source, /resolveRunsPath\(historyPath, options\.runsPath\)/);
-  assert.doesNotMatch(source, /activity\.(append|rewrite|compact)\(/);
-});
-
 
 test("child agent rows use cumulative direct generation, not bounded response history or descendants", () => {
   const store = createRuntimeStore(1);

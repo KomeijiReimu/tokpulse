@@ -829,6 +829,10 @@ export function tuiReadModel(store) {
   }
   return value;
 }
+export function disconnectTuiReadModel(store) {
+  models.get(store)?.dispose();
+  models.delete(store);
+}
 const tokenFields = ["input", "output", "reasoning", "cacheRead", "cacheWrite"];
 const speedFields = ["generatedTokens", "durationMs", "responseCount", "estimatedResponseCount", "coverageGeneratedTokens", "shortResponseCount"];
 function zeroSpeed() {

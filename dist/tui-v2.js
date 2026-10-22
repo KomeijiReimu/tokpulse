@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createRoot, createSignal, getOwner, onCleanup, runWithOwner } from "solid-js";
 import { createV2EventAdapter, isContentOnlyEvent, isV2ControlEvent } from "./v2-server.js";
 import { parentProofPort } from "./tui-read-model.js";
+import { sessionSourcePort } from "./tui-source.js";
 /** Unknown ownership may await metadata, never retain tool input/body objects. */
 function queuedControl(raw) {
   const input = raw.data;
@@ -88,7 +89,11 @@ export function createV2TuiBridge(context, defaults = []) {
     return size;
   };
   const location = () => context.location ?? context.data.location.default();
+  let sourceBound = false;
+  let sourceDirectory;
+  const activeDirectory = () => sourceBound ? sourceDirectory : location().directory;
   let proofDirectory;
+  let proofInitialized = false;
   let proofEpoch = 0;
   let allowCachedProof = true;
   let inFlight = 0;
@@ -98,12 +103,53 @@ export function createV2TuiBridge(context, defaults = []) {
   let healthSerial = 0;
   let retryTimer;
   let retryDue = Infinity;
+  // Source discovery has one physical RPC plus only the latest queued SID.
+  // Route changes cannot cancel host RPCs or release their physical slot early.
+
+  let sourceLookupActive;
+  let sourceLookupPending;
+  const pumpSourceLookup = () => {
+    if (disposed || sourceLookupActive || !sourceLookupPending) return;
+    const job = sourceLookupPending;
+    sourceLookupPending = undefined;
+    sourceLookupActive = job;
+    void Promise.resolve().then(() => {
+      if (!disposed) return context.data.session.sync(job.id);
+    }).then(() => job.resolve(), error => job.reject(error)).finally(() => {
+      if (sourceLookupActive === job) sourceLookupActive = undefined;
+      if (!disposed) pumpSourceLookup();
+    });
+  };
+  const syncSource = id => {
+    if (disposed) return Promise.resolve();
+    if (sourceLookupActive?.id === id) {
+      sourceLookupPending?.resolve();
+      sourceLookupPending = undefined;
+      return sourceLookupActive.promise;
+    }
+    if (sourceLookupPending?.id === id) return sourceLookupPending.promise;
+    sourceLookupPending?.resolve();
+    let resolve, reject;
+    const promise = new Promise((done, fail) => {
+      resolve = done;
+      reject = fail;
+    });
+    sourceLookupPending = {
+      id,
+      promise,
+      resolve,
+      reject
+    };
+    pumpSourceLookup();
+    return promise;
+  };
   const wake = event => {
     if (!disposed) for (const receive of proofAvailable) receive(event);
   };
   const emit = event => {
     const sourced = {
       ...event,
+      sourceDirectory: activeDirectory(),
       sourceEpoch: `tui-bridge:${bridgeID}:${proofEpoch}`
     };
     for (const callback of handlers.get(event.type) ?? []) callback(sourced);
@@ -135,8 +181,9 @@ export function createV2TuiBridge(context, defaults = []) {
     // Do not clear lookupActive/inFlight or let an old finally delete new work.
   };
   const ensureProofDirectory = () => {
-    const directory = location().directory;
-    if (proofDirectory === undefined) {
+    const directory = activeDirectory();
+    if (!proofInitialized) {
+      proofInitialized = true;
       proofDirectory = directory;
       return;
     }
@@ -171,6 +218,7 @@ export function createV2TuiBridge(context, defaults = []) {
   const pump = () => {
     if (disposed) return;
     ensureProofDirectory();
+    if (!proofDirectory) return;
     while (!disposed && inFlight < 4 && lookupQueue.size) {
       let id;
       const now = performance.now();
@@ -190,13 +238,13 @@ export function createV2TuiBridge(context, defaults = []) {
       lookupActive.set(sid, token);
       inFlight++;
       void Promise.resolve().then(() => {
-        if (disposed || epoch !== proofEpoch || directory !== location().directory) return;
+        if (disposed || epoch !== proofEpoch || directory !== activeDirectory()) return;
         if (parentRequest && (parentRequest.done || parentRequests.get(sid) !== parentRequest)) return;
         lookupCount++;
         return context.data.session.sync(sid);
       }).then(() => {
         if (parentRequest && (parentRequest.done || parentRequests.get(sid) !== parentRequest)) return;
-        if (!disposed && epoch === proofEpoch && directory === location().directory && cachedProof(sid)) {
+        if (!disposed && epoch === proofEpoch && directory === activeDirectory() && cachedProof(sid)) {
           proven.add(sid);
           flush(sid);
           if (parentRequest && parentRequests.get(sid) === parentRequest) {
@@ -311,10 +359,18 @@ export function createV2TuiBridge(context, defaults = []) {
     }
   };
   const api = {
+    [sessionSourcePort]: {
+      sync: syncSource,
+      bind: directory => {
+        sourceBound = true;
+        sourceDirectory = directory;
+        ensureProofDirectory();
+      }
+    },
     [parentProofPort]: {
       epoch: () => proofEpoch,
       request: (id, version, receive, options) => {
-        if (disposed) return false;
+        if (disposed || sourceBound && !sourceDirectory) return false;
         const previous = parentRequests.get(id);
         if (previous?.version === version && previous.receive === receive) return true;
         if (!previous && !pending.has(id) && pendingSize() >= 256) return false;
@@ -544,8 +600,17 @@ export function createV2TuiBridge(context, defaults = []) {
           // Gate by type before *any* payload/location/cache/query work.
           const type = details.type;
           if (isContentOnlyEvent(type)) return;
-          const disruption = type === "server.instance.disposed" || /^(?:workspace\..*(?:status|disposed|deleted)|server\.(?:disconnected|error))$/.test(type);
+          const disruption = type === "server.instance.disposed" || /^(?:workspace\..*(?:status(?:\.changed)?|disposed|deleted)|server\.(?:disconnected|error))$/.test(type);
           if (!disruption && !isV2ControlEvent(type)) return;
+          const raw = details;
+          const data = raw.data;
+          const outer = raw.location?.directory ?? raw.directory;
+          const inner = data?.location?.directory ?? data?.directory;
+          const directory = activeDirectory();
+          // Location ownership also applies to transport/workspace disruptions.
+          // Only truly unlocated transport events are global; never relabel an
+          // explicitly foreign workspace event as the selected source.
+          if (outer !== undefined && outer !== directory || inner !== undefined && inner !== directory) return;
           ensureProofDirectory();
           if (disruption) {
             resetProofEpoch();
@@ -565,15 +630,9 @@ export function createV2TuiBridge(context, defaults = []) {
             });
             return;
           }
-          const raw = details;
-          const data = raw.data;
           if (!data || typeof data.sessionID !== "string") return;
           const id = data.sessionID;
-          const outer = raw.location?.directory;
-          const inner = data.location?.directory;
-          const directory = proofDirectory;
           if (typeof directory !== "string" || !directory) return;
-          if (outer !== undefined && outer !== directory || inner !== undefined && inner !== directory) return;
           if (outer === directory || inner === directory || proven.has(id) || allowCachedProof && cachedProof(id)) {
             proven.add(id);
             flush(id);
@@ -641,6 +700,9 @@ export function createV2TuiBridge(context, defaults = []) {
       stopEvents?.();
       handlers.clear();
       adapter.clear();
+      sourceLookupPending?.resolve();
+      sourceLookupPending = undefined;
+      sourceLookupActive?.resolve();
       if (retryTimer !== undefined) clearTimeout(retryTimer);
       retryTimer = undefined;
       retryDue = Infinity;
