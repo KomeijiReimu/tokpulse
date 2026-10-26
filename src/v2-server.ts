@@ -29,7 +29,7 @@ export function createV2EventAdapter() {
   const starts = new Map<string, RecordValue>();
   type Work = { sessionID: string; executionID: string; workID: string; source: "step" | "tool";
     stepID?: string; start?: number; end?: number; scope: CompactScopeEvidence; model?: RecordValue; agent?: string; pureReady?: boolean };
-  type Execution = { id: string; sessionID: string; complete: boolean; terminal?: number; works: Set<string>; unready: number; startedAt?: number; sourceSequence?: number; pureEmitted?: boolean };
+  type Execution = { id: string; sessionID: string; complete: boolean; terminal?: number; works: Set<string>; unready: number; startedAt?: number; sourceSequence?: number; pureEmitted?: boolean; observing?: boolean };
   const current = new Map<string, Execution>();
   const executions = new Map<string, Execution>();
   const bySession = new Map<string, Execution[]>();
@@ -58,7 +58,7 @@ export function createV2EventAdapter() {
     // gap must invalidate that unfinished certificate, not only current work.
     for (const execution of executions.values()) if ((!sessionID || execution.sessionID === sessionID) && !execution.pureEmitted) execution.complete = false;
     for (const [id, execution] of current) if (!sessionID || id === sessionID) {
-      execution.complete = false; current.delete(id);
+      execution.complete = false; execution.observing = false; current.delete(id);
     }
     for (const [id, info] of starts) if (!sessionID || info.sessionID === sessionID) starts.delete(id);
   };
@@ -130,7 +130,7 @@ export function createV2EventAdapter() {
           const previous = current.get(sessionID);
           const newer = !previous || (typeof event.durable?.seq === "number" && previous.sourceSequence !== undefined
             ? event.durable.seq > previous.sourceSequence : event.created >= (previous.startedAt ?? -Infinity));
-          const execution: Execution = { id: event.id, sessionID, complete: newer, works: new Set(), unready: 0, startedAt: event.created, sourceSequence: event.durable?.seq };
+          const execution: Execution = { id: event.id, sessionID, complete: newer, works: new Set(), unready: 0, startedAt: event.created, sourceSequence: event.durable?.seq, observing: newer };
           if (newer) current.set(sessionID, execution);
           executions.set(execution.id, execution);
           const history = bySession.get(sessionID) ?? [];
@@ -179,6 +179,14 @@ export function createV2EventAdapter() {
             workID: messageID, source: "step", start: data.started ?? event.created, scope: localScope(info), model: info.model, agent: info.agent };
           updateWork(execution, key, work); stepIDs.set(stepIdentity, key);
           const proofs: RecordValue[] = [workFact(work, "start")];
+          // A moved drain has no second execution.started. Only a fresh step
+          // can reopen observation, never a replayed/closed work boundary.
+          if (!execution.observing && !known && execution.terminal === undefined
+            && (!current.has(sessionID) || current.get(sessionID) === execution)) {
+            current.set(sessionID, execution); execution.observing = true;
+            proofs.unshift({ ...emit("session.status", { sessionID, status: { type: "busy" } }),
+              timestamp: work.start, executionID: execution.id });
+          }
           if (work.end !== undefined) proofs.push(workFact(work, "end"));
           for (const key of execution.works) {
             const tool = works.get(key)!;

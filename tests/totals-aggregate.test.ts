@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { SessionDirectTotals } from "../src/totals-storage.js";
+import type { OpenContribution, SessionDirectTotals, TotalsLedger } from "../src/totals-storage.js";
 import { createTotalsRollupIndex, type TotalsRollup } from "../src/totals-aggregate.js";
 import { classifyMessageMetadata, classifySessionMetadata, type SessionScopes } from "../src/scope.js";
+import { mergeTotalsSources } from "../src/source-ledgers.js";
+import { addSpeedTotals, emptySpeedTotals, GENERATION_BASIS_VERSION, updateSpeedTotals } from "../src/statistics.js";
 
 function rollupSessionTotals(...args: Parameters<typeof import("../src/totals-aggregate.js").rollupSessionTotals>): TotalsRollup {
   return createTotalsRollupIndex(args[0], args[1], args[3]).get(args[2]);
@@ -199,4 +201,94 @@ test("cycle with special IDs, branches and a ledger-only intermediary counts eac
   assert.equal(index.get("__proto__").including.responseCount, 4);
   assert.equal(index.get("missing").including.cost, 4);
   assert.deepEqual(index.get("excluded"), { direct: zero(), including: zero(), children: [] });
+});
+
+test("moved session unions durable totals, corrects copied messages once and refuses only overlapping legacy markers", () => {
+  const sessionID = "__proto__";
+  const proof = classifyMessageMetadata({ agent: "historian" });
+  const copied: OpenContribution = {
+    sessionID, quality: "exact", tokens: usage(10).tokens, cost: 10,
+    speed: { response: { generatedTokens: 23, durationMs: 200, estimated: false } },
+    update: { source: "live", instanceID: "server", sequence: 1, receivedAt: 100, revision: 1, fingerprint: "old", seenFingerprints: [] },
+  };
+  const corrected: OpenContribution = {
+    ...copied, tokens: zero().tokens, cost: 0,
+    speed: { response: { generatedTokens: 0, durationMs: 100, estimated: false } },
+    update: { ...copied.update!, sequence: 2, receivedAt: 200, revision: 2, fingerprint: "zero", seenFingerprints: ["old"] },
+  };
+  const removed: OpenContribution = { ...copied, tokens: usage(20).tokens, cost: 20 };
+  const exact: OpenContribution = { ...copied, tokens: usage(30).tokens, cost: 30, speedBackfill: { version: 1, source: "server" } };
+  const provisional: OpenContribution = {
+    ...copied, quality: "provisional", tokens: usage(90).tokens, cost: 90,
+    update: { ...corrected.update!, sequence: 3, revision: 3, fingerprint: "provisional" },
+  };
+  const oldTotals = usage(100);
+  oldTotals.responseCount = 10; // Cropped historical prefix has no message snapshots.
+  oldTotals.speed = emptySpeedTotals();
+  oldTotals.speed.response = { generatedTokens: 500, durationMs: 5_000, responseCount: 10, estimatedResponseCount: 0 };
+  oldTotals.speed.generation = { generatedTokens: 999, durationMs: 999, responseCount: 1, estimatedResponseCount: 0 };
+  for (const contribution of [copied, removed, exact]) {
+    for (const field of ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const) oldTotals.tokens[field] += contribution.tokens[field];
+    oldTotals.cost += contribution.cost;
+    oldTotals.responseCount++;
+    oldTotals.speed = updateSpeedTotals(oldTotals.speed, contribution.speed, 1);
+  }
+  const newTotals = usage(7);
+  for (const contribution of [corrected, provisional]) {
+    for (const field of ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const) newTotals.tokens[field] += contribution.tokens[field];
+    newTotals.cost += contribution.cost;
+    newTotals.responseCount++;
+    newTotals.speed = updateSpeedTotals(newTotals.speed, contribution.speed, 1);
+  }
+  const before: TotalsLedger = {
+    version: 1, sessions: { [sessionID]: oldTotals },
+    open: { constructor: copied, removed, exact }, settled: { "prefix-legacy": true },
+    sessionScopes: { [sessionID]: classifySessionMetadata({ agent: "normal" }) },
+    sessionAgents: { [sessionID]: [" worker ", "old"] },
+  };
+  const after: TotalsLedger = {
+    version: 1, generationBasisVersion: GENERATION_BASIS_VERSION, sessions: { [sessionID]: newTotals },
+    open: { exact: provisional }, settled: { constructor: corrected, removed: { ...removed, excluded: proof } },
+    sessionScopes: { [sessionID]: classifySessionMetadata({ agent: "normal", parentID: "parent" }) },
+    sessionAgents: { [sessionID]: ["worker", "new", "compaction"] },
+    messageScopes: { "local-legacy": proof },
+  };
+  after.settled["local-legacy"] = true;
+  const originals = structuredClone([before, after]);
+  const merged = mergeTotalsSources([before, after]);
+  const expected = usage(100);
+  expected.cost += 7 + 30;
+  expected.responseCount = 10 + 1 + 1 + 1;
+  for (const field of ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const) expected.tokens[field] += usage(7).tokens[field] + exact.tokens[field];
+  expected.speed = emptySpeedTotals();
+  expected.speed.response = { generatedTokens: 500, durationMs: 5_000, responseCount: 10, estimatedResponseCount: 0 };
+  expected.speed = updateSpeedTotals(updateSpeedTotals(expected.speed, corrected.speed, 1), exact.speed, 1);
+  // Normalize optional legacy coverage counters using the same accumulator API.
+  expected.speed = addSpeedTotals(undefined, expected.speed);
+  assert.deepEqual(merged.sessions[sessionID], expected);
+  assert.deepEqual(merged.settled["constructor"], corrected, "explicit zero correction replaces the older larger copy");
+  assert.equal(merged.open.exact.quality, "exact", "a newer provisional copy cannot replace exact usage");
+  assert.deepEqual(merged.settled.removed, { ...removed, excluded: proof });
+  assert.equal(merged.settled["prefix-legacy"], true);
+  assert.equal(merged.settled["local-legacy"], true);
+  assert.deepEqual(merged.sessionAgents?.[sessionID], ["new", "old", "worker"]);
+  assert.equal(merged.sessionScopes?.[sessionID].parentSessionID, "parent");
+  assert.deepEqual(merged.messageScopes?.["local-legacy"], proof);
+  assert.equal(Object.getPrototypeOf(merged.sessions), null);
+  assert.equal(Object.getPrototypeOf(merged.settled), null);
+  assert.deepEqual([before, after], originals, "read-only projection must not mutate either physical source");
+  assert.deepEqual(mergeTotalsSources([after, before]).open.exact, provisional, "an older revision cannot promote provisional usage to stale exact usage");
+  const staleCopies: TotalsLedger = {
+    ...after,
+    open: { exact: { ...provisional, quality: "exact", update: undefined } },
+    settled: { ...after.settled, constructor: { ...corrected, update: undefined } },
+  };
+  const protectedMerge = mergeTotalsSources([before, staleCopies]);
+  assert.deepEqual(protectedMerge.open.exact, exact, "history without a live update cannot replace server speed backfill");
+  assert.deepEqual(protectedMerge.open["constructor"], copied, "history without an update cannot overwrite an existing same-quality live update");
+  assert.strictEqual(mergeTotalsSources([before]), before, "unchanged single-source sessions stay zero-copy");
+  assert.deepEqual(Object.keys(mergeTotalsSources([]).sessions), []);
+  const legacyOverlap: TotalsLedger = { version: 1, sessions: {}, open: {}, settled: { ["constructor"]: true as const } };
+  assert.strictEqual(mergeTotalsSources([legacyOverlap]), legacyOverlap);
+  assert.throws(() => mergeTotalsSources([before, legacyOverlap]), /overlapping legacy settled contribution: constructor/);
 });

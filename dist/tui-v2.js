@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import { createRoot, createSignal, getOwner, onCleanup, runWithOwner } from "solid-js";
 import { createV2EventAdapter, isContentOnlyEvent, isV2ControlEvent } from "./v2-server.js";
 import { parentProofPort } from "./tui-read-model.js";
@@ -79,6 +80,7 @@ export function createV2TuiBridge(context, defaults = []) {
   const lookupActive = new Map();
   const parentRequests = new Map();
   const proofAvailable = new Set();
+  const sourceChanged = new Set();
   let proofQueueVisits = 0;
   const pendingSize = (count = true) => {
     let size = pending.size;
@@ -361,6 +363,72 @@ export function createV2TuiBridge(context, defaults = []) {
   const api = {
     [sessionSourcePort]: {
       sync: syncSource,
+      directories: async id => {
+        const locations = new Set();
+        const current = context.data.session.get(id);
+        if (current?.id === id) {
+          const directory = current.location?.directory;
+          if (typeof directory !== "string" || !isAbsolute(directory)) throw new TypeError("Invalid native session directory");
+          locations.add(directory);
+        }
+        let next;
+        do {
+          const page = await context.client.message.list({
+            sessionID: id,
+            type: "location-switched",
+            order: "asc",
+            limit: 100,
+            cursor: next ?? undefined
+          });
+          if (!Array.isArray(page.data)) throw new TypeError("Invalid native move history page");
+          for (const message of page.data) {
+            // Only filtered native move controls cross this boundary. Retain
+            // directory strings, never message bodies or native payloads.
+            const row = message;
+            if (!row || row.type !== "location-switched") throw new TypeError("Invalid native move history message");
+            const directory = row.location?.directory;
+            if (typeof directory !== "string" || !isAbsolute(directory)) throw new TypeError("Invalid native move directory");
+            locations.add(directory);
+            if (row.previous !== undefined) {
+              const previous = row.previous.location?.directory;
+              if (typeof previous !== "string" || !isAbsolute(previous)) throw new TypeError("Invalid previous native move directory");
+              locations.add(previous);
+            }
+          }
+          next = page.cursor.next;
+        } while (next && !disposed);
+        return [...locations];
+      },
+      children: async id => {
+        const children = [];
+        let next;
+        do {
+          const page = await context.client.session.list({
+            parentID: id,
+            limit: 100,
+            cursor: next ?? undefined
+          });
+          if (!Array.isArray(page.data)) throw new TypeError("Invalid native child session page");
+          for (const child of page.data) {
+            if (!child || typeof child.id !== "string" || !child.id || child.parentID !== id || typeof child.location?.directory !== "string" || !isAbsolute(child.location.directory)) {
+              throw new TypeError("Invalid native child session metadata");
+            }
+            children.push({
+              id: child.id,
+              parentID: id,
+              directory: child.location.directory
+            });
+          }
+          next = page.cursor.next;
+        } while (next && !disposed);
+        return children;
+      },
+      onChanged: receive => {
+        sourceChanged.add(receive);
+        return () => {
+          sourceChanged.delete(receive);
+        };
+      },
       bind: directory => {
         sourceBound = true;
         sourceDirectory = directory;
@@ -599,6 +667,11 @@ export function createV2TuiBridge(context, defaults = []) {
           if (disposed) return;
           // Gate by type before *any* payload/location/cache/query work.
           const type = details.type;
+          if (type === "session.moved") {
+            const id = details.data?.sessionID;
+            if (typeof id === "string") for (const receive of sourceChanged) receive(id);
+            return;
+          }
           if (isContentOnlyEvent(type)) return;
           const disruption = type === "server.instance.disposed" || /^(?:workspace\..*(?:status(?:\.changed)?|disposed|deleted)|server\.(?:disconnected|error))$/.test(type);
           if (!disruption && !isV2ControlEvent(type)) return;
@@ -716,6 +789,7 @@ export function createV2TuiBridge(context, defaults = []) {
       attempted.clear();
       parentRequests.clear();
       proofAvailable.clear();
+      sourceChanged.clear();
       // 2.0.27 scopes layers/routes/slots, but its dialog API is shared and has
       // no activation cleanup. Close only our still-active dialog; onClose
       // relinquishes ownership when another plugin or the host replaces it.

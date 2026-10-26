@@ -906,6 +906,8 @@ test("V2 TUI scrollable sidebar, history and details preserve native layout and 
   const layers: any[] = [];
   const context = {
     options: { maxRecords: 100 }, location: { directory }, app: { version: "2.0.27" },
+    client: { message: { list: async () => ({ data: [], cursor: {} }) },
+      session: { list: async () => ({ data: [], cursor: {} }) } },
     renderer: { width: 120, height: 100 },
     theme: { hue: { interactive: { 500: color }, accent: { 500: color } },
       text: { base: color, muted: color, action: { secondary: { base: color } }, feedback: { info: { base: color } } },

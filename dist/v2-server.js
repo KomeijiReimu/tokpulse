@@ -52,6 +52,7 @@ export function createV2EventAdapter() {
     for (const execution of executions.values()) if ((!sessionID || execution.sessionID === sessionID) && !execution.pureEmitted) execution.complete = false;
     for (const [id, execution] of current) if (!sessionID || id === sessionID) {
       execution.complete = false;
+      execution.observing = false;
       current.delete(id);
     }
     for (const [id, info] of starts) if (!sessionID || info.sessionID === sessionID) starts.delete(id);
@@ -190,7 +191,8 @@ export function createV2EventAdapter() {
               works: new Set(),
               unready: 0,
               startedAt: event.created,
-              sourceSequence: event.durable?.seq
+              sourceSequence: event.durable?.seq,
+              observing: newer
             };
             if (newer) current.set(sessionID, execution);
             executions.set(execution.id, execution);
@@ -285,6 +287,22 @@ export function createV2EventAdapter() {
             updateWork(execution, key, work);
             stepIDs.set(stepIdentity, key);
             const proofs = [workFact(work, "start")];
+            // A moved drain has no second execution.started. Only a fresh step
+            // can reopen observation, never a replayed/closed work boundary.
+            if (!execution.observing && !known && execution.terminal === undefined && (!current.has(sessionID) || current.get(sessionID) === execution)) {
+              current.set(sessionID, execution);
+              execution.observing = true;
+              proofs.unshift({
+                ...emit("session.status", {
+                  sessionID,
+                  status: {
+                    type: "busy"
+                  }
+                }),
+                timestamp: work.start,
+                executionID: execution.id
+              });
+            }
             if (work.end !== undefined) proofs.push(workFact(work, "end"));
             for (const key of execution.works) {
               const tool = works.get(key);

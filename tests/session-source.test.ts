@@ -9,6 +9,7 @@ import test from "node:test";
 import { createRoot, createSignal } from "solid-js";
 import { normalizeActivityEvent } from "../src/activity.js";
 import type { HistoryRecord } from "../src/core.js";
+import { createTotalsStorage } from "../src/totals-storage.js";
 import { parentProofPort, tuiReadModel, type ParentProofPort } from "../src/tui-read-model.js";
 import { sessionSourcePaths } from "../src/tui-source.js";
 import { createV2TuiBridge, type V2TuiContext } from "../src/tui-v2.js";
@@ -54,11 +55,30 @@ async function ledger(directory: string, value: number, sid = "root", options = 
   return paths;
 }
 
+async function moveLedger(directory: string, value: number, sid: string, start: number, parentSessionID?: string) {
+  const paths = await ledger(directory, value, sid);
+  const record = JSON.parse(await fs.readFile(paths.history, "utf8")) as HistoryRecord;
+  record.time = { start, completed: start + value, duration: value };
+  if (parentSessionID) record.parentSessionID = parentSessionID;
+  await fs.writeFile(paths.history, JSON.stringify(record) + "\n");
+  await fs.rm(paths.totals);
+  await createTotalsStorage(paths.totals).apply(record);
+  const events = (await fs.readFile(paths.runs, "utf8")).trim().split("\n").map((line) => {
+    const fact = JSON.parse(line);
+    return { ...fact, timestamp: fact.timestamp + start - 100, observedAt: fact.observedAt + start - 100,
+      ...(parentSessionID ? { parentSessionID } : {}) };
+  });
+  await fs.writeFile(paths.runs, events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+  return { paths, record };
+}
+
 function host(directory: string, initial = "root") {
   let send!: (event: { details: any }) => void;
   let stopEffects = () => {};
   let sync = async (_id: string) => {};
   const sessions = new Map<string, { id: string; parentID?: string; location: { directory: string; worktree?: string } }>();
+  let messages = async (_input: any): Promise<any> => ({ data: [], cursor: {} });
+  let children = async (input: any): Promise<any> => ({ data: [...sessions.values()].filter((session) => session.parentID === input.parentID), cursor: {} });
   const slots: SlotClaim[] = [];
   const state = createRoot((dispose) => {
     stopEffects = dispose;
@@ -68,6 +88,7 @@ function host(directory: string, initial = "root") {
   });
   const context = {
     options: {}, location: { directory }, theme: {}, renderer: { width: 100, height: 40 },
+    client: { message: { list: (input: any) => messages(input) }, session: { list: (input: any) => children(input) } },
     data: { location: { default: () => ({ directory }) }, listen: (receive: typeof send) => { send = receive; return () => {}; },
       session: { get: (id: string) => { state.revision(); return sessions.get(id); }, sync: (id: string) => sync(id) } },
     keymap: { mode: { current: () => "base", push: () => () => {} }, layer: () => {} },
@@ -80,6 +101,8 @@ function host(directory: string, initial = "root") {
     setSession(id: string, root: string) { sessions.set(id, { id, location: { directory: root, worktree: "/wrong-worktree" } }); state.changed(); },
     setRoute(id: string) { state.setRoute({ type: "session", sessionID: id }); },
     setSync(fn: typeof sync) { sync = fn; },
+    setMessages(fn: typeof messages) { messages = fn; },
+    setChildren(fn: typeof children) { children = fn; },
     send(type: string, data: Record<string, unknown>, root?: string, created = Date.now()) {
       send({ details: { type, data, id: `event-${Math.random()}`, created,
         ...(root === undefined ? {} : { location: { directory: root } }) } });
@@ -92,32 +115,192 @@ function selected(store: NonNullable<Awaited<ReturnType<typeof initializeTui>>>[
   return buildSessionDetailsTree(store, sid).nodes.find((node) => node.sessionID === sid)?.direct.tokens.input;
 }
 
-test("actual initialize/bridge binds all three ledgers to metadata, independent of launch directory, A -> B -> A", async (t) => {
+test("actual initialize/bridge binds unrelated SIDs independently of launch directory, A -> B -> A", async (t) => {
   const base = await fixture(t), A = join(base, "A"), B = join(base, "B");
-  await ledger(A, 11); await ledger(B, 22);
+  await ledger(A, 11); await ledger(B, 22, "other");
   for (const launch of [A, B]) {
     const f = host(launch); f.setSession("root", A);
     try {
       const h = (await initializeTui(f.bridge.api, {}))!;
       assert.equal(f.slots[0].append, "sidebar.content", "production slot registration is exercised");
-      for (const [directory, value] of [[A, 11], [B, 22], [A, 11]] as const) {
-        f.setSession("root", directory); await h.selectSession("root");
+      for (const [directory, value, sid] of [[A, 11, "root"], [B, 22, "other"], [A, 11, "root"]] as const) {
+        f.setSession(sid, directory); await h.selectSession(sid);
         assert.equal(h.store.sourceState.directory, directory);
         assert.equal(h.store.sourceState.status, "ready");
         assert.equal(h.store.sourceState.paths?.history, join(directory, ".tokpulse/history.jsonl"));
-        assert.equal(selected(h.store), value);
+        assert.equal(selected(h.store, sid), value);
         assert.equal(h.store.diskRecords[0].messageID, `message-${value}`);
-        assert.equal(tuiActivityTimes(h.store, "root").directMilliseconds, value);
+        assert.equal(tuiActivityTimes(h.store, sid).directMilliseconds, value);
         const before = h.store.optimistic.size;
-        f.send("session.step.ended", { sessionID: "root", assistantMessageID: `foreign-${value}`,
+        f.send("session.step.ended", { sessionID: sid, assistantMessageID: `foreign-${value}`,
           tokens: { input: 999, output: 999 }, cost: 0, finish: "stop" }, directory === A ? B : A);
         assert.equal(h.store.optimistic.size, before, "foreign-directory live events cannot enter this source");
-        f.send("session.step.ended", { sessionID: "root", assistantMessageID: `local-${value}`,
+        f.send("session.step.ended", { sessionID: sid, assistantMessageID: `local-${value}`,
           tokens: { input: 1, output: 1 }, cost: 0, finish: "stop" }, directory);
         assert.ok(h.store.optimistic.has(`local-${value}`), "proof directory follows selected source, not plugin ctx.location");
       }
     } finally { await f.dispose(); }
   }
+});
+
+test("native paged move history keeps A -> B -> A and reopened usage/time continuous without double counting", async (t) => {
+  const base = await fixture(t), A = join(base, "A"), B = join(base, "B"), unrelated = join(base, "unrelated");
+  const a = await moveLedger(A, 11, "root", 100), b = await moveLedger(B, 22, "root", 200);
+  await ledger(unrelated, 99, "other");
+  // A physical source can contain a copy of an already completed response and
+  // its lifecycle controls. The union must remove both duplicates, not sum them.
+  await createTotalsStorage(b.paths.totals).apply(a.record);
+  await fs.appendFile(b.paths.history, await fs.readFile(a.paths.history));
+  await fs.appendFile(b.paths.runs, await fs.readFile(a.paths.runs));
+  const moves: { type: string; location: { directory: string }; previous: { location: { directory: string } } }[] = [];
+  let pages = 0;
+  const history = async (input: any) => {
+    assert.equal(input.sessionID, "root"); assert.equal(input.type, "location-switched");
+    assert.equal(input.order, "asc"); assert.equal(input.limit, 100);
+    pages++;
+    const index = input.cursor === undefined ? 0 : Number(input.cursor);
+    assert.ok(Number.isInteger(index));
+    return { data: moves.slice(index, index + 1), cursor: index + 1 < moves.length ? { next: String(index + 1) } : {} };
+  };
+  const f = host(A); f.setSession("root", A); f.setMessages(history);
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!, epoch = h.store.sourceEpoch;
+    assert.equal(selected(h.store), 11);
+    for (const [previous, directory] of [[A, B], [B, A]]) {
+      moves.push({ type: "location-switched", location: { directory }, previous: { location: { directory: previous } } });
+      f.setSession("root", directory);
+      f.send("session.moved", { sessionID: "root" }, previous);
+      assert.ok(selected(h.store)! >= 11, "same-SID moves do not flash a cleared baseline");
+      await h.settled();
+      assert.equal(h.store.sourceEpoch, epoch);
+      assert.equal(h.store.sourceState.status, "ready"); assert.equal(h.store.sourceState.directory, directory);
+      assert.equal(selected(h.store), 33);
+      assert.equal(h.store.totalsLedger.sessions.root.tokens.cacheRead, 297);
+      assert.equal(h.store.totalsLedger.sessions.root.tokens.output, 33);
+      assert.equal(h.store.diskRecords.length, 2);
+      assert.equal(tuiActivityTimes(h.store, "root").directMilliseconds, 33, "move gaps are not bridged");
+    }
+    const resumed: HistoryRecord = { ...a.record, messageID: "resumed-A",
+      tokens: { ...a.record.tokens, input: 33, output: 33, cacheRead: 297 }, time: { start: 300, completed: 333, duration: 33 } };
+    await createTotalsStorage(a.paths.totals).apply(resumed);
+    await fs.appendFile(a.paths.history, JSON.stringify(resumed) + "\n");
+    await fs.appendFile(a.paths.runs, (["busy", "idle"] as const).map((state) => JSON.stringify(normalizeActivityEvent({
+      version: 2, kind: "lifecycle", eventID: `resumed-${state}`, instanceID: "resumed-instance-A", executionID: "resumed-execution-A",
+      sessionID: "root", state, timestamp: state === "busy" ? 300 : 333, observedAt: state === "busy" ? 300 : 333,
+    }))).join("\n") + "\n");
+    await eventually(() => selected(h.store) === 66 && tuiActivityTimes(h.store, "root").directMilliseconds === 66,
+      "after moving back, the existing source watcher appends new usage and canonical facts");
+    const before = h.store.optimistic.size;
+    f.send("session.step.ended", { sessionID: "root", assistantMessageID: "foreign", tokens: { input: 999, output: 999 }, finish: "stop" }, B);
+    assert.equal(h.store.optimistic.size, before, "historical sources do not gain foreign live ownership");
+  } finally { await f.dispose(); }
+  const sameDirectoryRecord: HistoryRecord = { ...a.record, sessionID: "same-A", messageID: "same-A-response",
+    tokens: { ...a.record.tokens, input: 7, output: 7, cacheRead: 63 } };
+  await createTotalsStorage(a.paths.totals).apply(sameDirectoryRecord);
+  await fs.appendFile(a.paths.history, JSON.stringify(sameDirectoryRecord) + "\n");
+  const files = [...Object.values(a.paths), ...Object.values(b.paths)];
+  const before = await Promise.all(files.map(async (path) => [await fs.readFile(path, "utf8"), (await fs.stat(path)).mtimeMs]));
+  const reopened = host(B); reopened.setSession("root", A); reopened.setSession("other", unrelated); reopened.setMessages(history);
+  try {
+    const h = (await initializeTui(reopened.bridge.api, {}))!;
+    assert.equal(selected(h.store), 66); assert.equal(tuiActivityTimes(h.store, "root").directMilliseconds, 66);
+    assert.ok(pages >= 5, "the second native move page is requested with its cursor and filter intact");
+    const epoch = h.store.sourceEpoch;
+    let now = Date.now();
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      reopened.send("session.execution.started", { sessionID: "root" }, A, now);
+      reopened.send("session.step.started", { sessionID: "root", assistantMessageID: "live-A", agent: "build", started: now }, A, now);
+      now += 5;
+      reopened.send("session.step.ended", { sessionID: "root", assistantMessageID: "live-A",
+        tokens: { input: 1, output: 1, cacheRead: 9 }, cost: 0, finish: "stop" }, A, now);
+      now += 5;
+      assert.ok(tuiActivityTimes(h.store, "root", now).directMilliseconds >= 76);
+      moves.push({ type: "location-switched", location: { directory: B }, previous: { location: { directory: A } } });
+      reopened.setSession("root", B); reopened.send("session.moved", { sessionID: "root" }, A, now);
+      await h.settled();
+      assert.equal(h.store.sourceEpoch, epoch); assert.equal(h.store.totalsLedger.sessions.root.tokens.input, 66);
+      assert.ok(tuiActivityTimes(h.store, "root", now).directMilliseconds >= 66, "moving during execution retains the historical clock");
+      now += 10;
+      reopened.send("session.step.started", { sessionID: "root", assistantMessageID: "continued-B-live", agent: "build", started: now }, B, now);
+      const resumed = tuiActivityTimes(h.store, "root", now);
+      now += 20;
+      const growing = tuiActivityTimes(h.store, "root", now);
+      assert.equal(growing.active, true); assert.equal(growing.directMilliseconds, resumed.directMilliseconds + 20);
+      assert.ok(growing.directMilliseconds >= 86); assert.equal(h.store.sourceEpoch, epoch);
+      reopened.send("session.step.ended", { sessionID: "root", assistantMessageID: "continued-B-live",
+        tokens: { input: 2, output: 2, cacheRead: 18 }, cost: 0, finish: "stop" }, B, now);
+      reopened.send("session.execution.succeeded", { sessionID: "root" }, B, now);
+      const completed = tuiActivityTimes(h.store, "root", now);
+      assert.equal(completed.active, false); assert.ok(completed.directMilliseconds >= 86);
+      now += 100;
+      assert.equal(tuiActivityTimes(h.store, "root", now).directMilliseconds, completed.directMilliseconds);
+      moves.push({ type: "location-switched", location: { directory: A }, previous: { location: { directory: B } } });
+      reopened.setSession("root", A); reopened.send("session.moved", { sessionID: "root" }, B, now);
+      await h.settled();
+    } finally { clock.mockRestore(); }
+    reopened.setSession("same-A", A);
+    reopened.setMessages(async () => ({ data: [], cursor: {} }));
+    const open = fs.open, foreignReads: string[] = [];
+    const missing = spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+      if (Object.values(b.paths).includes(String(args[0]))) {
+        foreignReads.push(String(args[0])); throw Object.assign(Error("old moved source is missing"), { code: "ENOENT" });
+      }
+      return open(...args);
+    });
+    try {
+      await h.selectSession("same-A");
+      assert.equal(selected(h.store, "same-A"), 7); assert.equal(h.store.sourceState.status, "ready");
+      assert.deepEqual(h.store.sourceState.missing, []); assert.deepEqual(h.store.sourceState.errors, {});
+      assert.deepEqual(foreignReads, [], "an unrelated SID in A neither reads nor inherits failures from B");
+      let fail = true, attempts = 0;
+      reopened.setMessages(async () => { attempts++; if (fail) throw Error("native move lookup failed"); return { data: [], cursor: {} }; });
+      reopened.send("session.moved", { sessionID: "same-A" }, A);
+      await h.settled();
+      assert.equal(h.store.sourceState.status, "error"); assert.match(h.store.sourceState.errors?.metadata ?? "", /native move lookup failed/);
+      assert.equal(selected(h.store, "same-A"), 7);
+      fail = false; await h.selectSession("same-A");
+      assert.equal(attempts, 2); assert.equal(h.store.sourceState.status, "ready"); assert.equal(selected(h.store, "same-A"), 7);
+      assert.deepEqual(foreignReads, []);
+    } finally { missing.mockRestore(); }
+    await h.selectSession("other"); assert.equal(selected(h.store, "other"), 99);
+    assert.ok(h.store.activityEvents.every((fact) => fact.sessionID === "other"));
+  } finally { await reopened.dispose(); }
+  assert.deepEqual(await Promise.all(files.map(async (path) => [await fs.readFile(path, "utf8"), (await fs.stat(path)).mtimeMs])), before,
+    "browsing and disposal only read every historical source");
+});
+
+test("native descendants discover a child's independent move even without a local root parent ledger", async (t) => {
+  const base = await fixture(t), A = join(base, "A"), B = join(base, "B"), C = join(base, "C");
+  await moveLedger(A, 11, "root", 100);
+  await moveLedger(B, 22, "child", 200, "root");
+  await moveLedger(C, 33, "child", 300, "root");
+  const f = host(A); f.setSession("root", A);
+  f.sessions.set("child", { id: "child", parentID: "root", location: { directory: B } });
+  f.sessions.set("grandchild", { id: "grandchild", parentID: "child", location: { directory: B } });
+  const queried = new Set<string>();
+  let moved = false;
+  f.setMessages(async (input) => {
+    queried.add(input.sessionID);
+    assert.equal(input.type, "location-switched");
+    return { data: input.sessionID === "child" && moved ? [{ type: "location-switched", location: { directory: C },
+      previous: { location: { directory: B } } }] : [], cursor: {} };
+  });
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!, epoch = h.store.sourceEpoch;
+    assert.deepEqual([...queried].sort(), ["child", "grandchild", "root"]);
+    let root = buildSessionDetailsTree(h.store, "root");
+    assert.equal(root.including.tokens.input, 33); assert.equal(tuiActivityTimes(h.store, "root").includingMilliseconds, 33);
+    moved = true; f.sessions.set("child", { id: "child", parentID: "root", location: { directory: C } });
+    f.send("session.moved", { sessionID: "child" }, C);
+    await h.settled();
+    root = buildSessionDetailsTree(h.store, "root");
+    assert.equal(h.store.sourceEpoch, epoch); assert.equal(h.store.sourceState.directory, A);
+    assert.equal(root.nodes[0].direct.tokens.input, 11); assert.equal(root.including.tokens.input, 66);
+    assert.equal(root.including.tokens.cacheRead, 594); assert.equal(root.including.tokens.output, 66);
+    assert.equal(tuiActivityTimes(h.store, "root").includingMilliseconds, 66);
+    assert.equal(tuiActivityTimes(h.store, "child").directMilliseconds, 55);
+  } finally { await f.dispose(); }
 });
 
 test("foreign workspace/transport disruption cannot freeze selected live time or reset proof epoch", async (t) => {
@@ -234,9 +417,9 @@ test("registered route and metadata effects follow host navigation without helpe
     const h = (await initializeTui(f.bridge.api, {}))!;
     f.setRoute("other"); await Promise.resolve(); await h.settled();
     assert.equal(h.store.sourceState.sessionID, "other"); assert.equal(selected(h.store, "other"), 22);
-    await ledger(A, 33, "other");
-    f.setSession("other", A); await Promise.resolve(); await h.settled();
-    assert.equal(h.store.sourceState.directory, A); assert.equal(selected(h.store, "other"), 33);
+    await ledger(A, 33, "third");
+    f.setSession("third", A); f.setRoute("third"); await Promise.resolve(); await h.settled();
+    assert.equal(h.store.sourceState.directory, A); assert.equal(selected(h.store, "third"), 33);
     // Stop at the component boundary: source registration/effects stay real,
     // while presentation and OpenTUI mounting belong to separate render tests.
     const component = spyOn(tuiSolid, "createComponent").mockImplementation(() => null);

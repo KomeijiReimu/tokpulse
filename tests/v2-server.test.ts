@@ -7,6 +7,7 @@ import type { SessionStepStarted, SessionStepEnded, SessionStepFailed, SessionCr
 import plugin from "../src/server.js";
 import { createV2EventAdapter, readV2Idle, type V2ServerContext } from "../src/v2-server.js";
 import { ActivityLedger } from "../src/runs-storage.js";
+import { mergeTotalsSources } from "../src/source-ledgers.js";
 import { replayActivity, createActivityProjector } from "../src/activity.js";
 import { createRuntimeStore, reloadActivity, taskWallTimeForSession } from "../src/tui.js";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
@@ -518,6 +519,58 @@ test("V2 fresh TUI conservatively retains an open instance across server restart
   });
 });
 
+test("V2 live execution moves A to B to A using only new step boundaries with no frontend", async () => {
+  await fixture(async (a) => fixture(async (b) => {
+    const base = a.base;
+    let seq = 0;
+    const send = async (location: FixtureContext, type: string, data: Record<string, any>, offset: number) => {
+      const event = { id: `move_${++seq}`, type, data, created: base + offset,
+        durable: { aggregateID: data.sessionID, seq, version: 1 }, location: { directory: location.directory } };
+      await a.raw(event);
+      await b.raw(event);
+      return event;
+    };
+    for (const sessionID of ["s", "child"]) {
+      await send(a, "session.created", { sessionID, agent: "build", ...(sessionID === "child" ? { parentID: "s" } : {}) }, 0);
+      await send(a, "session.execution.started", { sessionID }, 0);
+    }
+    for (const [location, start, end, suffix] of [[a, 10, 30, "a"], [b, 100, 130, "b"], [a, 200, 230, "return"]] as const) {
+      for (const sessionID of ["s", "child"]) {
+        const assistantMessageID = `${sessionID}_${suffix}`;
+        // OpenCode continues the same drain after moving; it does not emit a
+        // second execution.started in either destination, including return A.
+        await send(location, "session.step.started", { sessionID, assistantMessageID, agent: "build", model, started: base + start }, start + 5);
+        const ended = await send(location, "session.step.ended", { sessionID, assistantMessageID, tokens, cost: 1, finish: "stop" }, end);
+        await location.raw(ended); // durable replay must not count a request twice
+      }
+    }
+    for (const sessionID of ["s", "child"]) await send(a, "session.execution.succeeded", { sessionID }, 250);
+    await a.cleanup();
+    await b.cleanup();
+    const left = await a.read();
+    const right = await b.read();
+    assert.equal(replayActivity(right.facts).timelines.get("s")?.activeMilliseconds, 30,
+      "B must open activity at its actual new step start without execution.started");
+    const replay = replayActivity([...left.facts, ...right.facts]);
+    for (const sessionID of ["s", "child"]) {
+      const timeline = replay.timelines.get(sessionID)!;
+      assert.equal(timeline.activeMilliseconds, 110);
+      assert.deepEqual(timeline.intervals.map(({ start, end }) => [start - base, end - base]),
+        [[0, 30], [100, 130], [200, 250]], "move gaps are unknown, not billable activity");
+    }
+    assert.equal(replay.rootActiveMilliseconds.s, 110, "parallel child activity is unioned, not added twice");
+    const totals = mergeTotalsSources([left.totals, right.totals]);
+    for (const sessionID of ["s", "child"]) {
+      assert.equal(totals.sessions[sessionID].responseCount, 3);
+      assert.equal(totals.sessions[sessionID].tokens.input, 36);
+      assert.equal(totals.sessions[sessionID].tokens.output, 21);
+      assert.equal(totals.sessions[sessionID].cost, 3);
+    }
+    assert.equal([...left.facts, ...right.facts].some((fact: any) => fact.kind === "execution-scope"), false,
+      "partial execution coverage must not certify pure maintenance");
+  }));
+});
+
 test("V2 locationless execution transitions retain their original times when a scoped step proves ownership", async () => {
   await fixture(async ({ base, directory, send, read }) => {
     // Captured 2.0.32 public shape: execution.started has no location and its
@@ -620,11 +673,12 @@ test("V2 location proof lookup concurrency is bounded and cleanup aborts unresol
     await send("session.step.started", { sessionID: "idle_contender", assistantMessageID: "idle_contender_msg", agent: "build", model, started: Date.now() }, 21);
     await send("session.step.ended", { sessionID: "idle_contender", assistantMessageID: "idle_contender_msg", tokens, cost: 1, finish: "stop" }, 22);
     assert.equal(calls.length, 4);
-    assert.equal((await read()).facts.some((fact: any) => fact.kind === "lifecycle"), false);
+    assert.deepEqual((await read()).facts.filter((fact: any) => fact.kind === "lifecycle").map((fact: any) => fact.sessionID), ["idle_contender"],
+      "the scoped new step proves only its own busy boundary, not pending locationless sessions");
     await cleanup();
     assert.ok(calls.every((call) => call.signal.aborted));
     assert.equal(calls.length, 4, "queued lookups cannot start after cleanup");
-    assert.equal((await read()).facts.some((fact: any) => fact.kind === "lifecycle"), false);
+    assert.equal((await read()).facts.some((fact: any) => fact.kind === "lifecycle" && fact.sessionID.startsWith("pending_")), false);
   }, () => proof);
 });
 
@@ -706,7 +760,9 @@ test("V2 created metadata, agent/model identity and deferred parent lookup exclu
     assert.equal(totals.sessionScopes.child.parentSessionID, "hidden");
     assert.equal(totals.sessionScopes.late.parentSessionID, "hidden");
     assert.ok(calls.some((call: any) => call.sessionID === "late"));
-    assert.equal(facts.some((fact: any) => fact.kind === "lifecycle"), false);
+    assert.equal(facts.some((fact: any) => fact.kind === "lifecycle" && fact.sessionID !== "s"), false);
+    assert.equal(replayActivity(facts).rootActiveMilliseconds.s ?? 0, 0,
+      "a partial busy boundary does not turn its proven maintenance step into user activity");
   }, (id, directory) => ({ id, location: { directory }, agent: "build", time: {}, ...(id === "late" ? { parentID: "hidden" } : {}) }));
 });
 
@@ -1072,7 +1128,8 @@ test("pending prefix and session-budget losses never bridge a separately observe
     const replay = replayActivity(facts);
     assert.equal(replay.rootActiveMilliseconds.s, 330);
     assert.equal(replay.rootActiveMilliseconds.truncated, 36);
-    assert.equal(replay.rootActiveMilliseconds.unknown_0 ?? 0, 0);
+    assert.equal(replay.rootActiveMilliseconds.unknown_0, 90,
+      "the evicted prefix stays unknown; only the new scoped step at 110 through terminal 200 is observed");
     assert.equal(facts.some((fact: any) => fact.kind === "execution-scope"), false, "loss of observation cannot certify complete pure execution");
   }, () => { throw new Error("ownership unknown until a scoped control event"); });
 });
@@ -1089,7 +1146,8 @@ test("missing start or malformed work cannot certify a complete pure maintenance
     await send("session.execution.succeeded", { sessionID: "s" }, 100);
     const { facts } = await read();
     assert.equal(facts.some((fact: any) => fact.kind === "execution-scope"), false);
-    assert.equal(replayActivity(facts).rootActiveMilliseconds.s ?? 0, missing === "execution" ? 0 : 30);
+    assert.equal(replayActivity(facts).rootActiveMilliseconds.s ?? 0, missing === "execution" ? 20 : 30,
+      "a new partial step starts at 10, its proven maintenance span ends at 80, and the unknown tail remains through 100");
   });
 });
 

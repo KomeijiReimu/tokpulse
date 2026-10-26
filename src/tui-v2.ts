@@ -2,10 +2,11 @@ import type { Plugin } from "@opencode/plugin/tui";
 import type { KeymapCommand, KeymapLayer } from "@opencode/plugin/tui/context";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import { createRoot, createSignal, getOwner, onCleanup, runWithOwner } from "solid-js";
 import { createV2EventAdapter, isContentOnlyEvent, isV2ControlEvent } from "./v2-server.js";
 import { parentProofPort, type ParentProofPort, type ParentProofOutcome, type ParentProofWake } from "./tui-read-model.js";
-import { sessionSourcePort, type SessionSourcePort } from "./tui-source.js";
+import { sessionSourcePort, type SessionSourcePort, type SessionSourceMetadata } from "./tui-source.js";
 
 export type V2TuiContext = Plugin.Context;
 type LegacyLayer = Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0];
@@ -67,6 +68,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
     epoch: number; attempts: number; due: number; done: boolean };
   const parentRequests = new Map<string, ParentJob>();
   const proofAvailable = new Set<(event: ParentProofWake) => void>();
+  const sourceChanged = new Set<(id: string) => void>();
   let proofQueueVisits = 0;
   const pendingSize = (count = true) => { let size = pending.size; for (const id of parentRequests.keys()) { if (count) proofQueueVisits++; if (!pending.has(id)) size++; } return size; };
   const location = () => context.location ?? context.data.location.default();
@@ -243,6 +245,55 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
   const api = {
     [sessionSourcePort]: {
       sync: syncSource,
+      directories: async (id) => {
+        const locations = new Set<string>();
+        const current = context.data.session.get(id);
+        if (current?.id === id) {
+          const directory = current.location?.directory;
+          if (typeof directory !== "string" || !isAbsolute(directory)) throw new TypeError("Invalid native session directory");
+          locations.add(directory);
+        }
+        let next: Awaited<ReturnType<typeof context.client.message.list>>["cursor"]["next"];
+        do {
+          const page = await context.client.message.list({ sessionID: id, type: "location-switched", order: "asc", limit: 100, cursor: next ?? undefined });
+          if (!Array.isArray(page.data)) throw new TypeError("Invalid native move history page");
+          for (const message of page.data) {
+            // Only filtered native move controls cross this boundary. Retain
+            // directory strings, never message bodies or native payloads.
+            const row = message as unknown as { type?: unknown; location?: { directory?: unknown };
+              previous?: { location?: { directory?: unknown } } };
+            if (!row || row.type !== "location-switched") throw new TypeError("Invalid native move history message");
+            const directory = row.location?.directory;
+            if (typeof directory !== "string" || !isAbsolute(directory)) throw new TypeError("Invalid native move directory");
+            locations.add(directory);
+            if (row.previous !== undefined) {
+              const previous = row.previous.location?.directory;
+              if (typeof previous !== "string" || !isAbsolute(previous)) throw new TypeError("Invalid previous native move directory");
+              locations.add(previous);
+            }
+          }
+          next = page.cursor.next;
+        } while (next && !disposed);
+        return [...locations];
+      },
+      children: async (id) => {
+        const children: SessionSourceMetadata[] = [];
+        let next: Awaited<ReturnType<typeof context.client.session.list>>["cursor"]["next"];
+        do {
+          const page = await context.client.session.list({ parentID: id, limit: 100, cursor: next ?? undefined });
+          if (!Array.isArray(page.data)) throw new TypeError("Invalid native child session page");
+          for (const child of page.data) {
+            if (!child || typeof child.id !== "string" || !child.id || child.parentID !== id
+              || typeof child.location?.directory !== "string" || !isAbsolute(child.location.directory)) {
+              throw new TypeError("Invalid native child session metadata");
+            }
+            children.push({ id: child.id, parentID: id, directory: child.location.directory });
+          }
+          next = page.cursor.next;
+        } while (next && !disposed);
+        return children;
+      },
+      onChanged: (receive) => { sourceChanged.add(receive); return () => { sourceChanged.delete(receive); }; },
       bind: (directory: string | undefined) => {
         sourceBound = true; sourceDirectory = directory;
         ensureProofDirectory();
@@ -380,6 +431,11 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
           if (disposed) return;
           // Gate by type before *any* payload/location/cache/query work.
           const type: string = details.type;
+          if (type === "session.moved") {
+            const id = (details as unknown as { data?: { sessionID?: unknown } }).data?.sessionID;
+            if (typeof id === "string") for (const receive of sourceChanged) receive(id);
+            return;
+          }
           if (isContentOnlyEvent(type)) return;
           const disruption = type === "server.instance.disposed" || /^(?:workspace\..*(?:status(?:\.changed)?|disposed|deleted)|server\.(?:disconnected|error))$/.test(type);
           if (!disruption && !isV2ControlEvent(type)) return;
@@ -439,7 +495,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
       sourceLookupActive?.resolve();
       if (retryTimer !== undefined) clearTimeout(retryTimer); retryTimer = undefined; retryDue = Infinity;
       for (const job of parentRequests.values()) { job.done = true; job.receive = undefined; }
-      proven.clear(); pending.clear(); lookupQueue.clear(); attempted.clear(); parentRequests.clear(); proofAvailable.clear();
+      proven.clear(); pending.clear(); lookupQueue.clear(); attempted.clear(); parentRequests.clear(); proofAvailable.clear(); sourceChanged.clear();
       // 2.0.27 scopes layers/routes/slots, but its dialog API is shared and has
       // no activation cleanup. Close only our still-active dialog; onClose
       // relinquishes ownership when another plugin or the host replaces it.

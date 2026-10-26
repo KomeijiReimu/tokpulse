@@ -11,6 +11,7 @@ import type { BindingConfig, BindingValue } from "@opencode-ai/plugin/tui";
 import { Plugin } from "@opencode/plugin/tui";
 import { createV2TuiBridge } from "./tui-v2.js";
 import { tuiReadModel, disconnectTuiReadModel, parentProofPort, RevisionMap, TuiActivitySelection, activitySemanticIdentity, type ParentProofPort, type DisplayTerm } from "./tui-read-model.js";
+import { mergeTotalsSources } from "./source-ledgers.js";
 import { sessionSourcePort, sessionSourceDirectory, sessionSourcePaths, type SourceApi, type TuiSourceState, type TuiSourcePaths } from "./tui-source.js";
 import type {
   TuiPlugin,
@@ -55,7 +56,7 @@ import {
   parseHistoryJsonl,
   filterHistoryRecords,
 } from "./storage.js";
-import { readActivityDelta } from "./runs-storage.js";
+import { readActivityDelta, type ActivityReadCursor } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
 import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
@@ -3336,54 +3337,98 @@ export function hydrateHistoryState(
   retireCanonicalResponses(store);
 }
 
+type SourceReadOutcome = "loaded" | "missing" | { error: string };
+type SourceSnapshots = {
+  history: Map<string, HistoryRecord[]>;
+  totals: Map<string, TotalsLedger>;
+  runs: Map<string, { cursor?: ActivityReadCursor; events: ActivityEvent[] }>;
+  runPaths: string[];
+  outcomes: Map<string, { ledger: keyof TuiSourcePaths; path: string; result: SourceReadOutcome }>;
+};
+const sourceSnapshots = new WeakMap<RuntimeStore, SourceSnapshots>();
+function snapshotsFor(store: RuntimeStore): SourceSnapshots {
+  let value = sourceSnapshots.get(store);
+  if (!value) {
+    value = { history: new Map(), totals: new Map(), runs: new Map(), runPaths: [], outcomes: new Map() };
+    sourceSnapshots.set(store, value);
+  }
+  return value;
+}
+function physicalPaths(paths: string | readonly string[]): string[] {
+  return [...new Set((typeof paths === "string" ? [paths] : paths).map((path) => resolve(path)))];
+}
+
 export async function reloadHistory(
   store: RuntimeStore,
   api: TuiPluginApi,
-  path: string,
-  totalsPath: string,
+  path: string | readonly string[],
+  totalsPath: string | readonly string[],
   maxRecords: number,
   generation = store.historyGeneration,
 ): Promise<void> {
   if (store.disposed) return;
   const sourceEpoch = store.sourceEpoch;
+  const snapshots = snapshotsFor(store);
+  const histories = physicalPaths(path), totals = physicalPaths(totalsPath);
   let diskRecords: HistoryRecord[] | undefined;
-  try {
-    // Keep ENOENT distinct from an actually empty, successfully opened ledger.
-    diskRecords = parseHistoryJsonl(await readLedgerText(path)).slice(-maxRecords);
-  } catch (error) {
-    if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
-    if (generation === store.historyGeneration) {
-      sourceReadError(store, "history", error);
-      if (!isNodeError(error) || error.code !== "ENOENT") warnWithToast(api, "history read failed", error);
+  let historyChanged = false;
+  for (const file of histories) {
+    try {
+      const records = parseHistoryJsonl(await readLedgerText(file));
+      if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
+      for (const record of records) {
+        if (record.time.completed !== undefined && record.quality !== "provisional") {
+          finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch,
+            { completedAt: record.time.completed, authoritative: true });
+        }
+      }
+      if (generation !== store.historyGeneration) return;
+      snapshots.history.set(file, records); historyChanged = true;
+      sourceReadResult(store, "history", "loaded", file);
+    } catch (error) {
+      if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
+      if (generation === store.historyGeneration) {
+        sourceReadError(store, "history", error, file);
+        if (!isNodeError(error) || error.code !== "ENOENT") warnWithToast(api, "history read failed", error);
+      }
     }
   }
   if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
-  // Completion ownership is independent of the usage snapshot's generation.
-  // Once disk supplied an authoritative same-ID completion, late content must
-  // not revive it while the latest history/totals read is still draining.
-  for (const record of diskRecords ?? []) {
-    if (record.time.completed !== undefined && record.quality !== "provisional") {
-      finalizeResponse(store, record.messageID, record.sessionID, store.active.get(record.messageID)?.responseEpoch,
-        { completedAt: record.time.completed, authoritative: true });
-    }
-  }
   if (generation !== store.historyGeneration) return;
+  if (historyChanged) diskRecords = mergeHistoryLayers(histories.flatMap((file) => snapshots.history.get(file) ?? []), new Map(), maxRecords);
 
   let totalsLedger: TotalsLedger | undefined;
-  let totalsReadFailed = false;
-  try {
-    totalsLedger = await readTotalsSnapshot(totalsPath);
-  } catch (error) {
-    if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.historyGeneration) return;
-    totalsReadFailed = true;
-    sourceReadError(store, "totals", error);
-    warnWithToast(api, "totals read failed", error);
+  let totalsChanged = false;
+  for (const file of totals) {
+    try {
+      const ledger = await readTotalsSnapshot(file);
+      if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.historyGeneration) return;
+      if (ledger) { snapshots.totals.set(file, ledger); totalsChanged = true; }
+      sourceReadResult(store, "totals", ledger ? "loaded" : "missing", file);
+    } catch (error) {
+      if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.historyGeneration) return;
+      sourceReadError(store, "totals", error, file);
+      warnWithToast(api, "totals read failed", error);
+    }
   }
   if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.historyGeneration) return;
+  if (totalsChanged) {
+    try {
+      totalsLedger = mergeTotalsSources(totals.flatMap((file) => {
+        const ledger = snapshots.totals.get(file); return ledger ? [ledger] : [];
+      }));
+      snapshots.outcomes.delete("totals:union");
+      const last = totals[totals.length - 1];
+      if (last) sourceReadResult(store, "totals", snapshots.outcomes.get(`totals:${last}`)!.result, last);
+    } catch (error) {
+      sourceReadError(store, "totals", error, "union");
+      warnWithToast(api, "totals sources cannot be combined", error);
+    }
+  }
 
   if (totalsLedger) {
     store.totalsLedger = totalsLedger;
-  } else if (!totalsReadFailed) sourceReadResult(store, "totals", "missing");
+  }
   // Each successful ledger remains independently useful. A failed history read
   // cannot block fresh totals, and a missing/failed totals read cannot erase the
   // same source's cumulative snapshot or its history detail window.
@@ -3408,14 +3453,12 @@ export async function reloadHistory(
     store.optimisticOrder,
   ));
   refreshScopeProjection(store);
-  if (diskRecords !== undefined) sourceReadSuccess(store, "history");
-  if (totalsLedger) sourceReadSuccess(store, "totals");
 }
 
 export async function reloadActivity(
   store: RuntimeStore,
   api: TuiPluginApi,
-  path: string,
+  path: string | readonly string[],
   generation = store.activityGeneration,
 ): Promise<boolean> {
   if (store.disposed) return false;
@@ -3425,27 +3468,54 @@ export async function reloadActivity(
   selection.retryNeeded = false;
   const model = tuiReadModel(store);
   model.bindProof((api as TuiPluginApi & { [parentProofPort]?: ParentProofPort })[parentProofPort]);
+  const snapshots = snapshotsFor(store), paths = physicalPaths(path);
   try {
-    const delta = await readActivityDelta(path, selection.cursor);
+    const reads = await Promise.all(paths.map(async (file) => {
+      try { return { file, delta: await readActivityDelta(file, snapshots.runs.get(file)?.cursor) }; }
+      catch (error) { return { file, error }; }
+    }));
     if (
       store.disposed
       || sourceEpoch !== store.sourceEpoch
       || generation !== store.activityGeneration
       || token !== selection.readToken
     ) { selection.counters.staleReads++; return false; }
-    if (delta.mode === "reset" && !delta.cursor) {
-      sourceReadResult(store, "runs", "missing");
-      return false;
+    let reset = JSON.stringify(paths) !== JSON.stringify(snapshots.runPaths);
+    const added: ActivityEvent[] = [];
+    let succeeded = false;
+    for (const read of reads) {
+      if (!read.delta) {
+        const error = read.error;
+        if (error instanceof Error && /(?:Activity ledger (?:changed|truncated)|Ledger identity changed)/.test(error.message)) {
+          selection.retryNeeded = true; selection.counters.readRetries++;
+        } else { sourceReadError(store, "runs", error, read.file); warnWithToast(api, "activity read failed", error); }
+        continue;
+      }
+      const delta = read.delta;
+      if (!delta.cursor) { sourceReadResult(store, "runs", "missing", read.file); continue; }
+      succeeded = true;
+      sourceReadResult(store, "runs", "loaded", read.file);
+      if (delta.mode === "unchanged") continue;
+      if (delta.mode === "reset") {
+        reset = true; snapshots.runs.set(read.file, { cursor: delta.cursor, events: Array.from(delta.events) });
+      } else {
+        const snapshot = snapshots.runs.get(read.file)!;
+        snapshot.events.push(...delta.events); snapshot.cursor = delta.cursor;
+      }
+      added.push(...delta.events);
     }
-    if (delta.mode === "unchanged") { selection.cursor = delta.cursor; sourceReadSuccess(store, "runs"); return true; }
-    model.canonicalParents(delta.events, delta.mode === "reset");
+    if (!succeeded) return false;
+    if (!reset && !added.length) return !selection.retryNeeded;
+    const events = reset ? [...new Map(paths.flatMap((file) => snapshots.runs.get(file)?.events ?? [])
+      .map((fact) => [JSON.stringify(fact), fact])).values()] : added;
+    model.canonicalParents(events, reset);
     let accepted: readonly ActivityEvent[];
-    if (delta.mode === "reset") {
-      store.activityEvents = Array.from(delta.events); value.canonical = store.activityEvents;
-      selection.counters.canonicalArrayCopies += delta.events.length;
-      selection.reset(delta.events); accepted = delta.events;
+    if (reset) {
+      store.activityEvents = events; value.canonical = store.activityEvents;
+      selection.counters.canonicalArrayCopies += events.length;
+      selection.reset(events); accepted = events;
     } else {
-      selection.patch(); accepted = selection.addCanonical(delta.events);
+      selection.patch(); accepted = selection.addCanonical(events);
       for (const fact of accepted) store.activityEvents.push(fact);
     }
     selection.patch();
@@ -3478,10 +3548,10 @@ export async function reloadActivity(
       }
     }
     // Commit the stateless cursor only after all current-generation application.
-    selection.cursor = delta.cursor;
-    sourceReadSuccess(store, "runs");
-    if (accepted.length || delta.mode === "reset") store.bump();
-    return true;
+    snapshots.runPaths = paths;
+    selection.cursor = paths.length === 1 ? snapshots.runs.get(paths[0])?.cursor : undefined;
+    if (accepted.length || reset) store.bump();
+    return !selection.retryNeeded;
   } catch (error) {
     if (store.disposed || sourceEpoch !== store.sourceEpoch || generation !== store.activityGeneration || token !== selection.readToken) { selection.counters.staleReads++; return false; }
     selection.retryNeeded = error instanceof Error && /(?:Activity ledger (?:changed|truncated)|Ledger identity changed)/.test(error.message);
@@ -5110,24 +5180,24 @@ function watchLedgerPaths(paths: readonly { path: string; changed: () => void }[
   };
 }
 
-function sourceReadError(store: RuntimeStore, ledger: keyof TuiSourcePaths, error: unknown): void {
+function sourceReadError(store: RuntimeStore, ledger: keyof TuiSourcePaths, error: unknown, path?: string): void {
   sourceReadResult(store, ledger, isNodeError(error) && error.code === "ENOENT" ? "missing"
-    : { error: error instanceof Error ? error.message : String(error) });
-}
-
-function sourceReadSuccess(store: RuntimeStore, ledger: keyof TuiSourcePaths): void {
-  sourceReadResult(store, ledger, "loaded");
+    : { error: error instanceof Error ? error.message : String(error) }, path);
 }
 
 /** Only an actual safe-FD read can establish availability. Keep prior knowledge
  * on the same source, but let every new result clear that ledger's older error. */
-function sourceReadResult(store: RuntimeStore, ledger: keyof TuiSourcePaths, result: "loaded" | "missing" | { error: string }): void {
-  const state = store.sourceState, path = state.paths?.[ledger] ?? ledger;
-  if (result === "loaded" && state.loaded?.[ledger] && !state.errors?.[ledger] && !state.missing?.includes(path)) return;
-  const errors = { ...state.errors }; delete errors[ledger];
-  const missing = (state.missing ?? []).filter((entry) => entry !== path);
-  if (result === "missing") missing.push(path);
-  else if (typeof result === "object") errors[ledger] = result.error;
+function sourceReadResult(store: RuntimeStore, ledger: keyof TuiSourcePaths, result: SourceReadOutcome, physicalPath?: string): void {
+  const state = store.sourceState, path = physicalPath ?? state.paths?.[ledger] ?? ledger;
+  const outcomes = snapshotsFor(store).outcomes;
+  outcomes.set(`${ledger}:${path}`, { ledger, path, result });
+  const errors: NonNullable<TuiSourceState["errors"]> = { ...state.errors };
+  delete errors[ledger];
+  const missing: string[] = [];
+  for (const outcome of outcomes.values()) {
+    if (outcome.result === "missing") missing.push(outcome.path);
+    else if (typeof outcome.result === "object") errors[outcome.ledger] = outcome.result.error;
+  }
   const loaded = { ...state.loaded, [ledger]: result === "loaded" || !!state.loaded?.[ledger] };
   store.sourceState = { ...state, loaded, missing, errors,
     status: Object.keys(errors).length ? "error" : missing.length ? "missing"
@@ -5139,6 +5209,7 @@ function sourceReadResult(store: RuntimeStore, ledger: keyof TuiSourcePaths, res
  * cache together. sourceEpoch fences readers independently of same-source edits. */
 function clearRuntimeSource(store: RuntimeStore): void {
   store.sourceEpoch++;
+  sourceSnapshots.delete(store);
   disconnectTuiReadModel(store);
   const activity = tuiActivities.get(store);
   activity?.selection.dispose();
@@ -5171,9 +5242,13 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
   const [sidebarSessionID, setSidebarSessionID] = createSignal<string>();
   const launchDirectory = api.state.path.worktree && api.state.path.worktree !== "/"
     ? api.state.path.worktree : api.state.path.directory;
-  let historyPath: string | undefined;
-  let runsPath: string | undefined;
-  let totalsPath: string | undefined;
+  let historyPath: string[] | undefined;
+  let runsPath: string[] | undefined;
+  let totalsPath: string[] | undefined;
+  const directories = new Set<string>();
+  const discovered = new Set<string>();
+  let discovery: Promise<void> | undefined;
+  let discoveryDirty = false;
   let sourceKey: string | undefined;
   let selectedSessionID: string | undefined;
   let selectionSerial = 0;
@@ -5201,6 +5276,7 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
         await reloadHistory(store, api, historyPath, totalsPath, options.maxRecords, generation);
         if (generation !== reloadGeneration) continue;
         historyAppliedGeneration = generation;
+        discoverNewFamily();
         return;
       }
     })().finally(() => { historyDrain = undefined; });
@@ -5222,6 +5298,7 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
           continue;
         }
         activityAppliedGeneration = generation;
+        discoverNewFamily();
         return;
       }
     })().finally(() => { activityDrain = undefined; });
@@ -5293,13 +5370,138 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
     await probeSource(epoch);
   };
 
+  const familyIDs = (): Set<string> => {
+    const ids = new Set<string>();
+    if (!selectedSessionID) return ids;
+    ids.add(selectedSessionID);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [id, parent] of store.sessionParents) if (parent && ids.has(parent) && !ids.has(id)) {
+        ids.add(id); changed = true;
+      }
+    }
+    return ids;
+  };
+  const watchSources = (): void => {
+    const paths = [...directories].map((directory) => sessionSourcePaths(directory, options));
+    historyPath = physicalPaths(paths.map((path) => path.history));
+    runsPath = physicalPaths(paths.map((path) => path.runs));
+    totalsPath = physicalPaths(paths.map((path) => path.totals));
+    store.historyGeneration = ++reloadGeneration;
+    store.activityGeneration = ++activityReloadGeneration;
+    const epoch = store.sourceEpoch;
+    stopLedgerWatchers();
+    const watchers = new Map<string, { path: string; history: boolean; runs: boolean }>();
+    for (const [files, kind] of [[historyPath, "history"], [totalsPath, "history"], [runsPath, "runs"]] as const) {
+      for (const path of files) {
+        const entry = watchers.get(path) ?? { path, history: false, runs: false };
+        entry[kind] = true; watchers.set(path, entry);
+      }
+    }
+    stopLedgerWatchers = watchLedgerPaths([...watchers.values()].map((entry) => ({ path: entry.path, changed: () => {
+      if (epoch !== store.sourceEpoch) return;
+      if (entry.history) scheduleReload();
+      if (entry.runs) scheduleActivityReload();
+    } })));
+  };
+  const discoverSources = (): Promise<void> => {
+    discoveryDirty = true;
+    if (discovery) return discovery;
+    const port = (api as SourceApi)[sessionSourcePort];
+    if (!port || !selectedSessionID || !store.sourceState.paths) return Promise.resolve();
+    discovery = (async () => {
+      while (!disposed && discoveryDirty) {
+        discoveryDirty = false;
+        if (!selectedSessionID || !store.sourceState.paths) return;
+        const epoch = store.sourceEpoch, serial = selectionSerial;
+        let queried = false;
+        let querying: string | undefined;
+        try {
+          for (const id of familyIDs()) {
+            if (discovered.has(id)) continue;
+            querying = id; discovered.add(id);
+            const locations = await port.directories(id);
+            if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) {
+              if (epoch === store.sourceEpoch) discovered.delete(id);
+              discoveryDirty = !disposed; break;
+            }
+            queried = true;
+            let added = false;
+            const children = await port.children(id);
+            if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) {
+              if (epoch === store.sourceEpoch) discovered.delete(id);
+              discoveryDirty = !disposed; break;
+            }
+            querying = undefined;
+            for (const directory of locations) if (!directories.has(directory)) { directories.add(directory); added = true; }
+            for (const child of children) {
+              tuiReadModel(store).observeParent(child.id, { parent: child.parentID, origin: "cache" });
+              if (!directories.has(child.directory)) { directories.add(child.directory); added = true; }
+              if (!discovered.has(child.id)) discoveryDirty = true;
+            }
+            if (added) { watchSources(); await settleSource(epoch); }
+          }
+          if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) continue;
+          if (queried) {
+            const errors = { ...store.sourceState.errors }; delete errors.metadata;
+            store.sourceState = { ...store.sourceState, errors }; await probeSource(epoch);
+          }
+        } catch (error) {
+          if (epoch === store.sourceEpoch && querying) discovered.delete(querying);
+          if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) continue;
+          store.sourceState = { ...store.sourceState, status: "error", errors: { ...store.sourceState.errors,
+            metadata: error instanceof Error ? error.message : String(error) } }; store.bump();
+          return;
+        }
+      }
+    })().finally(() => { discovery = undefined; });
+    return discovery;
+  };
+  const discoverNewFamily = (): void => {
+    if (discovery) {
+      if ([...familyIDs()].some((id) => !discovered.has(id))) discoveryDirty = true;
+    } else if ([...familyIDs()].some((id) => !discovered.has(id))) void discoverSources();
+  };
+
   const bindSource = (sessionID: string | undefined, directory: string | undefined): Promise<void> => {
     if (disposed) return Promise.resolve();
     const paths = directory ? sessionSourcePaths(directory, options) : undefined;
     const key = paths ? JSON.stringify([directory, paths.history, paths.runs, paths.totals]) : "waiting-metadata";
     if (key === sourceKey) {
       if (store.sourceState.sessionID !== sessionID) {
+        const previous = store.sourceState.sessionID;
+        const sameFamily = !!previous && !!sessionID
+          && tuiReadModel(store).root(previous) === tuiReadModel(store).root(sessionID);
         store.sourceState = { ...store.sourceState, sessionID }; store.focusSessionID = sessionID; store.bump();
+        if (!sameFamily && paths) {
+          directories.clear(); directories.add(directory!); discovered.clear();
+          const snapshots = snapshotsFor(store);
+          const current = { history: resolve(paths.history), totals: resolve(paths.totals), runs: resolve(paths.runs) };
+          for (const ledger of ["history", "totals", "runs"] as const) {
+            for (const file of snapshots[ledger].keys()) if (file !== current[ledger]) snapshots[ledger].delete(file);
+          }
+          for (const [key, outcome] of snapshots.outcomes) {
+            if (outcome.path !== current[outcome.ledger]) snapshots.outcomes.delete(key);
+          }
+          const errors: NonNullable<TuiSourceState["errors"]> = {}, missing: string[] = [];
+          for (const outcome of snapshots.outcomes.values()) {
+            if (outcome.result === "missing") missing.push(outcome.path);
+            else if (typeof outcome.result === "object") errors[outcome.ledger] = outcome.result.error;
+          }
+          store.sourceState = { ...store.sourceState, errors, missing, loaded: {
+            history: snapshots.history.has(current.history), totals: snapshots.totals.has(current.totals), runs: snapshots.runs.has(current.runs),
+          } };
+          if (historyPath?.length !== 1 || totalsPath?.length !== 1 || runsPath?.length !== 1) {
+            if (reloadTimer !== undefined) clearTimeout(reloadTimer); reloadTimer = undefined;
+            if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer); activityReloadTimer = undefined;
+            watchSources();
+            sourceSettled = settleSource(store.sourceEpoch);
+          }
+        }
+        sourceSettled = sourceSettled.then(() => discoverSources());
+      } else if (!discovery && [...familyIDs()].some((id) => !discovered.has(id))) {
+        sourceSettled = sourceSettled.then(() => discoverSources());
       }
       return sourceSettled;
     }
@@ -5308,27 +5510,28 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
     stopLedgerWatchers(); stopLedgerWatchers = () => {};
     if (reloadTimer !== undefined) clearTimeout(reloadTimer); reloadTimer = undefined;
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer); activityReloadTimer = undefined;
-    clearRuntimeSource(store);
+    const retain = !!paths && !!store.sourceState.paths && (store.sourceState.sessionID === sessionID
+      || (!!sessionID && !!store.sourceState.sessionID
+        && tuiReadModel(store).root(sessionID) === tuiReadModel(store).root(store.sourceState.sessionID)));
+    if (!retain) { clearRuntimeSource(store); directories.clear(); discovered.clear(); }
     store.historyGeneration = ++reloadGeneration;
     store.activityGeneration = ++activityReloadGeneration;
-    historyPath = paths?.history; runsPath = paths?.runs; totalsPath = paths?.totals;
+    historyPath = undefined; runsPath = undefined; totalsPath = undefined;
     const port = (api as SourceApi)[sessionSourcePort];
-    port?.bind(directory);
-    store.sourceState = { status: paths ? "loading" : "waiting-metadata", epoch: store.sourceEpoch,
-      sessionID, directory, paths, loaded: { history: false, totals: false, runs: false },
+    store.sourceState = { ...(retain ? store.sourceState : {}), status: paths ? "loading" : "waiting-metadata", epoch: store.sourceEpoch,
+      sessionID, directory, paths, loaded: retain ? store.sourceState.loaded : { history: false, totals: false, runs: false },
       live: !!directory && (!!port || directory === launchDirectory) };
+    port?.bind(directory);
     store.focusSessionID = sessionID; store.bump();
     if (!paths) {
       historyAppliedGeneration = reloadGeneration; activityAppliedGeneration = activityReloadGeneration;
       sourceSettled = Promise.resolve(); return sourceSettled;
     }
     const epoch = store.sourceEpoch;
-    stopLedgerWatchers = watchLedgerPaths([
-      { path: paths.history, changed: () => { if (epoch === store.sourceEpoch) scheduleReload(); } },
-      { path: paths.runs, changed: () => { if (epoch === store.sourceEpoch) scheduleActivityReload(); } },
-      { path: paths.totals, changed: () => { if (epoch === store.sourceEpoch) scheduleReload(); } },
-    ]);
-    sourceSettled = settleSource(epoch);
+    directories.add(directory!);
+    if (retain && sessionID) discovered.delete(sessionID);
+    watchSources();
+    sourceSettled = settleSource(epoch).then(() => discoverSources());
     return sourceSettled;
   };
 
@@ -5361,6 +5564,16 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
     }
     return bound;
   };
+
+  const sourcePort = (api as SourceApi)[sessionSourcePort];
+  const stopSourceChanges = sourcePort?.onChanged((id) => {
+    if (!familyIDs().has(id)) return;
+    discovered.delete(id);
+    if (discovery) discoveryDirty = true;
+    // Source discovery is read-only. Binding still follows only selected native
+    // metadata; an old/foreign directory never acquires live event ownership.
+    sourceSettled = selectSession(selectedSessionID);
+  });
 
   const openHistory = (): void => {
     const sessionID = currentSessionID(api);
@@ -5464,6 +5677,7 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
         const sessionID = readSessionID(properties, event);
         if (sessionID) rootSessionIDFor(store, api, sessionID);
         if (mapped) store.bump();
+        discoverNewFamily();
         scheduleActivityReload();
         return;
       }
@@ -5532,6 +5746,7 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
     store.disposed = true;
     store.activityGeneration++; store.historyGeneration++;
     stopSourceEffect(); selectionSerial++; metadataJob = undefined;
+    stopSourceChanges?.();
     stopLedgerWatchers();
     if (reloadTimer !== undefined) clearTimeout(reloadTimer);
     if (activityReloadTimer !== undefined) clearTimeout(activityReloadTimer);
@@ -5554,7 +5769,7 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
   // Unknown metadata must not block plugin registration or make an empty launch
   // directory look authoritative. A later fenced sync can bind the first source.
   if (store.sourceState.paths) await initialSelection;
-  return { store, selectSession, settled: () => metadataJob?.promise ?? sourceSettled };
+  return { store, selectSession, settled: () => metadataJob?.promise ?? discovery ?? sourceSettled };
 };
 
 const plugin = {

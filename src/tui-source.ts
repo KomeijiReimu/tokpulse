@@ -6,8 +6,12 @@ import { resolveTotalsPath } from "./totals-storage.js";
 
 /** Display-only binding. It never opens a writer or creates ledger files. */
 export const sessionSourcePort = Symbol("token-pulse.session-source");
+export type SessionSourceMetadata = { id: string; parentID: string; directory: string };
 export interface SessionSourcePort {
   sync(id: string): Promise<void>;
+  directories(id: string): Promise<readonly string[]>;
+  children(id: string): Promise<readonly SessionSourceMetadata[]>;
+  onChanged(receive: (id: string) => void): () => void;
   bind(directory: string | undefined): void;
 }
 export type SourceApi = TuiPluginApi & { [sessionSourcePort]?: SessionSourcePort };

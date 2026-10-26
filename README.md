@@ -122,8 +122,15 @@ History is JSONL, one record per completed response, kept to the most recent
 **1,000 records** by default.
 
 Opening a session from another directory uses that session's ledger directory.
-Relative `historyPath` values follow the session directory; absolute paths stay
-fixed. Browsing a session only reads its existing ledgers.
+When a session or child agent moves, Token Pulse uses OpenCode's recorded move
+history to read its previous and current ledgers together. Responses are counted
+once and overlapping activity intervals are unioned, preserving accumulated
+usage and task time when moving or reopening the session.
+
+Relative `historyPath` values resolve under each recorded directory; absolute
+paths stay fixed and shared ledger paths are counted once. Browsing only reads existing
+ledgers. Keep previous ledger directories available: unavailable sources are
+reported as incomplete while successfully loaded data remains visible.
 
 The server owns ledger recovery and writes; opening the TUI only reads them.
 It also creates `.tokpulse-writer-locks/` beside the ledger directory (in the
