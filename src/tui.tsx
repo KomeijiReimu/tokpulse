@@ -3395,7 +3395,16 @@ export async function reloadHistory(
   }
   if (store.disposed || sourceEpoch !== store.sourceEpoch) return;
   if (generation !== store.historyGeneration) return;
-  if (historyChanged) diskRecords = mergeHistoryLayers(histories.flatMap((file) => snapshots.history.get(file) ?? []), new Map(), maxRecords);
+  if (historyChanged) {
+    const multipleSources = histories.length > 1;
+    diskRecords = mergeHistoryLayers(histories.flatMap((file) => snapshots.history.get(file) ?? []), new Map(),
+      multipleSources ? Number.MAX_SAFE_INTEGER : maxRecords);
+    // Cross-file windows use time order; live optimistic admission order stays intact.
+    if (multipleSources) diskRecords = diskRecords
+      .sort((left, right) => (left.time.completed ?? left.time.start) - (right.time.completed ?? right.time.start)
+        || left.messageID.localeCompare(right.messageID))
+      .slice(-maxRecords);
+  }
 
   let totalsLedger: TotalsLedger | undefined;
   let totalsChanged = false;

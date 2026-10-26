@@ -143,6 +143,31 @@ test("actual initialize/bridge binds unrelated SIDs independently of launch dire
   }
 });
 
+test("reopening a moved session keeps the newest history when the old source fills the window", async (t) => {
+  const base = await fixture(t), A = join(base, "A"), B = join(base, "B");
+  const a = await ledger(A, 1), b = await ledger(B, 7);
+  const sample = JSON.parse(await fs.readFile(a.history, "utf8")) as HistoryRecord;
+  const old = Array.from({ length: 1000 }, (_, index): HistoryRecord => ({ ...sample,
+    messageID: `old-${index}`, time: { start: 1000 + index, completed: 1000 + index, duration: 0 } }));
+  const latest: HistoryRecord = { ...sample, messageID: "latest-B", tokens: { ...sample.tokens, input: 7 },
+    time: { start: 4000, completed: 4010, duration: 10 } };
+  await fs.writeFile(a.history, old.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  await fs.writeFile(b.history, JSON.stringify(latest) + "\n");
+  for (const paths of [a, b]) await fs.writeFile(paths.totals, JSON.stringify({ version: 1,
+    generationBasisVersion: 3, sessions: {}, open: {}, settled: {} }));
+  const f = host(B); f.setSession("root", B);
+  f.setMessages(async () => ({ data: [{ type: "location-switched", location: { directory: B },
+    previous: { location: { directory: A } } }], cursor: {} }));
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!;
+    assert.equal(h.store.diskRecords.length, 1000);
+    assert.equal(h.store.diskRecords[0].messageID, "old-1");
+    assert.equal(h.store.diskRecords.at(-1)?.messageID, "latest-B");
+    assert.ok(h.store.records.some((record) => record.messageID === "latest-B"));
+    assert.equal(selected(h.store), 1006, "the retained history window includes 999 old inputs plus the latest 7");
+  } finally { await f.dispose(); }
+});
+
 test("native paged move history keeps A -> B -> A and reopened usage/time continuous without double counting", async (t) => {
   const base = await fixture(t), A = join(base, "A"), B = join(base, "B"), unrelated = join(base, "unrelated");
   const a = await moveLedger(A, 11, "root", 100), b = await moveLedger(B, 22, "root", 200);
