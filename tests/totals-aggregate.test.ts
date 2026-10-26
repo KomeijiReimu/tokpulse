@@ -277,7 +277,9 @@ test("moved session unions durable totals, corrects copied messages once and ref
   assert.equal(Object.getPrototypeOf(merged.sessions), null);
   assert.equal(Object.getPrototypeOf(merged.settled), null);
   assert.deepEqual([before, after], originals, "read-only projection must not mutate either physical source");
-  assert.deepEqual(mergeTotalsSources([after, before]).open.exact, provisional, "an older revision cannot promote provisional usage to stale exact usage");
+  assert.deepEqual(mergeTotalsSources([after, before]).open.exact, exact, "exact usage also wins when the sources are reversed");
+  assert.deepEqual(mergeTotalsSources([after, before]).sessions, merged.sessions, "baseline, correction and exclusion totals are independent of source order");
+  assert.deepEqual(mergeTotalsSources([after, before]).settled.removed, merged.settled.removed);
   const staleCopies: TotalsLedger = {
     ...after,
     open: { exact: { ...provisional, quality: "exact", update: undefined } },
@@ -286,9 +288,69 @@ test("moved session unions durable totals, corrects copied messages once and ref
   const protectedMerge = mergeTotalsSources([before, staleCopies]);
   assert.deepEqual(protectedMerge.open.exact, exact, "history without a live update cannot replace server speed backfill");
   assert.deepEqual(protectedMerge.open["constructor"], copied, "history without an update cannot overwrite an existing same-quality live update");
+  assert.deepEqual(mergeTotalsSources([staleCopies, before]).open, protectedMerge.open);
+  const exclusions = [removed, corrected].map((contribution): TotalsLedger => ({
+    version: 1, sessions: {}, open: {},
+    settled: { removed: { ...contribution, update: undefined, excluded: proof } },
+  }));
+  const excludedMerge = mergeTotalsSources(exclusions);
+  assert.deepEqual(mergeTotalsSources([...exclusions].reverse()), excludedMerge);
+  assert.deepEqual(Object.keys(excludedMerge.sessions), [], "excluded copies contribute zero regardless of their old amounts");
   assert.strictEqual(mergeTotalsSources([before]), before, "unchanged single-source sessions stay zero-copy");
   assert.deepEqual(Object.keys(mergeTotalsSources([]).sessions), []);
   const legacyOverlap: TotalsLedger = { version: 1, sessions: {}, open: {}, settled: { ["constructor"]: true as const } };
   assert.strictEqual(mergeTotalsSources([legacyOverlap]), legacyOverlap);
   assert.throws(() => mergeTotalsSources([before, legacyOverlap]), /overlapping legacy settled contribution: constructor/);
+});
+
+test("copied totals require comparable authority for conflicts, not source order or update metadata alone", () => {
+  const original: OpenContribution = {
+    sessionID: "moved", quality: "exact", tokens: usage(10).tokens, cost: 10,
+    speed: { response: { generatedTokens: 23, durationMs: 200, estimated: false } },
+  };
+  const source = (contribution: OpenContribution): TotalsLedger => ({
+    version: 1, generationBasisVersion: GENERATION_BASIS_VERSION,
+    sessions: { [contribution.sessionID]: {
+      tokens: { ...contribution.tokens }, cost: contribution.cost, responseCount: 1,
+      speed: updateSpeedTotals(undefined, contribution.speed, 1),
+    } },
+    open: { "copied-mid": contribution }, settled: {},
+  });
+  const first = source(original);
+  const same = source({ ...original });
+  assert.deepEqual(mergeTotalsSources([first, same]), mergeTotalsSources([same, first]));
+  assert.equal(mergeTotalsSources([first, same]).sessions.moved.cost, 10);
+
+  for (const change of [
+    { cost: 9 }, { tokens: usage(9).tokens }, { sessionID: "other" },
+    { speed: { response: { generatedTokens: 23, durationMs: 100, estimated: false } } },
+  ]) {
+    const conflict = source({ ...original, ...change });
+    assert.throws(() => mergeTotalsSources([first, conflict]), /conflicting totals contribution.*copied-mid/);
+    assert.throws(() => mergeTotalsSources([conflict, first]), /conflicting totals contribution.*copied-mid/);
+  }
+
+  const live: OpenContribution = { ...original, update: {
+    source: "live", instanceID: "server", sequence: 1, receivedAt: 100, revision: 1,
+    fingerprint: "original", seenFingerprints: [],
+  } };
+  const duplicate = source({ ...live, update: { ...live.update!, instanceID: "restart", fingerprint: "same-value" } });
+  const current = source(live);
+  assert.deepEqual(mergeTotalsSources([current, duplicate]), mergeTotalsSources([duplicate, current]));
+  assert.equal(mergeTotalsSources([current, duplicate]).sessions.moved.cost, 10, "equal effective values deduplicate despite incomparable metadata");
+  const refreshed = source({ ...live, update: { ...live.update!, sequence: 2, revision: 2 } });
+  assert.deepEqual(mergeTotalsSources([refreshed, current]).open["copied-mid"], refreshed.open["copied-mid"], "same-value copies retain the newer comparable authority");
+  assert.deepEqual(mergeTotalsSources([current, refreshed]), mergeTotalsSources([refreshed, current]));
+  const tiedConflict = source({ ...original, cost: 9, update: duplicate.open["copied-mid"].update });
+  assert.throws(() => mergeTotalsSources([current, tiedConflict]), /conflicting totals contribution.*copied-mid/);
+  assert.throws(() => mergeTotalsSources([tiedConflict, current]), /conflicting totals contribution.*copied-mid/);
+
+  const corrected: OpenContribution = { ...original, tokens: zero().tokens, cost: 0,
+    update: { ...live.update!, sequence: 2, receivedAt: 200, revision: 2, fingerprint: "zero" },
+  };
+  const newest = source(corrected);
+  const forward = mergeTotalsSources([current, tiedConflict, newest]);
+  assert.deepEqual(forward, mergeTotalsSources([newest, tiedConflict, current]));
+  assert.deepEqual(forward.open["copied-mid"], corrected, "a comparable newer update resolves both older conflicts, including a zero correction");
+  assert.equal(forward.sessions.moved.cost, 0);
 });

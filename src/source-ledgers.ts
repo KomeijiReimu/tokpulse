@@ -1,7 +1,8 @@
+import { isDeepStrictEqual } from "node:util";
 import { normalizeAgentNames } from "./agent-names.js";
 import { addTokenCounts, emptyTokenCounts } from "./core.js";
 import { mergeScopeEvidence } from "./scope.js";
-import { addSpeedTotals, GENERATION_BASIS_VERSION, isNewerCompletionUpdate, updateSpeedTotals } from "./statistics.js";
+import { addSpeedTotals, emptySpeedTotals, GENERATION_BASIS_VERSION, isNewerCompletionUpdate, updateSpeedTotals } from "./statistics.js";
 import { projectTotalsGenerationBasis, TOTALS_VERSION, type OpenContribution, type SessionDirectTotals, type TotalsLedger } from "./totals-storage.js";
 
 /** Read-only union of distinct, already validated physical totals files.
@@ -56,33 +57,55 @@ export function mergeTotalsSources(ledgers: readonly TotalsLedger[]): TotalsLedg
       else merged.open[messageID] = contribution as OpenContribution;
       continue;
     }
-    let winner: { contribution: OpenContribution; settled: boolean } | undefined;
-    for (const copy of copies) {
+    const snapshots = copies.map((copy) => {
       const next = copy.contribution;
       if (next === true) throw new Error(`Cannot merge overlapping legacy settled contribution: ${messageID}`);
       if (!next.excluded) adjustContribution(merged, next, -1);
-      if (!winner) {
-        winner = { contribution: next, settled: copy.settled };
-        continue;
-      }
-      const previous = winner.contribution;
-      if (next.excluded) {
-        winner = { contribution: { ...next, excluded: mergeScopeEvidence(previous.excluded, next.excluded) }, settled: true };
-        continue;
-      }
-      if (previous.excluded || (previous.quality === "exact" && next.quality === "provisional")) continue;
-      if (!next.update && ((previous.update && previous.quality === next.quality) || previous.speedBackfill)) continue;
-      if (next.update) {
-        if (previous.update && !isNewerCompletionUpdate(next.update, previous.update)) continue;
-      }
-      winner = { contribution: next, settled: copy.settled };
+      return { contribution: next, settled: copy.settled, value: next.excluded ? null : {
+        sessionID: next.sessionID, tokens: next.tokens, cost: next.cost,
+        speed: updateSpeedTotals(undefined, next.speed, 1) ?? emptySpeedTotals(),
+      } };
+    });
+    // Exclusion is sticky; quality wins before revision, even for newer provisional copies.
+    const excluded = snapshots.filter((copy) => copy.contribution.excluded);
+    const eligible = excluded.length ? excluded : snapshots;
+    const exact = eligible.filter((copy) => copy.contribution.quality === "exact");
+    const candidates = exact.length ? exact : eligible;
+    // Compare against every copy rather than throwing on the first ambiguous pair:
+    // a third, authoritative update can resolve both older conflicting snapshots.
+    const winners = candidates.filter((copy) => candidates.every((other) =>
+      isDeepStrictEqual(copy.value, other.value) || supersedesContribution(copy.contribution, other.contribution)));
+    if (!winners.length) throw new Error(`Cannot merge conflicting totals contribution without comparable update: ${messageID}`);
+    const latest = winners.filter((copy) => !winners.some((other) => supersedesContribution(other.contribution, copy.contribution)));
+    // Only equivalent effective contributions reach this tie-break. Keep metadata
+    // deterministic without using usage volume or physical source order as authority.
+    const equivalent = latest.length ? latest : winners;
+    equivalent.sort((left, right) => {
+      const a = JSON.stringify(left);
+      const b = JSON.stringify(right);
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    let { contribution } = equivalent[0];
+    const { settled } = equivalent[0];
+    if (excluded.length) {
+      const proofs = excluded.map((copy) => copy.contribution.excluded!);
+      proofs.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+      contribution = { ...contribution, excluded: proofs.reduce((previous, next) => mergeScopeEvidence(previous, next)) };
     }
-    const { contribution, settled } = winner!;
     if (!contribution.excluded) adjustContribution(merged, contribution, 1);
     if (settled || contribution.excluded) merged.settled[messageID] = contribution;
     else merged.open[messageID] = contribution;
   }
   return merged;
+}
+
+function supersedesContribution(next: OpenContribution, previous: OpenContribution): boolean {
+  if (next.update && previous.update) {
+    // Ingress timestamps can tie across instances; mutual "newer" is not evidence.
+    return isNewerCompletionUpdate(next.update, previous.update) && !isNewerCompletionUpdate(previous.update, next.update);
+  }
+  if (next.update || previous.update) return !!next.update;
+  return false;
 }
 
 function adjustContribution(ledger: TotalsLedger, contribution: OpenContribution, sign: 1 | -1): void {
