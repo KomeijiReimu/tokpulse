@@ -416,6 +416,15 @@ test("missing historical native child preserves known usage without aborting oth
   await fs.appendFile(root.paths.history, await fs.readFile(old.paths.history));
   await createTotalsStorage(root.paths.totals).apply(old.record);
   await fs.appendFile(root.paths.runs, await fs.readFile(old.paths.runs));
+  const maintenance = await moveLedger(join(base, "maintenance"), 99, "maintenance", 400, "root");
+  const maintenanceChild = await moveLedger(join(base, "maintenance-child"), 99, "maintenance-child", 500, "maintenance");
+  await fs.appendFile(root.paths.history, await fs.readFile(maintenance.paths.history));
+  await fs.appendFile(root.paths.history, await fs.readFile(maintenanceChild.paths.history));
+  await fs.appendFile(root.paths.runs, await fs.readFile(maintenance.paths.runs));
+  await fs.appendFile(root.paths.runs, await fs.readFile(maintenanceChild.paths.runs));
+  await createTotalsStorage(root.paths.totals).setSessionScope("maintenance", {
+    version: 1, sourceScope: "magic-session", reasons: ["hidden-metadata"], parentSessionID: "root",
+  });
   await moveLedger(C, 33, "child", 300, "root");
   const f = host(B); f.setSession("root", B);
   f.sessions.set("child", { id: "child", parentID: "root", location: { directory: C } });
@@ -426,7 +435,7 @@ test("missing historical native child preserves known usage without aborting oth
   let failure: { id: string; error: Error } | undefined;
   f.setMessages(async (input) => {
     queries.push(input.sessionID);
-    if (input.sessionID === "old") throw missing("old");
+    if (input.sessionID === "old" || input.sessionID.startsWith("maintenance")) throw missing(input.sessionID);
     if (failure && failure.id === input.sessionID) throw failure.error;
     return { data: [], cursor: {} };
   });
@@ -461,6 +470,16 @@ test("missing historical native child preserves known usage without aborting oth
     assert.equal(h.store.sourceState.errors?.metadata, "Session root not found");
     assert.equal(sourceStatusLabel(h.store), "Unable to read: session metadata");
     assert.equal(buildSessionDetailsTree(h.store, "root").including.tokens.input, 66);
+    failure = undefined;
+    await createTotalsStorage(root.paths.totals).setSessionScope("old", {
+      version: 1, sourceScope: "magic-session", reasons: ["hidden-metadata"], parentSessionID: "root",
+    });
+    f.send("session.moved", { sessionID: "root" }, B); await h.settled();
+    await eventually(() => h.store.sourceState.status === "ready",
+      "late maintenance proof must retire its historical-metadata warning");
+    assert.equal(h.store.sourceState.unavailableSessions?.length ?? 0, 0);
+    assert.equal(sourceStatusLabel(h.store), undefined);
+    assert.equal(buildSessionDetailsTree(h.store, "root").including.tokens.input, 44);
   } finally { await f.dispose(); }
 });
 

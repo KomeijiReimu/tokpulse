@@ -24,7 +24,7 @@ import { normalizeActivityEvent, resolveRootSessionID } from "./activity.js";
 import { cachePartSnapshot, cachedContentProgress, coerceCompletionUpdate, coerceSpeedContribution, coerceSpeedTotals, contentSpeedObservations, createContentMetadataCache, earliestFirstOutput, isNewerCompletionUpdate, measureRecordSpeed, mergeRecordSpeed, sameSpeedContribution, updateSpeedTotals } from './statistics.js';
 import { applyFirstResponseSignal, createContentProgress, mergeContentProgress, noteStepIdentity, selectSpeedMeasurement, taintContentProgress, thinkingFirstResponseSignal } from "./statistics.js";
 import { completeContentMetadata, retireContentMetadata, disposeContentMetadata } from "./statistics.js";
-import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, mergeScopeEvidence } from "./scope.js";
+import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, isSessionScopeExcluded, mergeScopeEvidence } from "./scope.js";
 import { DEFAULT_MAX_RECORDS, parseHistoryJsonl, filterHistoryRecords } from "./storage.js";
 import { readActivityDelta } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
@@ -4858,6 +4858,7 @@ export const initializeTui = async (api, rawOptions) => {
       if (!disposed && sourceEpoch === store.sourceEpoch) void drainActivity().then(() => probeSource(sourceEpoch));
     }, 30);
   };
+  const excludedSource = id => store.sourceScopes.isExcluded(id) || isSessionScopeExcluded(id, tuiReadModel(store).scopes, store.sessionParents);
   const probeSource = async epoch => {
     const paths = store.sourceState.paths;
     if (!paths || disposed || epoch !== store.sourceEpoch) return;
@@ -4867,10 +4868,12 @@ export const initializeTui = async (api, rawOptions) => {
       missing,
       errors
     } = store.sourceState;
+    const unavailableSessions = store.sourceState.unavailableSessions?.filter(id => !excludedSource(id));
     const loading = historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration;
     store.sourceState = {
       ...store.sourceState,
-      status: Object.keys(errors ?? {}).length ? "error" : loading ? "loading" : missing?.length ? "missing" : store.sourceState.unavailableSessions?.length ? "partial" : "ready"
+      unavailableSessions,
+      status: Object.keys(errors ?? {}).length ? "error" : loading ? "loading" : missing?.length ? "missing" : unavailableSessions?.length ? "partial" : "ready"
     };
     store.bump();
   };
@@ -4887,7 +4890,7 @@ export const initializeTui = async (api, rawOptions) => {
     let changed = true;
     while (changed) {
       changed = false;
-      for (const [id, parent] of store.sessionParents) if (parent && ids.has(parent) && !ids.has(id)) {
+      for (const [id, parent] of store.sessionParents) if (parent && ids.has(parent) && !ids.has(id) && !excludedSource(id)) {
         ids.add(id);
         changed = true;
       }
@@ -4937,7 +4940,7 @@ export const initializeTui = async (api, rawOptions) => {
           serial = selectionSerial;
         let queried = false;
         for (const id of familyIDs()) {
-          if (discovered.has(id)) continue;
+          if (discovered.has(id) || id !== selectedSessionID && excludedSource(id)) continue;
           discovered.add(id);
           try {
             const locations = await port.directories(id);

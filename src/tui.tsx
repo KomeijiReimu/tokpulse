@@ -5357,16 +5357,20 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
     }, 30);
   };
 
+  const excludedSource = (id: string): boolean => store.sourceScopes.isExcluded(id)
+    || isSessionScopeExcluded(id, tuiReadModel(store).scopes, store.sessionParents);
   const probeSource = async (epoch: number): Promise<void> => {
     const paths = store.sourceState.paths;
     if (!paths || disposed || epoch !== store.sourceEpoch) return;
     // Publish current read outcomes, not a pre/post-stat guess or an older
     // captured error map that could overwrite a successful concurrent read.
     const { missing, errors } = store.sourceState;
+    const unavailableSessions = store.sourceState.unavailableSessions
+      ?.filter((id) => !excludedSource(id));
     const loading = historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration;
-    store.sourceState = { ...store.sourceState,
+    store.sourceState = { ...store.sourceState, unavailableSessions,
       status: Object.keys(errors ?? {}).length ? "error" : loading ? "loading" : missing?.length ? "missing"
-        : store.sourceState.unavailableSessions?.length ? "partial" : "ready" };
+        : unavailableSessions?.length ? "partial" : "ready" };
     store.bump();
   };
 
@@ -5388,7 +5392,8 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
     let changed = true;
     while (changed) {
       changed = false;
-      for (const [id, parent] of store.sessionParents) if (parent && ids.has(parent) && !ids.has(id)) {
+      for (const [id, parent] of store.sessionParents) if (parent && ids.has(parent) && !ids.has(id)
+        && !excludedSource(id)) {
         ids.add(id); changed = true;
       }
     }
@@ -5428,7 +5433,7 @@ export const initializeTui = async (api: TuiPluginApi, rawOptions: unknown): Pro
         const epoch = store.sourceEpoch, serial = selectionSerial;
         let queried = false;
         for (const id of familyIDs()) {
-          if (discovered.has(id)) continue;
+          if (discovered.has(id) || (id !== selectedSessionID && excludedSource(id))) continue;
           discovered.add(id);
           try {
             const locations = await port.directories(id);
