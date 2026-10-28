@@ -6,15 +6,15 @@ import * as fs from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createRoot, createSignal } from "solid-js";
+import { createMemo, createRoot, createSignal } from "solid-js";
 import { normalizeActivityEvent } from "../src/activity.js";
-import type { HistoryRecord } from "../src/core.js";
+import { formatDuration, type HistoryRecord } from "../src/core.js";
 import { createTotalsStorage } from "../src/totals-storage.js";
 import { parentProofPort, tuiReadModel, type ParentProofPort } from "../src/tui-read-model.js";
 import { sessionSourcePaths } from "../src/tui-source.js";
 import { createV2TuiBridge, type V2TuiContext } from "../src/tui-v2.js";
 import { buildSessionDetailsTree, createRuntimeStore, initializeTui, reloadActivity,
-  reloadHistory, taskWallTimeForSession, tuiActivityTimes, sourceStatusLabel } from "../src/tui.js";
+  reloadHistory, taskWallTimeForSession, tuiActivityTimes, hasLiveTaskWallActivity, sourceStatusLabel } from "../src/tui.js";
 const { spyOn } = require("bun:test");
 
 function deferred() {
@@ -325,6 +325,87 @@ test("native descendants discover a child's independent move even without a loca
     assert.equal(root.including.tokens.cacheRead, 594); assert.equal(root.including.tokens.output, 66);
     assert.equal(tuiActivityTimes(h.store, "root").includingMilliseconds, 66);
     assert.equal(tuiActivityTimes(h.store, "child").directMilliseconds, 55);
+  } finally { await f.dispose(); }
+});
+
+test("selected root observes only its native cross-directory child's live clock and follows its move", async (t) => {
+  // The real sidebar uses Solid's reactive browser export, not the inert node memo.
+  if (process.env.TOKPULSE_BROWSER_CHILD_LIVE_TEST !== "1") {
+    const child = spawnSync(process.execPath, ["--conditions=browser", "test", import.meta.filename,
+      "--test-name-pattern", "selected root observes only"], {
+      env: { ...process.env, TOKPULSE_BROWSER_CHILD_LIVE_TEST: "1" }, encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(child.status, 0, child.stdout + child.stderr); return;
+  }
+  const base = await fixture(t), B = join(base, "B"), C = join(base, "C"), D = join(base, "D");
+  await moveLedger(B, 11, "root", 100);
+  const child = await moveLedger(C, 22, "child", 200, "root");
+  await moveLedger(D, 0, "child", 300, "root");
+  const originalRuns = await fs.readFile(child.paths.runs, "utf8");
+  const f = host(B); f.setSession("root", B);
+  f.sessions.set("child", { id: "child", parentID: "root", location: { directory: C } });
+  f.setSession("unrelated", C);
+  const lifecycle: any[] = [];
+  for (const type of ["session.status", "session.completed"] as const) {
+    f.bridge.api.event.on(type as any, (event: unknown) => { lifecycle.push(event); });
+  }
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!;
+    const start = Date.now(); let now = start;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    let stopClockView = () => {};
+    try {
+      const before = tuiActivityTimes(h.store, "root", now).includingMilliseconds;
+      f.send("session.execution.started", { sessionID: "child" }, undefined, now);
+      f.send("session.step.started", { sessionID: "child", assistantMessageID: "child-live",
+        agent: "build", started: now }, C, now);
+      await eventually(() => hasLiveTaskWallActivity(h.store), "native child in C must wake root B's live clock");
+      assert.equal(lifecycle[0].sourceDirectory, C, "child events retain their actual source, never root B's label");
+      const taskTimeLabel = createRoot((dispose) => {
+        stopClockView = dispose;
+        // Isolate the sidebar's clock dependency: ledger revisions cannot fake
+        // a ticker refresh. Use the production formatter and default live now.
+        return createMemo(() => { h.store.clockRevision();
+          return formatDuration(taskWallTimeForSession(h.store, "root")!); });
+      });
+      assert.equal(taskTimeLabel(), formatDuration(before));
+      now += 10_000;
+      await eventually(() => taskTimeLabel() === formatDuration(before + 10_000),
+        "the real 500ms ticker must refresh the displayed child-inclusive task time");
+      assert.equal(tuiActivityTimes(h.store, "root", now).includingMilliseconds, before + 10_000);
+      assert.equal(tuiActivityTimes(h.store, "child", now).directMilliseconds, 22 + 10_000);
+      f.send("session.execution.started", { sessionID: "unrelated" }, undefined, now);
+      f.send("session.execution.started", { sessionID: "unrelated" }, C, now);
+      assert.equal(tuiActivityTimes(h.store, "unrelated", now).active, false);
+      f.sessions.set("child", { id: "child", parentID: "root", location: { directory: D } });
+      f.send("session.moved", { sessionID: "child" }, D, now);
+      await h.settled();
+      f.send("session.execution.succeeded", { sessionID: "child" }, C, now);
+      assert.equal(hasLiveTaskWallActivity(h.store), true, "late terminal from previous directory has no ownership");
+      f.send("session.step.started", { sessionID: "child", assistantMessageID: "child-moved",
+        agent: "build", started: now }, D, now);
+      f.send("session.execution.succeeded", { sessionID: "child" }, D, now);
+      assert.equal(hasLiveTaskWallActivity(h.store), false);
+      const ended = tuiActivityTimes(h.store, "root", now);
+      assert.equal(ended.includingMilliseconds, before + 10_000);
+      const closed = ["busy", "idle"].map((state, index) => normalizeActivityEvent({
+        version: 2, kind: "lifecycle", eventID: `child-canonical-${state}`, instanceID: "child-server",
+        sessionID: "child", parentSessionID: "root", executionID: lifecycle[0].executionID,
+        sourceEventID: lifecycle[index].sourceEventID, state, timestamp: start + index * 10_000,
+        observedAt: start + index * 10_000,
+      })!);
+      const movedPaths = sessionSourcePaths(D, {});
+      await fs.appendFile(movedPaths.runs, closed.map((fact) => JSON.stringify(fact)).join("\n") + "\n");
+      await eventually(() => h.store.activityEvents.some((fact) => fact.eventID === "child-canonical-idle"),
+        "native watcher must load the closed child ledger");
+      now += 10_000;
+      await new Promise((resolve) => setTimeout(resolve, 550));
+      assert.equal(taskTimeLabel(), formatDuration(ended.includingMilliseconds), "closed display must not accrue another ticker interval");
+      assert.equal(taskWallTimeForSession(h.store, "root"), ended.includingMilliseconds);
+      assert.deepEqual(tuiActivityTimes(h.store, "root", now), ended, "terminal clock stays closed");
+      assert.equal(tuiActivityTimes(h.store, "unrelated", now).active, false, "unlocated unrelated events cannot acquire family ownership later");
+      assert.equal(await fs.readFile(child.paths.runs, "utf8"), originalRuns, "live observation never rewrites C's ledger");
+    } finally { stopClockView(); clock.mockRestore(); }
   } finally { await f.dispose(); }
 });
 

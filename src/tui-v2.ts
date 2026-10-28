@@ -59,7 +59,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
   const disposers = new Set<() => void | Promise<void>>();
   const handlers = new Map<string, Set<(event: unknown) => void>>();
   const adapter = createV2EventAdapter();
-  const proven = new Set<string>();
+  const proven = new Map<string, string>();
   const pending = new Map<string, unknown[]>();
   const lookupQueue = new Set<string>();
   const attempted = new Set<string>();
@@ -74,7 +74,29 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
   const location = () => context.location ?? context.data.location.default();
   let sourceBound = false;
   let sourceDirectory: string | undefined;
+  let sourceSessionID: string | undefined;
   const activeDirectory = () => sourceBound ? sourceDirectory : location().directory;
+  // Only native parent metadata can grant a descendant its own live directory.
+  // Historical ledger parent links and other sessions sharing that directory
+  // are deliberately not an ownership certificate.
+  const sessionDirectory = (id: string): string | undefined => {
+    const selected = activeDirectory();
+    if (!sourceSessionID || id === sourceSessionID) return selected;
+    const session = context.data.session.get(id);
+    const directory = session?.location?.directory;
+    if (session?.id !== id || typeof directory !== "string" || !isAbsolute(directory)) return selected;
+    const visited = new Set<string>([id]);
+    let parent = session.parentID;
+    while (parent) {
+      if (parent === sourceSessionID) return directory;
+      if (visited.has(parent)) break;
+      visited.add(parent);
+      const ancestor = context.data.session.get(parent);
+      if (ancestor?.id !== parent) break;
+      parent = ancestor.parentID;
+    }
+    return selected;
+  };
   let proofDirectory: string | undefined;
   let proofInitialized = false;
   let proofEpoch = 0;
@@ -115,7 +137,9 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
   };
   const wake = (event: ParentProofWake) => { if (!disposed) for (const receive of proofAvailable) receive(event); };
   const emit = (event: Record<string, any>) => {
-    const sourced = { ...event, sourceDirectory: activeDirectory(), sourceEpoch: `tui-bridge:${bridgeID}:${proofEpoch}` };
+    const id = event.properties?.sessionID;
+    const sourced = { ...event, sourceDirectory: typeof id === "string" ? sessionDirectory(id) : activeDirectory(),
+      sourceEpoch: `tui-bridge:${bridgeID}:${proofEpoch}` };
     for (const callback of handlers.get(event.type) ?? []) callback(sourced);
   };
   const finishParent = (job: ParentJob, outcome: ParentProofOutcome) => {
@@ -148,7 +172,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
   const cachedProof = (id: string): boolean => {
     try {
       const session = context.data.session.get(id);
-      return session?.id === id && session.location?.directory === proofDirectory;
+      return session?.id === id && session.location?.directory === sessionDirectory(id);
     } catch { return false; }
   };
   const pump = () => {
@@ -161,7 +185,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
       for (const candidate of lookupQueue) if (!lookupActive.has(candidate) && (parentRequests.get(candidate)?.due ?? 0) <= now) { id = candidate; break; }
       if (id === undefined) break; // Keep fresh same-SID work queued behind its old RPC.
       lookupQueue.delete(id);
-      if (proven.has(id) && !parentRequests.has(id)) continue;
+      if (proven.get(id) === sessionDirectory(id) && !parentRequests.has(id)) continue;
       const sid = id; const token = Symbol(); const epoch = proofEpoch; const directory = proofDirectory;
       const parentRequest = parentRequests.get(sid);
       if (parentRequest) parentRequest.attempts++;
@@ -173,10 +197,10 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
       }).then(() => {
         if (parentRequest && (parentRequest.done || parentRequests.get(sid) !== parentRequest)) return;
         if (!disposed && epoch === proofEpoch && directory === activeDirectory() && cachedProof(sid)) {
-          proven.add(sid); flush(sid);
+          proven.set(sid, sessionDirectory(sid)!); flush(sid);
           if (parentRequest && parentRequests.get(sid) === parentRequest) {
             const entity = context.data.session.get(sid);
-            if (entity?.id === sid && entity.location?.directory === directory) {
+            if (entity?.id === sid && entity.location?.directory === sessionDirectory(sid)) {
               finishParent(parentRequest, { status: "success", parent: entity.parentID || null });
             }
           }
@@ -294,10 +318,11 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
         return children;
       },
       onChanged: (receive) => { sourceChanged.add(receive); return () => { sourceChanged.delete(receive); }; },
-      bind: (directory: string | undefined) => {
-        sourceBound = true; sourceDirectory = directory;
+      bind: (directory: string | undefined, sessionID?: string) => {
+        sourceBound = true; sourceDirectory = directory; sourceSessionID = sessionID;
         ensureProofDirectory();
       },
+      owns: (id, directory) => sessionDirectory(id) === directory,
     } satisfies SessionSourcePort,
     [parentProofPort]: {
       epoch: () => proofEpoch,
@@ -443,7 +468,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
           const data = raw.data;
           const outer = raw.location?.directory ?? raw.directory;
           const inner = data?.location?.directory ?? data?.directory;
-          const directory = activeDirectory();
+          const directory = !disruption && typeof data?.sessionID === "string" ? sessionDirectory(data.sessionID) : activeDirectory();
           // Location ownership also applies to transport/workspace disruptions.
           // Only truly unlocated transport events are global; never relabel an
           // explicitly foreign workspace event as the selected source.
@@ -462,8 +487,8 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
           if (!data || typeof data.sessionID !== "string") return;
           const id = data.sessionID;
           if (typeof directory !== "string" || !directory) return;
-          if (outer === directory || inner === directory || proven.has(id) || (allowCachedProof && cachedProof(id))) {
-            proven.add(id); flush(id); deliver(details); return;
+          if (outer === directory || inner === directory || proven.get(id) === directory || (allowCachedProof && cachedProof(id))) {
+            proven.set(id, directory); flush(id); deliver(details); return;
           }
           let queue = pending.get(id);
           while (!queue && !parentRequests.has(id) && pendingSize() >= 256) {

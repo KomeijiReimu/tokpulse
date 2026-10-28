@@ -126,6 +126,8 @@ When a session or child agent moves, Token Pulse uses OpenCode's recorded move
 history to read its previous and current ledgers together. Responses are counted
 once and overlapping activity intervals are unioned, preserving accumulated
 usage and task time when moving or reopening the session.
+The TUI also uses live execution events to update task time for background child
+sessions working in another directory.
 
 Relative `historyPath` values resolve under each recorded directory; absolute
 paths stay fixed and shared ledger paths are counted once. Browsing only reads existing

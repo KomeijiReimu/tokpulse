@@ -5038,6 +5038,7 @@ export const initializeTui = async (api, rawOptions) => {
     const key = paths ? JSON.stringify([directory, paths.history, paths.runs, paths.totals]) : "waiting-metadata";
     if (key === sourceKey) {
       if (store.sourceState.sessionID !== sessionID) {
+        api[sessionSourcePort]?.bind(directory, sessionID);
         if (sessionID && store.sourceState.unavailableSessions?.includes(sessionID)) discovered.delete(sessionID);
         const previous = store.sourceState.sessionID;
         const sameFamily = !!previous && !!sessionID && tuiReadModel(store).root(previous) === tuiReadModel(store).root(sessionID);
@@ -5129,7 +5130,7 @@ export const initializeTui = async (api, rawOptions) => {
       },
       live: !!directory && (!!port || directory === launchDirectory)
     };
-    port?.bind(directory);
+    port?.bind(directory, sessionID);
     store.focusSessionID = sessionID;
     store.bump();
     if (!paths) {
@@ -5202,8 +5203,8 @@ export const initializeTui = async (api, rawOptions) => {
     if (!familyIDs().has(id)) return;
     discovered.delete(id);
     if (discovery) discoveryDirty = true;
-    // Source discovery is read-only. Binding still follows only selected native
-    // metadata; an old/foreign directory never acquires live event ownership.
+    // Source discovery is read-only. The selected source stays bound here;
+    // descendants prove live ownership separately from their native metadata.
     sourceSettled = selectSession(selectedSessionID);
   });
   const openHistory = () => {
@@ -5278,7 +5279,10 @@ export const initializeTui = async (api, rawOptions) => {
     if (type === "message.part.delta" || type === "message.part.updated" || type === "session.next.text.delta" || type === "session.next.reasoning.delta" || type === "session.next.tool.input.delta") return;
     if (!store.sourceState.paths || !store.sourceState.live) return;
     const eventDirectory = readString(event.sourceDirectory) ?? _metadata?.directory;
-    if (eventDirectory && eventDirectory !== store.sourceState.directory) return;
+    if (eventDirectory && eventDirectory !== store.sourceState.directory) {
+      const id = readSessionID(eventProperties(event), event);
+      if (!id || !api[sessionSourcePort]?.owns(id, eventDirectory)) return;
+    }
     const receivedAt = Date.now();
     try {
       const properties = eventProperties(event);

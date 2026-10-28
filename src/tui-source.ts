@@ -12,7 +12,8 @@ export interface SessionSourcePort {
   directories(id: string): Promise<readonly string[]>;
   children(id: string): Promise<readonly SessionSourceMetadata[]>;
   onChanged(receive: (id: string) => void): () => void;
-  bind(directory: string | undefined): void;
+  bind(directory: string | undefined, sessionID?: string): void;
+  owns(id: string, directory: string): boolean;
 }
 export type SourceApi = TuiPluginApi & { [sessionSourcePort]?: SessionSourcePort };
 export type TuiSourcePaths = { history: string; runs: string; totals: string };
