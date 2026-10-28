@@ -131,6 +131,9 @@ Relative `historyPath` values resolve under each recorded directory; absolute
 paths stay fixed and shared ledger paths are counted once. Browsing only reads existing
 ledgers. Keep previous ledger directories available: unavailable sources are
 reported as incomplete while successfully loaded data remains visible.
+If a historical child session no longer exists in OpenCode, its missing metadata
+is reported separately. Already loaded statistics stay visible, and discovery
+continues for other sessions.
 
 The server owns ledger recovery and writes; opening the TUI only reads them.
 It also creates `.tokpulse-writer-locks/` beside the ledger directory (in the

@@ -17,7 +17,7 @@ export interface SessionSourcePort {
 export type SourceApi = TuiPluginApi & { [sessionSourcePort]?: SessionSourcePort };
 export type TuiSourcePaths = { history: string; runs: string; totals: string };
 export type TuiSourceState = {
-  status: "waiting-metadata" | "loading" | "ready" | "missing" | "error";
+  status: "waiting-metadata" | "loading" | "ready" | "partial" | "missing" | "error";
   epoch: number;
   sessionID?: string;
   directory?: string;
@@ -26,6 +26,9 @@ export type TuiSourceState = {
    * missing/error results; a new source starts with no known measurements. */
   loaded?: Partial<Record<keyof TuiSourcePaths, boolean>>;
   missing?: string[];
+  /** Historical family members absent from the native API; their known ledger
+   * contributions remain readable, but further source discovery is incomplete. */
+  unavailableSessions?: string[];
   errors?: Partial<Record<keyof TuiSourcePaths | "metadata", string>>;
   live: boolean;
 };

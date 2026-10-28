@@ -14,7 +14,7 @@ import { parentProofPort, tuiReadModel, type ParentProofPort } from "../src/tui-
 import { sessionSourcePaths } from "../src/tui-source.js";
 import { createV2TuiBridge, type V2TuiContext } from "../src/tui-v2.js";
 import { buildSessionDetailsTree, createRuntimeStore, initializeTui, reloadActivity,
-  reloadHistory, taskWallTimeForSession, tuiActivityTimes } from "../src/tui.js";
+  reloadHistory, taskWallTimeForSession, tuiActivityTimes, sourceStatusLabel } from "../src/tui.js";
 const { spyOn } = require("bun:test");
 
 function deferred() {
@@ -325,6 +325,61 @@ test("native descendants discover a child's independent move even without a loca
     assert.equal(root.including.tokens.cacheRead, 594); assert.equal(root.including.tokens.output, 66);
     assert.equal(tuiActivityTimes(h.store, "root").includingMilliseconds, 66);
     assert.equal(tuiActivityTimes(h.store, "child").directMilliseconds, 55);
+  } finally { await f.dispose(); }
+});
+
+test("missing historical native child preserves known usage without aborting other family discovery", async (t) => {
+  const base = await fixture(t), B = join(base, "B"), C = join(base, "C");
+  const root = await moveLedger(B, 11, "root", 100);
+  const old = await moveLedger(join(base, "old"), 22, "old", 200, "root");
+  await fs.appendFile(root.paths.history, await fs.readFile(old.paths.history));
+  await createTotalsStorage(root.paths.totals).apply(old.record);
+  await fs.appendFile(root.paths.runs, await fs.readFile(old.paths.runs));
+  await moveLedger(C, 33, "child", 300, "root");
+  const f = host(B); f.setSession("root", B);
+  f.sessions.set("child", { id: "child", parentID: "root", location: { directory: C } });
+  const missing = (id: string) => Object.assign(new Error(`Session ${id} not found`), {
+    name: "SessionNotFoundError", _tag: "SessionNotFoundError", sessionID: id,
+  });
+  const queries: string[] = [];
+  let failure: { id: string; error: Error } | undefined;
+  f.setMessages(async (input) => {
+    queries.push(input.sessionID);
+    if (input.sessionID === "old") throw missing("old");
+    if (failure && failure.id === input.sessionID) throw failure.error;
+    return { data: [], cursor: {} };
+  });
+  try {
+    const h = (await initializeTui(f.bridge.api, {}))!;
+    assert.equal(h.store.sourceState.status, "partial");
+    assert.deepEqual(h.store.sourceState.loaded, { history: true, totals: true, runs: true });
+    assert.deepEqual(h.store.sourceState.unavailableSessions, ["old"]);
+    assert.deepEqual(h.store.sourceState.errors, {});
+    assert.equal(sourceStatusLabel(h.store), "Historical session metadata unavailable (1) · showing known ledger data");
+    assert.ok(queries.includes("child"), "the missing historical SID must not abort the remaining native child query");
+    assert.equal(buildSessionDetailsTree(h.store, "root").including.tokens.input, 66);
+    assert.equal(selected(h.store, "old"), 22);
+    assert.equal(tuiActivityTimes(h.store, "root").includingMilliseconds, 66);
+    f.send("session.moved", { sessionID: "child" }, C); await h.settled();
+    assert.equal(queries.filter((id) => id === "old").length, 1, "known absent history is not retried each discovery round");
+    failure = { id: "child", error: Object.assign(new Error("Forbidden HTTP404"), { _tag: "ForbiddenError", sessionID: "child" }) };
+    f.send("session.moved", { sessionID: "child" }, C); await h.settled();
+    assert.equal(h.store.sourceState.status, "error");
+    assert.equal(h.store.sourceState.errors?.metadata, "Forbidden HTTP404", "neither other tags nor message substrings mean a missing session");
+    failure = { id: "child", error: missing("unrelated") };
+    f.send("session.moved", { sessionID: "child" }, C); await h.settled();
+    assert.equal(h.store.sourceState.status, "error", "the declared missing SID must match the queried family member");
+    assert.deepEqual(h.store.sourceState.unavailableSessions, ["old"]);
+    failure = undefined;
+    f.send("session.moved", { sessionID: "child" }, C); await h.settled();
+    assert.equal(h.store.sourceState.status, "partial");
+    assert.equal(h.store.sourceState.errors?.metadata, undefined);
+    failure = { id: "root", error: missing("root") };
+    f.send("session.moved", { sessionID: "root" }, B); await h.settled();
+    assert.equal(h.store.sourceState.status, "error", "selected-root absence remains fatal to discovery");
+    assert.equal(h.store.sourceState.errors?.metadata, "Session root not found");
+    assert.equal(sourceStatusLabel(h.store), "Unable to read: session metadata");
+    assert.equal(buildSessionDetailsTree(h.store, "root").including.tokens.input, 66);
   } finally { await f.dispose(); }
 });
 

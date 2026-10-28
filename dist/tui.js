@@ -2912,9 +2912,10 @@ function sourcePartAvailable(store, part) {
   // snapshots. An omitted part in an explicit loaded map is still unknown.
   return source.loaded ? source.loaded[part] === true : source.status === "ready";
 }
-function sourceStatusLabel(store) {
+export function sourceStatusLabel(store) {
   const source = store.sourceState;
   if (source.status === "ready") return undefined;
+  if (source.status === "partial") return `Historical session metadata unavailable (${source.unavailableSessions?.length ?? 0}) · showing known ledger data`;
   if (source.status === "waiting-metadata") return "Waiting for session metadata";
   if (source.status === "loading") return Object.values(source.loaded ?? {}).some(Boolean) ? "Refreshing Token Pulse data" : "Loading Token Pulse data";
   const labels = {
@@ -4715,7 +4716,7 @@ function sourceReadResult(store, ledger, result, physicalPath) {
     loaded,
     missing,
     errors,
-    status: Object.keys(errors).length ? "error" : missing.length ? "missing" : loaded.history && loaded.totals && loaded.runs ? "ready" : "loading"
+    status: Object.keys(errors).length ? "error" : missing.length ? "missing" : loaded.history && loaded.totals && loaded.runs ? state.unavailableSessions?.length ? "partial" : "ready" : "loading"
   };
   store.bump();
 }
@@ -4869,7 +4870,7 @@ export const initializeTui = async (api, rawOptions) => {
     const loading = historyAppliedGeneration < reloadGeneration || activityAppliedGeneration < activityReloadGeneration;
     store.sourceState = {
       ...store.sourceState,
-      status: Object.keys(errors ?? {}).length ? "error" : loading ? "loading" : missing?.length ? "missing" : "ready"
+      status: Object.keys(errors ?? {}).length ? "error" : loading ? "loading" : missing?.length ? "missing" : store.sourceState.unavailableSessions?.length ? "partial" : "ready"
     };
     store.bump();
   };
@@ -4935,12 +4936,10 @@ export const initializeTui = async (api, rawOptions) => {
         const epoch = store.sourceEpoch,
           serial = selectionSerial;
         let queried = false;
-        let querying;
-        try {
-          for (const id of familyIDs()) {
-            if (discovered.has(id)) continue;
-            querying = id;
-            discovered.add(id);
+        for (const id of familyIDs()) {
+          if (discovered.has(id)) continue;
+          discovered.add(id);
+          try {
             const locations = await port.directories(id);
             if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) {
               if (epoch === store.sourceEpoch) discovered.delete(id);
@@ -4955,7 +4954,12 @@ export const initializeTui = async (api, rawOptions) => {
               discoveryDirty = !disposed;
               break;
             }
-            querying = undefined;
+            if (store.sourceState.unavailableSessions?.includes(id)) {
+              store.sourceState = {
+                ...store.sourceState,
+                unavailableSessions: store.sourceState.unavailableSessions.filter(missing => missing !== id)
+              };
+            }
             for (const directory of locations) if (!directories.has(directory)) {
               directories.add(directory);
               added = true;
@@ -4975,32 +4979,47 @@ export const initializeTui = async (api, rawOptions) => {
               watchSources();
               await settleSource(epoch);
             }
-          }
-          if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) continue;
-          if (queried) {
-            const errors = {
-              ...store.sourceState.errors
-            };
-            delete errors.metadata;
+          } catch (error) {
+            if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) {
+              if (epoch === store.sourceEpoch) discovered.delete(id);
+              discoveryDirty = !disposed;
+              break;
+            }
+            const native = asRecord(error);
+            // The SDK's declared error identifies the missing session. Neither
+            // a generic HTTP 404 nor another resource's absence is this outcome.
+            if (id !== selectedSessionID && native?._tag === "SessionNotFoundError" && native.sessionID === id) {
+              store.sourceState = {
+                ...store.sourceState,
+                unavailableSessions: [...new Set([...(store.sourceState.unavailableSessions ?? []), id])]
+              };
+              queried = true;
+              continue; // Retain the known ledger snapshot and do not retry this SID each round.
+            }
+            discovered.delete(id);
             store.sourceState = {
               ...store.sourceState,
-              errors
+              status: "error",
+              errors: {
+                ...store.sourceState.errors,
+                metadata: error instanceof Error ? error.message : String(error)
+              }
             };
-            await probeSource(epoch);
+            store.bump();
+            return;
           }
-        } catch (error) {
-          if (epoch === store.sourceEpoch && querying) discovered.delete(querying);
-          if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) continue;
+        }
+        if (disposed || epoch !== store.sourceEpoch || serial !== selectionSerial) continue;
+        if (queried) {
+          const errors = {
+            ...store.sourceState.errors
+          };
+          delete errors.metadata;
           store.sourceState = {
             ...store.sourceState,
-            status: "error",
-            errors: {
-              ...store.sourceState.errors,
-              metadata: error instanceof Error ? error.message : String(error)
-            }
+            errors
           };
-          store.bump();
-          return;
+          await probeSource(epoch);
         }
       }
     })().finally(() => {
@@ -5019,6 +5038,7 @@ export const initializeTui = async (api, rawOptions) => {
     const key = paths ? JSON.stringify([directory, paths.history, paths.runs, paths.totals]) : "waiting-metadata";
     if (key === sourceKey) {
       if (store.sourceState.sessionID !== sessionID) {
+        if (sessionID && store.sourceState.unavailableSessions?.includes(sessionID)) discovered.delete(sessionID);
         const previous = store.sourceState.sessionID;
         const sameFamily = !!previous && !!sessionID && tuiReadModel(store).root(previous) === tuiReadModel(store).root(sessionID);
         store.sourceState = {
@@ -5052,6 +5072,7 @@ export const initializeTui = async (api, rawOptions) => {
             ...store.sourceState,
             errors,
             missing,
+            unavailableSessions: undefined,
             loaded: {
               history: snapshots.history.has(current.history),
               totals: snapshots.totals.has(current.totals),
