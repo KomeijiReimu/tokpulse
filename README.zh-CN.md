@@ -145,10 +145,13 @@ Token Pulse 根据 OpenCode 保存的移动历史，联合读取移动前后的�
 
 ```text
 对于 Git 仓库，将 Token Pulse 的本地目录 .tokpulse/、.tokpulse-writer-locks/、
-迁移临时目录 .tokpulse-migrate-*/，以及仍保留的旧版数据 .opencode/oc-tps/ 加入 .gitignore。
+迁移临时目录 .tokpulse-migrate-*/，以及仍保留的旧版数据 .opencode/oc-tps/ 排除在版本控制之外。
+如果用户是该仓库的 maintainer，则将规则加入 .gitignore；否则加入 .git/info/exclude，
+使规则仅在本地生效。.gitignore 的修改随其他相关改动一并提交，不单独创建 commit。
 ```
 
-在项目的 `.gitignore` 中加入以下目录行：
+如果你是该仓库的 maintainer，将以下目录行加入 `.gitignore`；否则加入仅在本地生效的
+`.git/info/exclude`：
 
 ```gitignore
 .tokpulse/

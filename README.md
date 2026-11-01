@@ -166,9 +166,14 @@ of version control. You can add this reusable rule to your global `AGENTS.md`:
 In Git repositories, ignore Token Pulse's local .tokpulse/ and
 .tokpulse-writer-locks/ directories, .tokpulse-migrate-*/ staging directories,
 and any retained legacy data in .opencode/oc-tps/.
+If the user is a maintainer of that repository, add the rules to .gitignore;
+otherwise, add them to .git/info/exclude so they remain local to the checkout.
+Include .gitignore updates with other relevant changes rather than creating
+a separate commit just for these rules.
 ```
 
-Add these directory lines to the project's `.gitignore`:
+Add these directory lines to `.gitignore` if you maintain the repository;
+otherwise, add them to the local `.git/info/exclude` file:
 
 ```gitignore
 .tokpulse/
