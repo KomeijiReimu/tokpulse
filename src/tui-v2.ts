@@ -279,7 +279,7 @@ export function createV2TuiBridge(context: V2TuiContext, defaults: readonly Lega
         }
         let next: Awaited<ReturnType<typeof context.client.message.list>>["cursor"]["next"];
         do {
-          const page = await context.client.message.list({ sessionID: id, type: "location-switched", order: "asc", limit: 100, cursor: next ?? undefined });
+          const page = await context.client.message.list({ sessionID: id, type: "location-switched", order: next ? undefined : "asc", limit: 100, cursor: next ?? undefined });
           if (!Array.isArray(page.data)) throw new TypeError("Invalid native move history page");
           for (const message of page.data) {
             // Only filtered native move controls cross this boundary. Retain

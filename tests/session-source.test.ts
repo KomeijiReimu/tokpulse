@@ -181,11 +181,14 @@ test("native paged move history keeps A -> B -> A and reopened usage/time contin
   let pages = 0;
   const history = async (input: any) => {
     assert.equal(input.sessionID, "root"); assert.equal(input.type, "location-switched");
-    assert.equal(input.order, "asc"); assert.equal(input.limit, 100);
+    assert.equal(input.order, input.cursor === undefined ? "asc" : undefined,
+      "native continuation cursors must not be combined with order");
+    assert.equal(input.limit, 100);
     pages++;
     const index = input.cursor === undefined ? 0 : Number(input.cursor);
     assert.ok(Number.isInteger(index));
-    return { data: moves.slice(index, index + 1), cursor: index + 1 < moves.length ? { next: String(index + 1) } : {} };
+    const data = moves.slice(index, index + 1);
+    return { data, cursor: data.length ? { next: String(index + 1) } : {} };
   };
   const f = host(A); f.setSession("root", A); f.setMessages(history);
   try {

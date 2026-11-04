@@ -399,7 +399,7 @@ export function createV2TuiBridge(context, defaults = []) {
           const page = await context.client.message.list({
             sessionID: id,
             type: "location-switched",
-            order: "asc",
+            order: next ? undefined : "asc",
             limit: 100,
             cursor: next ?? undefined
           });
