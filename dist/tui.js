@@ -12,7 +12,7 @@ import { createElement as _$createElement } from "@opentui/solid";
 import { readLedgerText } from "./persistence-files.js";
 import { watch, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createEffect, createMemo, createRoot, createSignal, onCleanup, onMount, untrack } from "solid-js";
 import { Plugin } from "@opencode/plugin/tui";
 import { createV2TuiBridge } from "./tui-v2.js";
@@ -28,7 +28,7 @@ import { createScopeRegistry, coerceScopeEvidence, collectSessionScopeEvidence, 
 import { DEFAULT_MAX_RECORDS, parseHistoryJsonl, filterHistoryRecords } from "./storage.js";
 import { readActivityDelta } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
-import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
+import { readOnlyHistoryPath } from "./storage-paths.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope } from "./totals-storage.js";
 const HISTORY_ROUTE = "oc-tps-history";
@@ -2739,8 +2739,7 @@ export function tokenPulseBindings(options) {
 }
 export function resolveHistoryPath(api, configuredPath) {
   const base = api.state.path.worktree && api.state.path.worktree !== "/" ? api.state.path.worktree : api.state.path.directory;
-  const relativeOrAbsolute = configuredPath && configuredPath.trim().length > 0 ? configuredPath : DEFAULT_HISTORY_PATH;
-  return isAbsolute(relativeOrAbsolute) ? relativeOrAbsolute : join(base, relativeOrAbsolute);
+  return readOnlyHistoryPath(base, configuredPath);
 }
 export function createRuntimeStore(maxRecords, observedSince = Date.now()) {
   return createRoot(disposeSignals => {

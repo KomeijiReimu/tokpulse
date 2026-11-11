@@ -3,7 +3,7 @@
 import { readLedgerText } from "./persistence-files.js";
 import { watch, statSync, type FSWatcher } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createEffect, createMemo, createRoot, createSignal, onCleanup, onMount, untrack } from "solid-js";
 import type { MouseEvent, ScrollBoxRenderable, SelectRenderable } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
@@ -58,7 +58,7 @@ import {
 } from "./storage.js";
 import { readActivityDelta, type ActivityReadCursor } from "./runs-storage.js";
 import { normalizeAgentName, normalizeAgentNames } from "./agent-names.js";
-import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
+import { readOnlyHistoryPath } from "./storage-paths.js";
 import { rollupSessionTotals } from "./totals-aggregate.js";
 import type { TotalsRollup } from "./totals-aggregate.js";
 import { TOTALS_VERSION, getExcludedMessageIDs, projectTotalsGenerationBasis, projectTotalsMeasurementScope } from "./totals-storage.js";
@@ -3641,12 +3641,7 @@ export function resolveHistoryPath(api: TuiPluginApi, configuredPath: string | u
     && api.state.path.worktree !== "/"
     ? api.state.path.worktree
     : api.state.path.directory;
-  const relativeOrAbsolute = configuredPath && configuredPath.trim().length > 0
-    ? configuredPath
-    : DEFAULT_HISTORY_PATH;
-  return isAbsolute(relativeOrAbsolute)
-    ? relativeOrAbsolute
-    : join(base, relativeOrAbsolute);
+  return readOnlyHistoryPath(base, configuredPath);
 }
 
 export function createRuntimeStore(maxRecords: number, observedSince = Date.now()): RuntimeStore {

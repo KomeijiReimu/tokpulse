@@ -1,5 +1,5 @@
-import { isAbsolute, join } from "node:path";
-import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
+import { isAbsolute } from "node:path";
+import { readOnlyHistoryPath } from "./storage-paths.js";
 import { resolveRunsPath } from "./runs-storage.js";
 import { resolveTotalsPath } from "./totals-storage.js";
 
@@ -12,8 +12,7 @@ export function sessionSourceDirectory(api, id) {
   return typeof directory === "string" && isAbsolute(directory) ? directory : undefined;
 }
 export function sessionSourcePaths(directory, options) {
-  const configured = options.historyPath?.trim() ? options.historyPath : DEFAULT_HISTORY_PATH;
-  const history = isAbsolute(configured) ? configured : join(directory, configured);
+  const history = readOnlyHistoryPath(directory, options.historyPath);
   // Match server V2: session.location.directory, not its worktree/project root.
   return {
     history,

@@ -61,7 +61,8 @@ test("writer lease guards writes after release, leaves business paths untouched 
   const base = await directory(context);
   const paths = await prepareLedgerPaths(base, {});
   const lease = await acquireWriterLease(paths);
-  assert.deepEqual(await readdir(base), [".tokpulse-writer-locks"]);
+  assert.deepEqual(await readdir(base), [".tokpulse"]);
+  assert.deepEqual(await readdir(join(base, ".tokpulse")), [".tokpulse-writer-locks"]);
   await assert.rejects(acquireWriterLease(paths), /ownership/);
   const history = createHistoryStorage(paths.historyPath, { lease });
   const runs = createActivityLedger(paths.runsPath, { lease });

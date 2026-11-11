@@ -1,6 +1,6 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { isAbsolute, join } from "node:path";
-import { DEFAULT_HISTORY_PATH } from "./storage-paths.js";
+import { isAbsolute } from "node:path";
+import { readOnlyHistoryPath } from "./storage-paths.js";
 import { resolveRunsPath } from "./runs-storage.js";
 import { resolveTotalsPath } from "./totals-storage.js";
 
@@ -42,8 +42,7 @@ export function sessionSourceDirectory(api: TuiPluginApi, id: string): string | 
 }
 
 export function sessionSourcePaths(directory: string, options: { historyPath?: string; runsPath?: string; totalsPath?: string }): TuiSourcePaths {
-  const configured = options.historyPath?.trim() ? options.historyPath : DEFAULT_HISTORY_PATH;
-  const history = isAbsolute(configured) ? configured : join(directory, configured);
+  const history = readOnlyHistoryPath(directory, options.historyPath);
   // Match server V2: session.location.directory, not its worktree/project root.
   return { history, runs: resolveRunsPath(history, options.runsPath),
     totals: resolveTotalsPath({ historyPath: history, totalsPath: options.totalsPath }) };

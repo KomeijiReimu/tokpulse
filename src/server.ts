@@ -25,7 +25,7 @@ import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSi
 import { completeContentMetadata, retireContentMetadata, disposeContentMetadata } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError, type TotalsStorage, type SessionMetadataUpdate } from "./totals-storage.js";
 import { normalizeAgentName } from "./agent-names.js";
-import { DEFAULT_HISTORY_PATH, migrateDefaultLedgers } from "./storage-paths.js";
+import { configuredHistoryPath, migrateDefaultLedgers, removeLegacyWriterLocks } from "./storage-paths.js";
 import { createScopeRegistry, coerceScopeEvidence, mergeScopeEvidence, type ScopeRegistry, type CompactScopeEvidence } from "./scope.js";
 import { createV2EventAdapter, isContentOnlyEvent, isV2ControlEvent, readV2Idle, type V2ServerContext } from "./v2-server.js";
 import { prepareLedgerPaths, acquireWriterLease, recoverHistoryFile, createReliableActivityWriter, createUsageCommitter,
@@ -587,6 +587,7 @@ export const server: Plugin = async (input: PluginInput, pluginOptions?: PluginO
   }
   let eventQueue: Promise<void> = initializeActivityRuntime(activity);
   await eventQueue;
+  await removeLegacyWriterLocks(baseDirectory, paths);
   const active = new Map<string, ActiveState>();
   const completedMessageIDs = new Set<string>();
   const metadata = runtimeContentMetadata(active);
@@ -844,11 +845,8 @@ export function resolveProjectDirectory(input: Pick<PluginInput, "directory" | "
 }
 
 export function resolveHistoryPath(baseDirectory: string, configuredPath?: string): string {
-  if (!configuredPath || configuredPath.trim().length === 0) {
-    return joinPath(baseDirectory, DEFAULT_HISTORY_PATH);
-  }
-  if (configuredPath.startsWith("/")) return configuredPath;
-  return joinPath(baseDirectory, configuredPath);
+  const path = configuredHistoryPath(configuredPath);
+  return path.startsWith("/") ? path : joinPath(baseDirectory, path);
 }
 
 function initializeActivityRuntime(runtime: ActivityRuntime): Promise<void> {

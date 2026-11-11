@@ -118,6 +118,11 @@ function selected(store: NonNullable<Awaited<ReturnType<typeof initializeTui>>>[
 test("actual initialize/bridge binds unrelated SIDs independently of launch directory, A -> B -> A", async (t) => {
   const base = await fixture(t), A = join(base, "A"), B = join(base, "B");
   await ledger(A, 11); await ledger(B, 22, "other");
+  // A moved historical directory has not run the new server: TUI must only read its flat bundle.
+  for (const name of ["history.jsonl", "totals.json", "runs.jsonl"]) {
+    await fs.rename(join(B, ".tokpulse", "data", name), join(B, ".tokpulse", name));
+  }
+  await fs.rm(join(B, ".tokpulse", "data"), { recursive: true });
   for (const launch of [A, B]) {
     const f = host(launch); f.setSession("root", A);
     try {
@@ -127,7 +132,7 @@ test("actual initialize/bridge binds unrelated SIDs independently of launch dire
         f.setSession(sid, directory); await h.selectSession(sid);
         assert.equal(h.store.sourceState.directory, directory);
         assert.equal(h.store.sourceState.status, "ready");
-        assert.equal(h.store.sourceState.paths?.history, join(directory, ".tokpulse/history.jsonl"));
+        assert.equal(h.store.sourceState.paths?.history, join(directory, directory === B ? ".tokpulse/history.jsonl" : ".tokpulse/data/history.jsonl"));
         assert.equal(selected(h.store, sid), value);
         assert.equal(h.store.diskRecords[0].messageID, `message-${value}`);
         assert.equal(tuiActivityTimes(h.store, sid).directMilliseconds, value);
@@ -141,6 +146,7 @@ test("actual initialize/bridge binds unrelated SIDs independently of launch dire
       }
     } finally { await f.dispose(); }
   }
+  assert.deepEqual((await fs.readdir(join(B, ".tokpulse"))).sort(), ["history.jsonl", "runs.jsonl", "totals.json"]);
 });
 
 test("reopening a moved session keeps the newest history when the old source fills the window", async (t) => {
@@ -767,7 +773,7 @@ test("disposal fences a pending source fd read and a pending metadata sync", asy
     await Promise.all([pendingRead, pendingMetadata]); await h.settled();
     assert.equal(h.store.disposed, true); assert.deepEqual(h.store.diskRecords, []);
     assert.equal(h.store.optimistic.size, 0); assert.equal(h.store.completedMessageIDs.size, 0);
-    assert.deepEqual((await fs.readdir(join(A, ".tokpulse"))).sort(), ["history.jsonl", "runs.jsonl", "totals.json"]);
+    assert.deepEqual((await fs.readdir(join(A, ".tokpulse", "data"))).sort(), ["history.jsonl", "runs.jsonl", "totals.json"]);
     assert.equal(JSON.parse(await fs.readFile(paths.totals, "utf8")).sessions.root.tokens.input, 11);
   } finally {
     gate.resolve(); metadata.resolve(); for (const handle of handles.reverse()) handle.mockRestore(); spy.mockRestore(); await f.dispose();

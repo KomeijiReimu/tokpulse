@@ -8,7 +8,7 @@ import { applyFirstResponseSignal, recordContentArrival, thinkingFirstResponseSi
 import { completeContentMetadata, retireContentMetadata, disposeContentMetadata } from "./statistics.js";
 import { createTotalsStorage, isCorruptTotalsError } from "./totals-storage.js";
 import { normalizeAgentName } from "./agent-names.js";
-import { DEFAULT_HISTORY_PATH, migrateDefaultLedgers } from "./storage-paths.js";
+import { configuredHistoryPath, migrateDefaultLedgers, removeLegacyWriterLocks } from "./storage-paths.js";
 import { createScopeRegistry, coerceScopeEvidence, mergeScopeEvidence } from "./scope.js";
 import { createV2EventAdapter, isContentOnlyEvent, isV2ControlEvent, readV2Idle } from "./v2-server.js";
 import { prepareLedgerPaths, acquireWriterLease, recoverHistoryFile, createReliableActivityWriter, createUsageCommitter } from "./persistence.js";
@@ -571,6 +571,7 @@ export const server = async (input, pluginOptions) => {
     }
     let eventQueue = initializeActivityRuntime(activity);
     await eventQueue;
+    await removeLegacyWriterLocks(baseDirectory, paths);
     const active = new Map();
     const completedMessageIDs = new Set();
     const metadata = runtimeContentMetadata(active);
@@ -909,11 +910,8 @@ export function resolveProjectDirectory(input) {
   return input.directory;
 }
 export function resolveHistoryPath(baseDirectory, configuredPath) {
-  if (!configuredPath || configuredPath.trim().length === 0) {
-    return joinPath(baseDirectory, DEFAULT_HISTORY_PATH);
-  }
-  if (configuredPath.startsWith("/")) return configuredPath;
-  return joinPath(baseDirectory, configuredPath);
+  const path = configuredHistoryPath(configuredPath);
+  return path.startsWith("/") ? path : joinPath(baseDirectory, path);
 }
 function initializeActivityRuntime(runtime) {
   const key = runtime.ledger.path;

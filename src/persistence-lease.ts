@@ -3,18 +3,21 @@ import { lstat, mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { canonicalLedgerPath, inspectLedgerFile, isMissing } from "./persistence-files.js";
 import type { LedgerPaths, WriterLease } from "./persistence.js";
+import { configuredHistoryPath, DEFAULT_HISTORY_PATH } from "./storage-paths.js";
 
 export async function prepareLedgerPaths(directory: string, options: {
   historyPath?: string; totalsPath?: string; runsPath?: string;
 } = {}): Promise<LedgerPaths> {
-  const history = resolve(directory, options.historyPath?.trim() || ".tokpulse/history.jsonl");
+  const history = resolve(directory, configuredHistoryPath(options.historyPath));
   // The migration target is an opaque directory bundle, never a directory
   // symlink. Do this before canonicalization would hide that original alias.
-  if (history === resolve(directory, ".tokpulse/history.jsonl")) {
-    try {
-      const entry = await lstat(dirname(history));
-      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Unsafe ledger directory: ${dirname(history)}`);
-    } catch (error) { if (!isMissing(error)) throw error; }
+  if (history === resolve(directory, DEFAULT_HISTORY_PATH)) {
+    for (const parent of [resolve(directory, ".tokpulse"), dirname(history)]) {
+      try {
+        const entry = await lstat(parent);
+        if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Unsafe ledger directory: ${parent}`);
+      } catch (error) { if (!isMissing(error)) throw error; }
+    }
   }
   const sibling = (configured: string | undefined, fallback: string) => configured
     ? isAbsolute(configured) ? configured : join(dirname(history), configured)
