@@ -22,12 +22,23 @@ export async function canonicalLedgerPath(path) {
     }
   }
 }
+class LedgerIdentityChangedError extends Error {
+  constructor(path) {
+    super(`Ledger identity changed: ${path}`);
+  }
+}
+function assertSafeLedgerStat(path, stat) {
+  if (stat.isFile() && !stat.isSymbolicLink()) {
+    if (stat.nlink === 1) return;
+    // An atomic replacement can unlink the inode while lstat or fstat samples it.
+    if (stat.nlink === 0) throw new LedgerIdentityChangedError(path);
+  }
+  throw new Error(`Unsafe ledger file identity (regular, single-link file required): ${path}`);
+}
 export async function inspectLedgerFile(path) {
   try {
     const stat = await lstat(path);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
-      throw new Error(`Unsafe ledger file (regular, single-link file required): ${path}`);
-    }
+    assertSafeLedgerStat(path, stat);
     return stat;
   } catch (error) {
     if (isMissing(error)) return undefined;
@@ -44,11 +55,10 @@ export async function openLedgerFile(path, flags, mode = 0o600) {
   const file = await open(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
   try {
     const stat = await file.stat();
-    if (!stat.isFile() || stat.nlink !== 1 || before && (before.dev !== stat.dev || before.ino !== stat.ino)) {
-      throw new Error(`Ledger identity changed: ${path}`);
-    }
+    assertSafeLedgerStat(path, stat);
+    if (before && !sameIdentity(before, stat)) throw new LedgerIdentityChangedError(path);
     const after = await inspectLedgerFile(path);
-    if (!after || after.dev !== stat.dev || after.ino !== stat.ino) throw new Error(`Ledger identity changed: ${path}`);
+    if (!sameIdentity(stat, after)) throw new LedgerIdentityChangedError(path);
     return file;
   } catch (error) {
     await file.close();
@@ -56,11 +66,20 @@ export async function openLedgerFile(path, flags, mode = 0o600) {
   }
 }
 export async function readLedgerText(path) {
-  const file = await openLedgerFile(path, constants.O_RDONLY);
-  try {
-    return await file.readFile("utf8");
-  } finally {
-    await file.close();
+  const maxAttempts = 3;
+  for (let attempt = 1;; attempt++) {
+    let file;
+    try {
+      file = await openLedgerFile(path, constants.O_RDONLY);
+    } catch (error) {
+      if (!(error instanceof LedgerIdentityChangedError) || attempt === maxAttempts) throw error;
+      continue;
+    }
+    try {
+      return await file.readFile("utf8");
+    } finally {
+      await file.close();
+    }
   }
 }
 

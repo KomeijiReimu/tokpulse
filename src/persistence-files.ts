@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -24,12 +24,23 @@ export async function canonicalLedgerPath(path: string): Promise<string> {
   }
 }
 
+class LedgerIdentityChangedError extends Error {
+  constructor(path: string) { super(`Ledger identity changed: ${path}`); }
+}
+
+function assertSafeLedgerStat(path: string, stat: Stats): void {
+  if (stat.isFile() && !stat.isSymbolicLink()) {
+    if (stat.nlink === 1) return;
+    // An atomic replacement can unlink the inode while lstat or fstat samples it.
+    if (stat.nlink === 0) throw new LedgerIdentityChangedError(path);
+  }
+  throw new Error(`Unsafe ledger file identity (regular, single-link file required): ${path}`);
+}
+
 export async function inspectLedgerFile(path: string) {
   try {
     const stat = await lstat(path);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
-      throw new Error(`Unsafe ledger file (regular, single-link file required): ${path}`);
-    }
+    assertSafeLedgerStat(path, stat);
     return stat;
   } catch (error) {
     if (isMissing(error)) return undefined;
@@ -47,19 +58,26 @@ export async function openLedgerFile(path: string, flags: number, mode = 0o600):
   const file = await open(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
   try {
     const stat = await file.stat();
-    if (!stat.isFile() || stat.nlink !== 1 || (before && (before.dev !== stat.dev || before.ino !== stat.ino))) {
-      throw new Error(`Ledger identity changed: ${path}`);
-    }
+    assertSafeLedgerStat(path, stat);
+    if (before && !sameIdentity(before, stat)) throw new LedgerIdentityChangedError(path);
     const after = await inspectLedgerFile(path);
-    if (!after || after.dev !== stat.dev || after.ino !== stat.ino) throw new Error(`Ledger identity changed: ${path}`);
+    if (!sameIdentity(stat, after)) throw new LedgerIdentityChangedError(path);
     return file;
   } catch (error) { await file.close(); throw error; }
 }
 
 export async function readLedgerText(path: string): Promise<string> {
-  const file = await openLedgerFile(path, constants.O_RDONLY);
-  try { return await file.readFile("utf8"); }
-  finally { await file.close(); }
+  const maxAttempts = 3;
+  for (let attempt = 1; ; attempt++) {
+    let file: FileHandle;
+    try { file = await openLedgerFile(path, constants.O_RDONLY); }
+    catch (error) {
+      if (!(error instanceof LedgerIdentityChangedError) || attempt === maxAttempts) throw error;
+      continue;
+    }
+    try { return await file.readFile("utf8"); }
+    finally { await file.close(); }
+  }
 }
 
 /** Process-crash atomic replacement, not a claim of power-loss durability. */

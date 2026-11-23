@@ -928,6 +928,57 @@ test("actual missing runs is not an empty reset, while a successfully opened emp
   } finally { store.disposed = true; tuiReadModel(store).dispose(); store.disposeSignals(); await f.dispose(); }
 });
 
+for (const race of ["unlinked pathname stat", "unlinked descriptor", "different opened inode"] as const) {
+  test(`read-only totals retry atomic replacement after ${race} without warning`, async (t) => {
+    const base = await fixture(t), paths = await ledger(base, 11);
+    const f = host(base), store = createRuntimeStore(100);
+    store.sourceState = { ...store.sourceState, status: "loading", paths, directory: base };
+    const refresh = () => reloadHistory(store, f.bridge.api, paths.history, paths.totals, 100);
+    try {
+      await refresh();
+      assert.equal(store.totalsLedger.sessions.root.tokens.input, 11);
+      const replacement = join(base, "replacement");
+      const known = store.totalsLedger;
+      await fs.writeFile(replacement, JSON.stringify({ ...known, sessions: { root: { ...known.sessions.root,
+        tokens: { ...known.sessions.root.tokens, input: 22 } } } }));
+      const lstat = fs.lstat, open = fs.open;
+      let replaced = false;
+      const spy = race === "unlinked pathname stat"
+        ? spyOn(fs, "lstat").mockImplementation(async (path: string) => {
+          const stat = await lstat(path);
+          if (path === paths.totals && !replaced) {
+            replaced = true;
+            await fs.rename(replacement, path);
+            // On Bun, the old regular inode can be sampled after its link was removed.
+            stat.nlink = 0;
+          }
+          return stat;
+        })
+        : spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+          if (String(args[0]) !== paths.totals || replaced) return open(...args);
+          replaced = true;
+          if (race === "different opened inode") {
+            await fs.rename(replacement, paths.totals);
+            return open(...args);
+          }
+          const file = await open(...args);
+          await fs.rename(replacement, paths.totals);
+          return file;
+        });
+      const warning = spyOn(console, "warn").mockImplementation(() => {});
+      const toast = spyOn(f.bridge.api.ui, "toast").mockImplementation(() => {});
+      try {
+        await refresh();
+        assert.equal(replaced, true);
+        assert.deepEqual(warning.mock.calls, []);
+        assert.deepEqual(toast.mock.calls, []);
+        assert.equal(store.totalsLedger.sessions.root.tokens.input, 22);
+        assert.equal(store.sourceState.errors?.totals, undefined);
+      } finally { toast.mockRestore(); warning.mockRestore(); spy.mockRestore(); }
+    } finally { store.disposed = true; tuiReadModel(store).dispose(); store.disposeSignals(); await f.dispose(); }
+  });
+}
+
 test("read-only totals reject a symlink without losing known usage, then accept an atomic replacement", async (t) => {
   const base = await fixture(t), paths = await ledger(base, 11), outside = join(base, "outside.json");
   const f = host(base); f.setSession("root", base);
