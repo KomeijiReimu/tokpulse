@@ -16,20 +16,32 @@ Token Pulse 在 OpenCode 侧栏显示会话 token 用量、缓存命中率、费
 
 ## 安装
 
-使用 Bun 1.3.14 或更新版本，并确认 OpenCode 提供 `opencode plugin add` 命令：
+安装工具需要 `PATH` 中有 Bun 1.3.14 或更高版本，以及支持 `opencode plugin add` 和
+`opencode plugin update` 的 OpenCode CLI。使用 `npx` 还需要 npm。
+
+**推荐使用 `bun x`**
 
 ```sh
-bun x @komeijireimu/tokpulse@latest
+# 安装
+bun x @komeijireimu/tokpulse-cli@latest setup
+
+# 更新已安装的插件
+bun x @komeijireimu/tokpulse-cli@latest update
 ```
 
-这会把 Token Pulse 加入全局配置，并让 OpenCode 跟踪 npm 上的 `latest` 版本。要立即更新 Token Pulse：
+**也可以使用 `npx`**
 
 ```sh
-bun x @komeijireimu/tokpulse@latest update
+# 安装
+npx @komeijireimu/tokpulse-cli@latest setup
+
+# 更新已安装的插件
+npx @komeijireimu/tokpulse-cli@latest update
 ```
 
-已有全局配置时，安装命令会保留原条目及其选项。更新遵循原条目的版本范围；固定版本保持不变。
-要让已有条目自动跟踪最新版，把该条目的包名改为 `@komeijireimu/tokpulse@latest`。
+`setup` 会将 `@komeijireimu/tokpulse@latest` 加入 OpenCode 全局配置；已有条目时，会保留
+原条目及其选项。`update` 只在配置的版本范围内更新；固定版本保持不变。要让已有条目
+跟踪 npm 上的最新版，将其中的包设为 `@komeijireimu/tokpulse@latest`。
 
 ### 手动配置
 

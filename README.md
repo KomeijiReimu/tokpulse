@@ -17,22 +17,34 @@ Requires **OpenCode V2, 2.0.27 or later**.
 
 ## Install
 
-With Bun 1.3.14 or later and an OpenCode version that provides `opencode plugin add`:
+The installer requires Bun 1.3.14 or later on `PATH` and an OpenCode CLI that
+provides `opencode plugin add` and `opencode plugin update`. The `npx` option
+also requires npm.
+
+**Recommended: `bun x`**
 
 ```sh
-bun x @komeijireimu/tokpulse@latest
+# Install
+bun x @komeijireimu/tokpulse-cli@latest setup
+
+# Update an existing installation
+bun x @komeijireimu/tokpulse-cli@latest update
 ```
 
-This adds Token Pulse to your global OpenCode configuration and follows npm's
-`latest` release. To update Token Pulse immediately:
+**Alternative: `npx`**
 
 ```sh
-bun x @komeijireimu/tokpulse@latest update
+# Install
+npx @komeijireimu/tokpulse-cli@latest setup
+
+# Update an existing installation
+npx @komeijireimu/tokpulse-cli@latest update
 ```
 
-The installer keeps an existing global Token Pulse entry and its options.
-Updates respect the entry's version range or pin. To enable automatic updates
-for an existing entry, change its package specifier to `@komeijireimu/tokpulse@latest`.
+`setup` adds `@komeijireimu/tokpulse@latest` to your global OpenCode configuration
+or keeps the existing global entry and its options. `update` respects that
+entry's version range or pin. To track npm's latest release, set the entry's
+package specifier to `@komeijireimu/tokpulse@latest`.
 
 ### Configure manually
 
