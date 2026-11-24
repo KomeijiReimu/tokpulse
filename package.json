@@ -1,6 +1,6 @@
 {
   "name": "@komeijireimu/tokpulse",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Token Pulse — session token totals, cache, and task time for OpenCode",
   "license": "AGPL-3.0-or-later",
   "author": "KomeijiReimu",
@@ -20,12 +20,16 @@
     "cache"
   ],
   "type": "module",
+  "bin": {
+    "tokpulse": "bin/tokpulse.mjs"
+  },
   "exports": {
     ".": "./dist/server.js",
     "./server": "./dist/server.js",
     "./tui": "./dist/tui.js"
   },
   "files": [
+    "bin/tokpulse.mjs",
     "dist",
     "LICENSE",
     "README.md",

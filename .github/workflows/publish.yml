@@ -47,7 +47,8 @@ jobs:
       - name: Pack and verify package entry points
         run: |
           bun pm pack --filename "$RUNNER_TEMP/tokpulse.tgz"
-          tar -tzf "$RUNNER_TEMP/tokpulse.tgz" package/package.json package/dist/server.js package/dist/tui.js
+          tar -tzf "$RUNNER_TEMP/tokpulse.tgz" \
+            package/package.json package/dist/server.js package/dist/tui.js package/bin/tokpulse.mjs
 
       - name: Smoke test installed package
         run: |
@@ -62,6 +63,7 @@ jobs:
             assert.equal(typeof server?.setup, "function", "Missing server setup export");
             assert.equal(typeof tui?.setup, "function", "Missing TUI setup export");
           '
+          bun x --no-install tokpulse --help
 
       - name: Upload package tarball
         id: upload
