@@ -48,7 +48,8 @@ jobs:
         run: |
           bun pm pack --filename "$RUNNER_TEMP/tokpulse.tgz"
           tar -tzf "$RUNNER_TEMP/tokpulse.tgz" \
-            package/package.json package/dist/server.js package/dist/tui.js package/bin/tokpulse.mjs
+            package/package.json package/dist/server.js package/dist/tui.js \
+            package/installer/tokpulse.mjs package/installer/messages.mjs
 
       - name: Smoke test installed package
         run: |
@@ -64,6 +65,24 @@ jobs:
             assert.equal(typeof tui?.setup, "function", "Missing TUI setup export");
           '
           bun x --no-install tokpulse --help
+
+      - name: Smoke test standalone installer
+        run: |
+          cmp LICENSE installer/LICENSE
+          (cd installer && bun pm pack --filename "$RUNNER_TEMP/tokpulse-cli.tgz")
+          tar -tzf "$RUNNER_TEMP/tokpulse-cli.tgz" \
+            package/package.json package/tokpulse.mjs package/messages.mjs package/LICENSE
+          consumer=$(mktemp -d "$RUNNER_TEMP/tokpulse-cli-smoke.XXXXXXXX")
+          cd "$consumer"
+          printf '%s\n' '{"private":true}' > package.json
+          bun add "$RUNNER_TEMP/tokpulse-cli.tgz"
+          bun --eval '
+            import assert from "node:assert/strict";
+            import { readdir } from "node:fs/promises";
+            assert.deepEqual((await readdir("node_modules")).filter((name) => !name.startsWith(".")), ["@komeijireimu"]);
+            assert.deepEqual(await readdir("node_modules/@komeijireimu"), ["tokpulse-cli"]);
+          '
+          bun x --no-install @komeijireimu/tokpulse-cli --help
 
       - name: Upload package tarball
         id: upload

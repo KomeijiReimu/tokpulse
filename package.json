@@ -21,7 +21,7 @@
   ],
   "type": "module",
   "bin": {
-    "tokpulse": "bin/tokpulse.mjs"
+    "tokpulse": "installer/tokpulse.mjs"
   },
   "exports": {
     ".": "./dist/server.js",
@@ -29,7 +29,8 @@
     "./tui": "./dist/tui.js"
   },
   "files": [
-    "bin/tokpulse.mjs",
+    "installer/tokpulse.mjs",
+    "installer/messages.mjs",
     "dist",
     "LICENSE",
     "README.md",

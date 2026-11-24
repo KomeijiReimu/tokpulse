@@ -1,0 +1,19 @@
+{
+  "name": "@komeijireimu/tokpulse-cli",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "tokpulse-cli": "tokpulse.mjs"
+  },
+  "files": [
+    "tokpulse.mjs",
+    "messages.mjs",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KomeijiReimu/tokpulse.git",
+    "directory": "installer"
+  }
+}
