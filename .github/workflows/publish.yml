@@ -49,6 +49,20 @@ jobs:
           bun pm pack --filename "$RUNNER_TEMP/tokpulse.tgz"
           tar -tzf "$RUNNER_TEMP/tokpulse.tgz" package/package.json package/dist/server.js package/dist/tui.js
 
+      - name: Smoke test installed package
+        run: |
+          consumer=$(mktemp -d "$RUNNER_TEMP/tokpulse-smoke.XXXXXXXX")
+          cd "$consumer"
+          printf '%s\n' '{"private":true}' > package.json
+          bun add "$RUNNER_TEMP/tokpulse.tgz"
+          bun --eval '
+            import assert from "node:assert/strict";
+            import server from "@komeijireimu/tokpulse";
+            import tui from "@komeijireimu/tokpulse/tui";
+            assert.equal(typeof server?.setup, "function", "Missing server setup export");
+            assert.equal(typeof tui?.setup, "function", "Missing TUI setup export");
+          '
+
       - name: Upload package tarball
         id: upload
         uses: actions/upload-artifact@v7

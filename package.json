@@ -1,6 +1,6 @@
 {
   "name": "@komeijireimu/tokpulse",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Token Pulse — session token totals, cache, and task time for OpenCode",
   "license": "AGPL-3.0-or-later",
   "author": "KomeijiReimu",
@@ -46,7 +46,7 @@
     "@opentui/core": ">=0.5.8",
     "@opentui/keymap": ">=0.5.8",
     "@opentui/solid": ">=0.5.8",
-    "solid-js": ">=1.9.0"
+    "solid-js": ">=1.9.0 <2"
   },
   "devDependencies": {
     "@babel/core": "^7.26.9",
