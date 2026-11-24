@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const cli = fileURLToPath(new URL("../bin/tokpulse.mjs", import.meta.url));
 const packageName = "@komeijireimu/tokpulse";
 
-async function fixture(t: TestContext, { xdg = true, native = true } = {}) {
+async function fixture(t: TestContext, { xdg = true, native = true, warmupStatus = 0 } = {}) {
   const temp = process.env.TMPDIR || join(homedir(), ".cache");
   await fs.mkdir(temp, { recursive: true });
   const root = await fs.mkdtemp(join(temp, "tokpulse-installer-"));
@@ -23,6 +23,11 @@ async function fixture(t: TestContext, { xdg = true, native = true } = {}) {
   await fs.writeFile(calls, "");
   if (native) await fs.writeFile(join(bin, "opencode"), `#!/bin/sh
 printf '%s\\n' "$@" >> "$TOKPULSE_CALLS"
+if [ "$1" = models ]; then
+  printf 'models stdout\\n'
+  printf 'models stderr\\n' >&2
+  exit "$TOKPULSE_WARMUP_STATUS"
+fi
 printf 'native stdout\\n'
 printf 'native stderr\\n' >&2
 exit "\${TOKPULSE_NATIVE_STATUS:-0}"
@@ -34,7 +39,7 @@ exit "\${TOKPULSE_NATIVE_STATUS:-0}"
       encoding: "utf8",
       env: {
         HOME: root, XDG_CONFIG_HOME: xdg ? configHome : undefined, PATH: bin,
-        TOKPULSE_CALLS: calls, TOKPULSE_NATIVE_STATUS: String(status),
+        TOKPULSE_CALLS: calls, TOKPULSE_NATIVE_STATUS: String(status), TOKPULSE_WARMUP_STATUS: String(warmupStatus),
       },
     }),
     calls: () => fs.readFile(calls, "utf8"),
@@ -74,7 +79,7 @@ test("install is idempotent across JSON and JSONC and preserves options and pins
   assert.equal(await fs.readFile(jsonc, "utf8"), pinned);
 });
 
-test("update passes the exact uniquely configured target without changing options", async (t) => {
+test("update warms OpenCode once before passing the exact configured target", async (t) => {
   const f = await fixture(t);
   const target = `${packageName}@>=0.1.1 <1`;
   const config = join(f.config, "opencode.jsonc");
@@ -83,8 +88,20 @@ test("update passes the exact uniquely configured target without changing option
   await fs.writeFile(join(f.config, "opencode.json"), JSON.stringify({ plugins: [target] }));
   const result = f.run(["update"]);
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(await f.calls(), `plugin\nupdate\n${target}\n`);
+  assert.equal(await f.calls(), `models\nplugin\nupdate\n${target}\n`);
+  assert.equal(result.stdout, "native stdout\n");
+  assert.equal(result.stderr, "models stderr\nnative stderr\n");
   assert.equal(await fs.readFile(config, "utf8"), source);
+});
+
+test("a failed OpenCode warmup forwards the error and blocks update", async (t) => {
+  const f = await fixture(t, { warmupStatus: 29 });
+  await fs.writeFile(join(f.config, "opencode.json"), JSON.stringify({ plugins: [`${packageName}@latest`] }));
+  const result = f.run(["update"]);
+  assert.equal(result.status, 29);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "models stderr\n");
+  assert.equal(await f.calls(), "models\n");
 });
 
 test("update never falls back to updating all plugins when absent or ambiguous", async (t) => {

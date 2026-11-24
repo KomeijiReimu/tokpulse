@@ -64,8 +64,14 @@ if (!opencode) fail("OpenCode was not found on PATH. Install OpenCode and try ag
 const [configured] = specs;
 const action = command === "install" ? ["add", `${packageName}@latest`] : ["update", configured];
 try {
+  if (command === "update") {
+    // On a cold start, OpenCode can query configured plugins before they finish loading.
+    const warmup = Bun.spawn([opencode, "models"], { stdin: "inherit", stdout: "ignore", stderr: "inherit" });
+    const status = await warmup.exited;
+    if (status !== 0) process.exit(status);
+  }
   const child = Bun.spawn([opencode, "plugin", ...action], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   process.exitCode = await child.exited;
 } catch {
-  fail("Could not run the OpenCode plugin command.");
+  fail("Could not run the OpenCode command.");
 }
