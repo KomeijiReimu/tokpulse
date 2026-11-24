@@ -4,6 +4,8 @@
 
 Token Pulse 在 OpenCode 侧栏显示会话 token 用量、缓存命中率、费用和任务耗时。
 
+![OpenCode 侧栏中的 Token Pulse 概览](docs/images/overall.jpg)
+
 需要 **OpenCode V2，2.0.27 或更高版本**。
 
 ## 功能
@@ -66,6 +68,13 @@ bun run build
 
 也可从命令面板选择 **Token Pulse details** 打开详情。选择一个 agent 查看其用量，
 或查看整棵会话树的汇总。按 `Esc` 或 `Ctrl+C` 关闭。
+
+<details>
+<summary>预览会话详情面板</summary>
+
+![会话汇总和各子 agent 的用量明细](docs/images/details.jpg)
+
+</details>
 
 ### 统计说明
 

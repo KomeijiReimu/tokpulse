@@ -5,6 +5,8 @@
 Token Pulse shows session token usage, cache hit rate, cost, and task time in
 OpenCode's sidebar.
 
+![Token Pulse summary in the OpenCode sidebar](docs/images/overall.jpg)
+
 Requires **OpenCode V2, 2.0.27 or later**.
 
 ## Features
@@ -74,6 +76,13 @@ descendants.
 Details are also available through **Token Pulse details** in the command
 palette. Select an agent to inspect its usage, or use the tree summary for the
 combined total. Press `Esc` or `Ctrl+C` to close.
+
+<details>
+<summary>Preview the session details panel</summary>
+
+![Session totals and child-agent breakdown](docs/images/details.jpg)
+
+</details>
 
 ### Understanding the metrics
 
