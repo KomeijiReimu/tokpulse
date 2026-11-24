@@ -15,7 +15,22 @@ Requires **OpenCode V2, 2.0.27 or later**.
 
 ## Install
 
-Build from source with Git and Bun:
+Add the npm package to `plugins` in `opencode.json` or `opencode.jsonc`:
+
+```json
+{
+  "plugins": ["@komeijireimu/tokpulse"]
+}
+```
+
+Use `~/.config/opencode/opencode.json` for all projects, or put the file in a
+project for that project only. Add Token Pulse to the existing `plugins` list
+alongside any other plugins.
+
+Open or reload OpenCode. It installs the package and loads both the usage
+collector and the **Token Pulse** sidebar.
+
+### Build from source
 
 ```sh
 git clone https://github.com/KomeijiReimu/tokpulse.git
@@ -24,21 +39,8 @@ bun install --frozen-lockfile
 bun run build
 ```
 
-Add the checkout's absolute path to `plugins` in `opencode.json` or
-`opencode.jsonc`:
-
-```json
-{
-  "plugins": [
-    {
-      "package": "/absolute/path/to/tokpulse"
-    }
-  ]
-}
-```
-
-Start OpenCode in your working project. OpenCode loads the usage collector and
-the **Token Pulse** sidebar together.
+Use the checkout's absolute build path, such as `/absolute/path/to/tokpulse/dist`,
+in place of the npm package name in `plugins`.
 
 ## Usage
 

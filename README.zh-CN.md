@@ -14,7 +14,20 @@ Token Pulse 在 OpenCode 侧栏显示会话 token 用量、缓存命中率、费
 
 ## 安装
 
-使用 Git 和 Bun 从源码构建：
+在 `opencode.json` 或 `opencode.jsonc` 的 `plugins` 中加入 npm 包名：
+
+```json
+{
+  "plugins": ["@komeijireimu/tokpulse"]
+}
+```
+
+要在所有项目中启用，编辑 `~/.config/opencode/opencode.json`；只在单个项目中启用，
+就把配置写在该项目下。已有 `plugins` 列表时，把 Token Pulse 追加到列表中。
+
+打开或重新加载 OpenCode。OpenCode 会安装该包，同时启用统计采集和 **Token Pulse** 侧栏。
+
+### 从源码构建
 
 ```sh
 git clone https://github.com/KomeijiReimu/tokpulse.git
@@ -23,19 +36,7 @@ bun install --frozen-lockfile
 bun run build
 ```
 
-在 `opencode.json` 或 `opencode.jsonc` 的 `plugins` 中加入仓库的绝对路径：
-
-```json
-{
-  "plugins": [
-    {
-      "package": "/absolute/path/to/tokpulse"
-    }
-  ]
-}
-```
-
-在要工作的项目中启动 OpenCode，统计采集与 **Token Pulse** 侧栏会一并加载。
+在 `plugins` 中用构建产物的绝对路径替换 npm 包名，例如 `/absolute/path/to/tokpulse/dist`。
 
 ## 使用
 
